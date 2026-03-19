@@ -5,7 +5,8 @@
       "Bash(pip install psutil pyautogui beautifulsoup4 --quiet)",
       "Bash(.venv/bin/pip install psutil pyautogui beautifulsoup4)",
       "Bash(.venv/bin/python -c \":*)",
-      "Read(//Users/rohit/.cache/torch/hub/snakers4_silero-vad_master/**)"
+      "Read(//Users/rohit/.cache/torch/hub/snakers4_silero-vad_master/**)",
+      "Bash(grep -E \"\\\\.\\(tsx?|jsx?\\)$\")"
     ]
   }
 }

@@ -44,9 +44,12 @@ export function useWebSocket() {
 
         case 'LLM_TOKEN':
           if (currentMsgIdRef.current) {
-            store.appendToken(currentMsgIdRef.current, msg.data.token)
-            if (msg.data.done) {
+            if (!msg.data.done) {
+              store.appendToken(currentMsgIdRef.current, msg.data.token)
+            } else {
               llmTimeRef.current = (Date.now() - llmStartRef.current) / 1000
+              store.finalizeMessage(currentMsgIdRef.current, llmTimeRef.current)
+              currentMsgIdRef.current = null
             }
           }
           break

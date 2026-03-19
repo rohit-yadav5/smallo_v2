@@ -1,82 +1,77 @@
+import { useState } from 'react'
 import { StatusBar } from './components/StatusBar'
-import { AICoreSphere } from './components/AICoreSphere'
 import { ConversationStream } from './components/ConversationStream'
-import { MemoryNetwork } from './components/MemoryNetwork'
-import { SystemStats } from './components/SystemStats'
+import { InfoDrawer } from './components/InfoDrawer'
 import { PluginNotifications } from './components/PluginNotifications'
-import { ParticleBackground } from './components/ParticleBackground'
 import { useWebSocket } from './hooks/useWebSocket'
+import { useAppStore } from './store/appStore'
+
+const STATE_FOOTER: Record<string, { emoji: string; label: string }> = {
+  idle:      { emoji: '',   label: '' },
+  listening: { emoji: '🎙', label: 'Listening...' },
+  thinking:  { emoji: '🤔', label: 'Thinking...' },
+  speaking:  { emoji: '💬', label: 'Speaking...' },
+}
 
 export default function App() {
   useWebSocket()
+  const voiceState = useAppStore((s) => s.voiceState)
+  const [drawerOpen, setDrawerOpen] = useState(false)
+
+  const footer = STATE_FOOTER[voiceState]
 
   return (
     <div
-      className="w-screen h-screen flex flex-col overflow-hidden"
-      style={{ background: '#000000', color: '#e4e4e7' }}
+      className="min-h-screen w-screen flex flex-col items-center"
+      style={{ background: 'linear-gradient(135deg, #FFD60A 0%, #FF4D6D 50%, #7B2FBE 100%)' }}
     >
-      <ParticleBackground />
-      <PluginNotifications />
+      <div className="w-full max-w-2xl flex flex-col px-4 py-4 gap-3" style={{ height: '100dvh' }}>
 
-      {/* Status Bar */}
-      <div className="relative z-10 shrink-0">
+        {/* Status bar */}
         <StatusBar />
-        {/* Fade status bar into content below */}
-        <div
-          className="absolute left-0 right-0 bottom-0 translate-y-full pointer-events-none"
-          style={{
-            height: '32px',
-            background: 'linear-gradient(to bottom, rgba(0,0,0,0.8) 0%, transparent 100%)',
-            zIndex: 20,
-          }}
-        />
-      </div>
 
-      {/* Main 3-column layout — no borders, panels bleed into background */}
-      <div className="relative z-10 flex flex-1 overflow-hidden">
+        {/* Conversation — scrollable, fills available space */}
+        <ConversationStream />
 
-        {/* Left: Memory Network — fades rightward into center */}
+        {/* Footer: voice state + drawer toggle */}
         <div
-          className="w-56 shrink-0 p-4"
+          className="flex items-center justify-between px-4 py-2.5 rounded-xl shrink-0"
           style={{
-            background: 'linear-gradient(to right, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.4) 70%, transparent 100%)',
+            background: '#FF6B35',
+            border: '3px solid #000000',
+            boxShadow: '5px 5px 0px #000000',
+            fontFamily: 'Inter, sans-serif',
           }}
         >
-          <MemoryNetwork />
-        </div>
+          <span className="text-sm font-semibold flex items-center gap-1.5" style={{ color: '#ffffff' }}>
+            {footer.emoji && <span>{footer.emoji}</span>}
+            {footer.label || <span style={{ color: 'rgba(255,255,255,0.7)' }}>Ready ✨</span>}
+          </span>
 
-        {/* Center: AI Core + Conversation */}
-        <div className="flex-1 flex flex-col overflow-hidden">
-
-          {/* Sphere */}
-          <div className="flex-shrink-0" style={{ height: '55%' }}>
-            <AICoreSphere />
-          </div>
-
-          {/* Conversation stream — fades up into sphere with mask */}
-          <div
-            className="flex-1 overflow-hidden px-4 py-3"
+          <button
+            className="text-xs flex items-center gap-1 px-3 py-1 rounded-lg transition-all active:translate-y-0.5"
             style={{
-              background: 'linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.55) 25%, rgba(0,0,0,0.75) 100%)',
-              WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, black 18%)',
-              maskImage: 'linear-gradient(to bottom, transparent 0%, black 18%)',
+              fontFamily: 'JetBrains Mono, monospace',
+              color: '#000000',
+              background: '#FFD60A',
+              border: '2px solid #000000',
+              boxShadow: '3px 3px 0px #000000',
+              cursor: 'pointer',
+              fontWeight: 700,
             }}
+            onClick={() => setDrawerOpen((o) => !o)}
           >
-            <ConversationStream />
-          </div>
+            <span>{drawerOpen ? '⌃' : '⌄'}</span>
+            <span>Memory · Stats</span>
+          </button>
         </div>
 
-        {/* Right: System Stats — fades leftward into center */}
-        <div
-          className="w-44 shrink-0 p-4"
-          style={{
-            background: 'linear-gradient(to left, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0.4) 70%, transparent 100%)',
-          }}
-        >
-          <SystemStats />
-        </div>
+        {/* Collapsible info drawer */}
+        <InfoDrawer open={drawerOpen} />
 
       </div>
+
+      <PluginNotifications />
     </div>
   )
 }

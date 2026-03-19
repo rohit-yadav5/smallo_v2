@@ -25,6 +25,7 @@ pyobjc-framework-Quartz==12.1
 rubicon-objc==0.5.3
 
 # ── Web & Networking ─────────────────────────────────────────────────────────
+websockets==14.2
 requests==2.32.5
 httpx==0.28.1
 beautifulsoup4==4.14.3
