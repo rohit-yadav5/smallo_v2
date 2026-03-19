@@ -15,7 +15,7 @@ interface AppState {
   addUserMessage: (text: string, stt_time: number, transcription_time: number) => void
   startAssistantMessage: () => string
   appendToken: (id: string, token: string) => void
-  finalizeMessage: (id: string, llm_time?: number, tts_time?: number, plugin?: string) => void
+  finalizeMessage: (id: string, llm_time?: number, tts_time?: number, plugin?: string, text?: string) => void
   addMemoryNode: (node: Omit<MemoryNode, 'x' | 'y'>) => void
   glowMemoryNode: (id: string) => void
   addPluginNotification: (notif: Omit<PluginNotification, 'id' | 'timestamp'>) => void
@@ -60,10 +60,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     }))
   },
 
-  finalizeMessage: (id, llm_time, tts_time, plugin) => {
+  finalizeMessage: (id, llm_time, tts_time, plugin, text) => {
     set((s) => ({
       messages: s.messages.map((m) =>
-        m.id === id ? { ...m, streaming: false, llm_time, tts_time, plugin } : m
+        m.id === id ? { ...m, streaming: false, llm_time, tts_time, plugin, ...(text !== undefined && { text }) } : m
       ),
       currentStreamId: null,
     }))

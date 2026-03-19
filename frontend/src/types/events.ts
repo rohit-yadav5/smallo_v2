@@ -10,6 +10,7 @@ export interface PluginAction {
   plugin: 'web' | 'computer' | 'security' | string
   action: string
   result: string
+  direct?: boolean
 }
 
 export interface LLMToken {

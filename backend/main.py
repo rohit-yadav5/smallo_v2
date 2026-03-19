@@ -20,9 +20,9 @@ from pathlib import Path
 import psutil
 import websockets
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+BACKEND_DIR = Path(__file__).resolve().parent  # .../smallO_v2/backend
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 from stt import listen, warmup as stt_warmup
 from llm import ask_llm_stream, warmup as llm_warmup
@@ -166,6 +166,7 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
         "plugin": result["plugin"],
         "action": result["action"],
         "result": result["text"][:200],
+        "direct": result["direct"],
     })
     if result["direct"]:
         _emit("VOICE_STATE", {"state": "speaking"})

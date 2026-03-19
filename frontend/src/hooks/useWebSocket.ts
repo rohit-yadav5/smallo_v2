@@ -60,9 +60,12 @@ export function useWebSocket() {
             action: msg.data.action,
             result: msg.data.result,
           })
-          if (currentMsgIdRef.current) {
-            store.finalizeMessage(currentMsgIdRef.current, llmTimeRef.current, undefined, msg.data.plugin)
+          if (msg.data.direct && currentMsgIdRef.current) {
+            // Direct plugin: no LLM tokens will follow — populate text and finalize now
+            store.finalizeMessage(currentMsgIdRef.current, 0, undefined, msg.data.plugin, msg.data.result)
+            currentMsgIdRef.current = null
           }
+          // Summarized plugin: leave currentMsgIdRef intact so LLM_TOKEN events fill the message
           break
 
         case 'MEMORY_EVENT':
