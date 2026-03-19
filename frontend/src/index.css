@@ -12,17 +12,21 @@ body {
   background: #FFD60A;
 }
 
-/* Thin scrollbar — warm toned */
-::-webkit-scrollbar {
-  width: 3px;
+/* Hide scrollbars everywhere — scroll still works */
+* {
+  scrollbar-width: none;        /* Firefox */
+  -ms-overflow-style: none;     /* IE / Edge */
 }
-::-webkit-scrollbar-track {
-  background: transparent;
+*::-webkit-scrollbar {
+  display: none;                /* Chrome / Safari */
 }
-::-webkit-scrollbar-thumb {
-  background: #000000;
-  border-radius: 2px;
+
+/* Side deco — hidden on narrow screens, shown when there's real side space */
+.side-deco {
+  display: none;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: #333333;
+@media (min-width: 920px) {
+  .side-deco {
+    display: block;
+  }
 }
