@@ -56,7 +56,7 @@ def ask_llm(user_text: str) -> str:
             "prompt": prompt,
             "stream": False,
             "options": {
-                "num_predict": 80
+                "num_predict": -1
             }
         },
         timeout=60
@@ -71,8 +71,8 @@ def ask_llm(user_text: str) -> str:
 # =====================
 
 _LLM_OPTIONS = {
-    "num_predict": 60,
-    "stop": ["\n\n", "User:", "Human:"]
+    "num_predict": -1,
+    "stop": ["User:", "Human:"]
 }
 
 
