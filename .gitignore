@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+.env.*
+
+# Database & vector index (runtime data)
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+memory_system/embeddings/faiss.index
+xstorage/
+
+# TTS / STT model files
+*.onnx
+*.onnx.json
+*.pt
+*.bin
+*.ckpt
+
+# Logs
+*.log
+logs/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp

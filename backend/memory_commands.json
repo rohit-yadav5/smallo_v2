@@ -1,0 +1,58 @@
+{
+  "title": "SMALL O V2 – Memory System Command Reference",
+  "sections": {
+    "Memory System Overview": {
+      "id": 1,
+      "description": "Prints a complete health summary of the memory system.",
+      "command": "python -c \"from memory_system.analytics.monitor import generate_health_report; generate_health_report()\""
+    },
+    "Open Database": {
+      "id": 2,
+      "description": "Open the SQLite memory database.",
+      "command": "sqlite3 memory_system/db/memory.db",
+      "exit_command": ".exit"
+    },
+    "View Conversation History": {
+      "id": 3,
+      "queries": {
+        "latest_summaries": "SELECT id, created_at, summary FROM memories WHERE memory_type = 'ReflectionMemory' ORDER BY created_at DESC LIMIT 10;",
+        "latest_full_text": "SELECT text FROM memories WHERE memory_type = 'ReflectionMemory' ORDER BY created_at DESC LIMIT 1;"
+      }
+    },
+    "View Personal Profile Data": {
+      "id": 4,
+      "queries": {
+        "personal_memories": "SELECT summary FROM memories WHERE memory_type = 'PersonalMemory';"
+      }
+    },
+    "View Project Memories": {
+      "id": 5,
+      "queries": {
+        "project_memories": "SELECT id, summary FROM memories WHERE memory_type = 'ProjectMemory' ORDER BY created_at DESC;",
+        "architecture_memories": "SELECT summary FROM memories WHERE memory_type = 'ArchitectureMemory';"
+      }
+    },
+    "View High Importance Memories": {
+      "id": 6,
+      "queries": {
+        "top_important": "SELECT summary, importance_score FROM memories ORDER BY importance_score DESC LIMIT 10;"
+      }
+    },
+    "View Embedding Mapping": {
+      "id": 7,
+      "queries": {
+        "embedding_map": "SELECT memory_id, vector_id, model_name FROM memory_embeddings;"
+      }
+    },
+    "Manual Retrieval Test": {
+      "id": 8,
+      "description": "Run retrieval with debug mode in Python shell.",
+      "steps": [
+        "python",
+        "from memory_system.retrieval.search import retrieve_memories",
+        "retrieve_memories(\"Redis performance\", debug=True)"
+      ],
+      "output": "Returns ranked memories with scoring explanation."
+    }
+  }
+}

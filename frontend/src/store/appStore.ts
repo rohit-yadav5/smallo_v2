@@ -1,0 +1,107 @@
+import { create } from 'zustand'
+import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats } from '../types/events'
+
+interface AppState {
+  voiceState: VoiceState
+  messages: ConversationMessage[]
+  memoryNodes: MemoryNode[]
+  pluginNotifications: PluginNotification[]
+  systemStats: SystemStats
+  memoryCount: number
+  latency: number
+  currentStreamId: string | null
+
+  setVoiceState: (state: VoiceState) => void
+  addUserMessage: (text: string, stt_time: number, transcription_time: number) => void
+  startAssistantMessage: () => string
+  appendToken: (id: string, token: string) => void
+  finalizeMessage: (id: string, llm_time?: number, tts_time?: number, plugin?: string) => void
+  addMemoryNode: (node: Omit<MemoryNode, 'x' | 'y'>) => void
+  glowMemoryNode: (id: string) => void
+  addPluginNotification: (notif: Omit<PluginNotification, 'id' | 'timestamp'>) => void
+  removePluginNotification: (id: string) => void
+  setSystemStats: (stats: SystemStats) => void
+  setLatency: (ms: number) => void
+}
+
+export const useAppStore = create<AppState>((set, get) => ({
+  voiceState: 'idle',
+  messages: [],
+  memoryNodes: [],
+  pluginNotifications: [],
+  systemStats: { cpu: 0, ram: 0, battery: 0 },
+  memoryCount: 0,
+  latency: 0,
+  currentStreamId: null,
+
+  setVoiceState: (state) => set({ voiceState: state }),
+
+  addUserMessage: (text, stt_time, transcription_time) => {
+    const id = crypto.randomUUID()
+    set((s) => ({
+      messages: [...s.messages, { id, role: 'user', text, stt_time, llm_time: transcription_time }],
+    }))
+  },
+
+  startAssistantMessage: () => {
+    const id = crypto.randomUUID()
+    set((s) => ({
+      messages: [...s.messages, { id, role: 'assistant', text: '', streaming: true }],
+      currentStreamId: id,
+    }))
+    return id
+  },
+
+  appendToken: (id, token) => {
+    set((s) => ({
+      messages: s.messages.map((m) =>
+        m.id === id ? { ...m, text: m.text + token } : m
+      ),
+    }))
+  },
+
+  finalizeMessage: (id, llm_time, tts_time, plugin) => {
+    set((s) => ({
+      messages: s.messages.map((m) =>
+        m.id === id ? { ...m, streaming: false, llm_time, tts_time, plugin } : m
+      ),
+      currentStreamId: null,
+    }))
+  },
+
+  addMemoryNode: (node) => {
+    const angle = Math.random() * Math.PI * 2
+    const radius = 60 + Math.random() * 120
+    const x = 50 + Math.cos(angle) * radius * 0.4
+    const y = 50 + Math.sin(angle) * radius * 0.3
+    set((s) => ({
+      memoryNodes: [...s.memoryNodes.slice(-40), { ...node, x, y }],
+      memoryCount: s.memoryCount + 1,
+    }))
+  },
+
+  glowMemoryNode: (id) => {
+    set((s) => ({
+      memoryNodes: s.memoryNodes.map((n) => (n.id === id ? { ...n, glowing: true } : n)),
+    }))
+    setTimeout(() => {
+      set((s) => ({
+        memoryNodes: s.memoryNodes.map((n) => (n.id === id ? { ...n, glowing: false } : n)),
+      }))
+    }, 1500)
+  },
+
+  addPluginNotification: (notif) => {
+    const id = crypto.randomUUID()
+    const full = { ...notif, id, timestamp: Date.now() }
+    set((s) => ({ pluginNotifications: [...s.pluginNotifications, full] }))
+    setTimeout(() => get().removePluginNotification(id), 4000)
+  },
+
+  removePluginNotification: (id) => {
+    set((s) => ({ pluginNotifications: s.pluginNotifications.filter((n) => n.id !== id) }))
+  },
+
+  setSystemStats: (stats) => set({ systemStats: stats }),
+  setLatency: (ms) => set({ latency: ms }),
+}))

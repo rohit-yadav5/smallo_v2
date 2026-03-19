@@ -1,0 +1,37 @@
+# ── Audio & Speech ───────────────────────────────────────────────────────────
+faster-whisper==1.2.1
+piper-tts==1.3.0
+sounddevice==0.5.5
+soundfile==0.13.1
+webrtcvad==2.0.10
+
+# ── LLM & Transformers ───────────────────────────────────────────────────────
+torch==2.10.0
+transformers==5.0.0
+sentence-transformers==5.2.2
+
+# ── Memory & Vector Search ───────────────────────────────────────────────────
+faiss-cpu==1.13.2
+scikit-learn==1.8.0
+numpy==2.4.1
+
+# ── System & Automation ──────────────────────────────────────────────────────
+psutil==7.2.2
+PyAutoGUI==0.9.54
+pyperclip==1.11.0
+
+# ── macOS / ObjC Bindings ────────────────────────────────────────────────────
+pyobjc-framework-Quartz==12.1
+rubicon-objc==0.5.3
+
+# ── Web & Networking ─────────────────────────────────────────────────────────
+requests==2.32.5
+httpx==0.28.1
+beautifulsoup4==4.14.3
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+click==8.3.1
+coloredlogs==15.0.1
+PyYAML==6.0.3
+typer-slim==0.21.1
+cffi==2.0.0
