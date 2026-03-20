@@ -1,4 +1,4 @@
-# Python
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
@@ -8,40 +8,52 @@ __pycache__/
 dist/
 build/
 
-# Virtual environment
+# ── Virtual environment ───────────────────────────────────────────────────────
 .venv/
 venv/
 env/
 
-# Environment variables
+# ── Environment variables ─────────────────────────────────────────────────────
 .env
 .env.*
 
-# Database & vector index (runtime data)
+# ── Database & vector index (runtime-generated, not source) ──────────────────
 **/*.db
 **/*.sqlite
 **/*.sqlite3
-memory_system/embeddings/faiss.index
-xstorage/
+backend/memory_system/embeddings/faiss.index
 
-# TTS / STT model files
+# ── Scratch / experimental folders ───────────────────────────────────────────
+backend/xextra/
+backend/xstorage/
+
+# ── TTS / STT model weights (downloaded at runtime, can be large) ────────────
 *.onnx
 *.onnx.json
 *.pt
 *.bin
 *.ckpt
+*.safetensors
+models/
 
-# Logs
+# ── Frontend build artifacts ──────────────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
 logs/
 
-# macOS
+# ── macOS ─────────────────────────────────────────────────────────────────────
 .DS_Store
+**/.DS_Store
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
+*.swo
 
-#claude
+# ── Claude Code ───────────────────────────────────────────────────────────────
 .claude/
