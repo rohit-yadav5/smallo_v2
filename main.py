@@ -14,10 +14,32 @@ ROOT     = Path(__file__).resolve().parent
 BACKEND  = ROOT / "backend"
 FRONTEND = ROOT / "frontend"
 VENV_PY  = ROOT / ".venv" / "bin" / "python3"
-DEVNULL  = subprocess.DEVNULL
+PYTHON   = str(VENV_PY) if VENV_PY.exists() else sys.executable
 
-# Use the venv Python if it exists, otherwise fall back to the current interpreter.
-PYTHON = str(VENV_PY) if VENV_PY.exists() else sys.executable
+
+def _kill_tree(proc: subprocess.Popen, label: str) -> None:
+    """Terminate a process and all its children (handles npm → vite → esbuild chains)."""
+    try:
+        import psutil
+        parent   = psutil.Process(proc.pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            try: child.terminate()
+            except psutil.NoSuchProcess: pass
+        try: parent.terminate()
+        except psutil.NoSuchProcess: pass
+        _, alive = psutil.wait_procs([parent] + children, timeout=3)
+        for p in alive:
+            try: p.kill()
+            except psutil.NoSuchProcess: pass
+    except Exception:
+        # Fallback if psutil unavailable or process already gone
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
 
 
 def main():
@@ -25,35 +47,29 @@ def main():
     env["PYTHONPATH"] = str(BACKEND)
 
     procs: list[subprocess.Popen] = []
+    frontend_proc: subprocess.Popen | None = None
+    backend_proc:  subprocess.Popen | None = None
 
     try:
-        # ── Backend — fully silent ────────────────────────────────────────────
         backend_proc = subprocess.Popen(
             [PYTHON, "main.py"],
-            cwd=BACKEND,
-            env=env,
-            stdout=DEVNULL,
-            stderr=DEVNULL,
+            cwd=BACKEND, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         procs.append(backend_proc)
 
-        # ── Frontend — fully silent ───────────────────────────────────────────
         frontend_proc = subprocess.Popen(
             ["npm", "run", "dev"],
-            cwd=FRONTEND,
-            env=env,
-            stdout=DEVNULL,
-            stderr=DEVNULL,
+            cwd=FRONTEND, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         procs.append(frontend_proc)
 
-        # Give Vite ~1.5 s to start, then open the browser automatically
         time.sleep(1.5)
         webbrowser.open("http://localhost:5173")
         print("  Small O is running  →  http://localhost:5173")
         print("  Press Ctrl+C to stop.\n")
 
-        # Poll until one process exits
         while True:
             for p in procs:
                 code = p.poll()
@@ -67,13 +83,9 @@ def main():
         print("\n  Stopping Small O...")
 
     finally:
-        for p in procs:
-            p.terminate()
-        for p in procs:
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()
+        for p, label in [(frontend_proc, "frontend"), (backend_proc, "backend")]:
+            if p is not None:
+                _kill_tree(p, label)
         print("  Done.")
 
 

@@ -203,17 +203,37 @@ def main():
     finally:
         stop.set()
         _section("SHUTDOWN", YLW)
+
+        def _kill_tree(proc: subprocess.Popen, label: str) -> None:
+            try:
+                import psutil
+                parent   = psutil.Process(proc.pid)
+                children = parent.children(recursive=True)
+                for child in children:
+                    try: child.terminate()
+                    except psutil.NoSuchProcess: pass
+                try: parent.terminate()
+                except psutil.NoSuchProcess: pass
+                _, alive = psutil.wait_procs([parent] + children, timeout=3)
+                for p in alive:
+                    try: p.kill()
+                    except psutil.NoSuchProcess: pass
+                print(f"  {GRN}✓{R}  {label} stopped")
+            except Exception:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    print(f"  {GRN}✓{R}  {label} stopped")
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    print(f"  {YLW}!{R}  {label} killed (didn't stop in time)")
+                except Exception:
+                    pass
+
         for p in procs:
             label = "BACKEND" if p is backend_proc else "FRONTEND"
-            try:
-                p.terminate()
-                p.wait(timeout=5)
-                print(f"  {GRN}✓{R}  {label} stopped")
-            except subprocess.TimeoutExpired:
-                p.kill()
-                print(f"  {YLW}!{R}  {label} killed (didn't stop in time)")
-            except Exception:
-                pass
+            _kill_tree(p, label)
+
         print(f"\n  {DIM}Done.{R}\n")
 
 

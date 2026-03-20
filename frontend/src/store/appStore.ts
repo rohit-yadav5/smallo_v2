@@ -2,52 +2,56 @@ import { create } from 'zustand'
 import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats } from '../types/events'
 
 interface AppState {
-  voiceState: VoiceState
-  wsConnected: boolean
-  micActive: boolean           // true once the AudioWorklet pipeline is running
-  messages: ConversationMessage[]
-  memoryNodes: MemoryNode[]
-  pluginNotifications: PluginNotification[]
-  systemStats: SystemStats
-  memoryCount: number
-  latency: number
-  currentStreamId: string | null
+  voiceState:           VoiceState
+  wsConnected:          boolean
+  micActive:            boolean          // true once AudioWorklet pipeline is running
+  messages:             ConversationMessage[]
+  memoryNodes:          MemoryNode[]
+  pluginNotifications:  PluginNotification[]
+  systemStats:          SystemStats
+  memoryCount:          number
+  latency:              number
+  currentStreamId:      string | null
 
-  setVoiceState: (state: VoiceState) => void
-  setWsConnected: (connected: boolean) => void
-  setMicActive: (v: boolean) => void
-  addUserMessage: (text: string, stt_time: number, transcription_time: number) => void
-  startAssistantMessage: () => string
-  appendToken: (id: string, token: string) => void
-  finalizeMessage: (id: string, llm_time?: number, tts_time?: number, plugin?: string, text?: string) => void
-  addMemoryNode: (node: Omit<MemoryNode, 'x' | 'y'>) => void
-  glowMemoryNode: (id: string) => void
-  addPluginNotification: (notif: Omit<PluginNotification, 'id' | 'timestamp'>) => void
+  setVoiceState:            (state: VoiceState) => void
+  setWsConnected:           (connected: boolean) => void
+  setMicActive:             (v: boolean) => void
+  addUserMessage:           (text: string, stt_time: number, transcription_time: number) => void
+  startAssistantMessage:    () => string
+  appendToken:              (id: string, token: string) => void
+  finalizeMessage:          (id: string, llm_time?: number, tts_time?: number, plugin?: string, text?: string) => void
+  addMemoryNode:            (node: Omit<MemoryNode, 'x' | 'y'>) => void
+  glowMemoryNode:           (id: string) => void
+  addPluginNotification:    (notif: Omit<PluginNotification, 'id' | 'timestamp'>) => void
   removePluginNotification: (id: string) => void
-  setSystemStats: (stats: SystemStats) => void
-  setLatency: (ms: number) => void
+  setSystemStats:           (stats: SystemStats) => void
+  setLatency:               (ms: number) => void
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
-  voiceState: 'idle',
-  wsConnected: false,
-  micActive: false,
-  messages: [],
-  memoryNodes: [],
+  voiceState:          'idle',
+  wsConnected:         false,
+  micActive:           false,
+  messages:            [],
+  memoryNodes:         [],
   pluginNotifications: [],
-  systemStats: { cpu: 0, ram: 0, battery: 0 },
-  memoryCount: 0,
-  latency: 0,
-  currentStreamId: null,
+  systemStats:         { cpu: 0, ram: 0, battery: 0 },
+  memoryCount:         0,
+  latency:             0,
+  currentStreamId:     null,
 
-  setVoiceState: (state) => set({ voiceState: state }),
+  setVoiceState:  (state)     => set({ voiceState: state }),
   setWsConnected: (connected) => set({ wsConnected: connected }),
-  setMicActive: (v) => set({ micActive: v }),
+  setMicActive:   (v)         => set({ micActive: v }),
 
   addUserMessage: (text, stt_time, transcription_time) => {
     const id = crypto.randomUUID()
     set((s) => ({
-      messages: [...s.messages, { id, role: 'user', text, stt_time, llm_time: transcription_time }],
+      messages: [...s.messages, {
+        id, role: 'user', text,
+        stt_time,           // recording duration
+        transcription_time, // whisper processing time
+      }],
     }))
   },
 
@@ -71,14 +75,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   finalizeMessage: (id, llm_time, tts_time, plugin, text) => {
     set((s) => ({
       messages: s.messages.map((m) =>
-        m.id === id ? { ...m, streaming: false, llm_time, tts_time, plugin, ...(text !== undefined && { text }) } : m
+        m.id === id
+          ? { ...m, streaming: false, llm_time, tts_time, plugin, ...(text !== undefined && { text }) }
+          : m
       ),
       currentStreamId: null,
     }))
   },
 
   addMemoryNode: (node) => {
-    const angle = Math.random() * Math.PI * 2
+    const angle  = Math.random() * Math.PI * 2
     const radius = 60 + Math.random() * 120
     const x = 50 + Math.cos(angle) * radius * 0.4
     const y = 50 + Math.sin(angle) * radius * 0.3
@@ -100,7 +106,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   addPluginNotification: (notif) => {
-    const id = crypto.randomUUID()
+    const id   = crypto.randomUUID()
     const full = { ...notif, id, timestamp: Date.now() }
     set((s) => ({ pluginNotifications: [...s.pluginNotifications, full] }))
     setTimeout(() => get().removePluginNotification(id), 4000)
@@ -111,5 +117,5 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   setSystemStats: (stats) => set({ systemStats: stats }),
-  setLatency: (ms) => set({ latency: ms }),
+  setLatency:     (ms)    => set({ latency: ms }),
 }))

@@ -224,6 +224,8 @@ def _store_action_memory(user_text: str, spoken_text: str, result: dict):
 # ──────────────────────────────────────────────────
 
 def _stats_loop():
+    psutil.cpu_percent(interval=None)   # prime the baseline — first call always returns 0.0
+    time.sleep(0.5)
     while True:
         try:
             battery = psutil.sensors_battery()
@@ -265,14 +267,30 @@ def _pipeline_loop():
         print(f"  Turn {turn}")
         print(f"{'─' * 54}")
 
+        # ── Clear stale audio from previous turns ────────
+        cleared = 0
+        while not _audio_queue.empty():
+            try:
+                _audio_queue.get_nowait()
+                cleared += 1
+            except queue.Empty:
+                break
+        if cleared:
+            print(f"  [pipeline] cleared {cleared} stale audio chunk(s) from queue")
+
         # ── Wait for audio from browser mic ─────────────
         _emit("VOICE_STATE", {"state": "listening"})
         print(f"  [pipeline] VOICE_STATE → listening  (queue depth: {_audio_queue.qsize()})")
         with tracker.step("STT"):
-            rec_start   = time.perf_counter()
+            rec_start = time.perf_counter()
             print(f"  [stt] blocking on audio queue...")
-            audio_bytes = _audio_queue.get()          # blocks until browser sends audio
-            rec_secs    = time.perf_counter() - rec_start
+            try:
+                audio_bytes = _audio_queue.get(timeout=120)   # 2-min safety timeout
+            except queue.Empty:
+                print("  [pipeline] audio queue timeout after 120s — re-entering listen loop")
+                _emit("VOICE_STATE", {"state": "idle"})
+                continue
+            rec_secs = time.perf_counter() - rec_start
 
             # First 4 bytes = uint32 sample rate sent by browser
             src_sr     = int(np.frombuffer(audio_bytes[:4], dtype=np.uint32)[0])
@@ -394,12 +412,27 @@ async def _ws_handler(ws):
     try:
         async for message in ws:
             if isinstance(message, bytes):
-                kb     = len(message) / 1024
-                src_sr = int(np.frombuffer(message[:4], dtype=np.uint32)[0]) if len(message) >= 4 else 0
-                secs   = (len(message) - 4) / (4 * src_sr) if src_sr > 0 else 0
-                q      = _audio_queue.qsize()
+                # Validate minimum size: 4-byte header + at least 1 sample (4 bytes)
+                if len(message) < 8:
+                    print(f"  [ws] ignoring too-short binary message ({len(message)} bytes)")
+                    continue
+                src_sr = int(np.frombuffer(message[:4], dtype=np.uint32)[0])
+                if src_sr == 0 or src_sr > 192000:
+                    print(f"  [ws] ignoring message with invalid sample rate: {src_sr}")
+                    continue
+                kb   = len(message) / 1024
+                secs = (len(message) - 4) / (4 * src_sr)
+                q    = _audio_queue.qsize()
                 print(f"  [ws] audio received  {kb:.1f} KB  ~{secs:.2f}s  src_sr={src_sr}  queue_depth={q}")
                 _audio_queue.put_nowait(message)
+            else:
+                # JSON control messages (e.g. ping from frontend heartbeat)
+                try:
+                    ctrl = json.loads(message)
+                    if ctrl.get('event') == 'ping':
+                        await ws.send(json.dumps({'event': 'pong', 'data': {}}))
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
