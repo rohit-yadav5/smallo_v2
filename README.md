@@ -14,25 +14,6 @@ reasons with a local LLM via Ollama, and speaks the response with Piper TTS — 
 in real time, streamed token by token to a cartoon-styled frontend.
 
 ---
-
-## Architecture
-
-```
-Browser (React)
-│
-│  getUserMedia() → AudioWorklet → silence detection
-│  Float32 audio chunks ──────────────────────────────────► WebSocket (ws://localhost:8765)
-│                                                                        │
-│  ◄── JSON events (VOICE_STATE, STT_RESULT, LLM_TOKEN, ...) ───────────┤
-│                                                               Python Backend
-│                                                               │
-│                                                               ├─ faster-whisper  (STT)
-│                                                               ├─ Ollama HTTP API (LLM)
-│                                                               ├─ piper-tts        (TTS → speakers)
-│                                                               ├─ Memory System    (FAISS + SQLite)
-│                                                               └─ Plugin Router    (web / computer / security)
-```
-
 ### Audio pipeline (browser → backend)
 
 | Step | Where | What happens |
