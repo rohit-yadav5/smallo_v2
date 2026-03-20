@@ -10,12 +10,15 @@ Events emitted (JSON: {"event": "...", "data": {...}}):
 """
 import asyncio
 import json
+import queue
 import re
 import sys
 import threading
 import time
 from collections import Counter
 from pathlib import Path
+
+import numpy as np
 
 import psutil
 import websockets
@@ -24,7 +27,7 @@ BACKEND_DIR = Path(__file__).resolve().parent  # .../smallO_v2/backend
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from stt import listen, warmup as stt_warmup
+from stt import transcribe, warmup as stt_warmup
 from llm import ask_llm_stream, warmup as llm_warmup
 from tts import speak, speak_stream, warmup as tts_warmup
 from memory_system.retrieval.search import retrieve_memories
@@ -39,10 +42,15 @@ from utils.latency import LatencyTracker
 
 _loop: asyncio.AbstractEventLoop | None = None
 _clients: set = set()
+_audio_queue: queue.Queue = queue.Queue()  # browser sends raw float32 audio here
+_current_voice_state: str = "idle"         # tracked so new clients get the current state
 
 
 def _emit(event: str, data: dict):
     """Thread-safe broadcast to all connected WebSocket clients."""
+    global _current_voice_state
+    if event == "VOICE_STATE":
+        _current_voice_state = data.get("state", _current_voice_state)
     if not _loop or not _clients:
         return
 
@@ -252,16 +260,44 @@ def _pipeline_loop():
     turn = 0
     while True:
         turn += 1
-        tracker = LatencyTracker()
+        tracker = LatencyTracker(turn=turn)
         print(f"\n{'─' * 54}")
         print(f"  Turn {turn}")
         print(f"{'─' * 54}")
 
-        # ── Listen ──────────────────────────────────────
+        # ── Wait for audio from browser mic ─────────────
         _emit("VOICE_STATE", {"state": "listening"})
+        print(f"  [pipeline] VOICE_STATE → listening  (queue depth: {_audio_queue.qsize()})")
         with tracker.step("STT"):
-            user_text, rec_secs, trans_secs = listen()
-        print(f"    [stt] speaking: {rec_secs:.3f}s  |  transcription: {trans_secs:.3f}s")
+            rec_start   = time.perf_counter()
+            print(f"  [stt] blocking on audio queue...")
+            audio_bytes = _audio_queue.get()          # blocks until browser sends audio
+            rec_secs    = time.perf_counter() - rec_start
+
+            # First 4 bytes = uint32 sample rate sent by browser
+            src_sr     = int(np.frombuffer(audio_bytes[:4], dtype=np.uint32)[0])
+            audio_data = np.frombuffer(audio_bytes[4:], dtype=np.float32).copy()
+            samples    = len(audio_data)
+            dur_raw    = samples / src_sr if src_sr > 0 else samples / 16000
+
+            tracker.note(f"audio received: {dur_raw:.2f}s  {samples} samples  {len(audio_bytes)/1024:.1f} KB  src_sr={src_sr} Hz")
+            print(f"  [stt] audio received after {rec_secs:.3f}s — {dur_raw:.2f}s @ {src_sr} Hz")
+
+            # Resample to 16 kHz if browser gave a different rate
+            if src_sr != 16000 and src_sr > 0:
+                target_len = int(samples * 16000 / src_sr)
+                audio_data = np.interp(
+                    np.linspace(0, samples, target_len),
+                    np.arange(samples),
+                    audio_data,
+                ).astype(np.float32)
+                tracker.note(f"resampled {src_sr} Hz → 16000 Hz  ({samples} → {target_len} samples)")
+                print(f"  [stt] resampled {src_sr} Hz → 16000 Hz")
+
+            user_text, trans_secs = transcribe(audio_data)
+            tracker.note(f"transcript: '{user_text[:70]}{'…' if len(user_text)>70 else ''}'  ({trans_secs:.3f}s)")
+
+        print(f"  [stt] wait={rec_secs:.3f}s  transcription={trans_secs:.3f}s")
         print(f"\n  You said: {user_text}\n")
 
         if not user_text:
@@ -348,9 +384,24 @@ def _pipeline_loop():
 
 async def _ws_handler(ws):
     _clients.add(ws)
-    print(f"  [ws] client connected  ({len(_clients)} total)")
+    print(f"  [ws] client connected  ({len(_clients)} total)  addr={ws.remote_address}")
+    # Send current state immediately so a late-connecting frontend doesn't miss it
     try:
-        await ws.wait_closed()
+        await ws.send(json.dumps({"event": "VOICE_STATE", "data": {"state": _current_voice_state}}))
+        print(f"  [ws] sent current state to new client: {_current_voice_state}")
+    except Exception:
+        pass
+    try:
+        async for message in ws:
+            if isinstance(message, bytes):
+                kb     = len(message) / 1024
+                src_sr = int(np.frombuffer(message[:4], dtype=np.uint32)[0]) if len(message) >= 4 else 0
+                secs   = (len(message) - 4) / (4 * src_sr) if src_sr > 0 else 0
+                q      = _audio_queue.qsize()
+                print(f"  [ws] audio received  {kb:.1f} KB  ~{secs:.2f}s  src_sr={src_sr}  queue_depth={q}")
+                _audio_queue.put_nowait(message)
+    except Exception:
+        pass
     finally:
         _clients.discard(ws)
         print(f"  [ws] client disconnected  ({len(_clients)} remaining)")

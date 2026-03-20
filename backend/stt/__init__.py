@@ -1,3 +1,3 @@
-from stt.main_stt import listen, warmup
+from stt.main_stt import transcribe, warmup
 
-__all__ = ["listen", "warmup"]
+__all__ = ["transcribe", "warmup"]

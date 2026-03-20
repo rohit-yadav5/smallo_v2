@@ -4,6 +4,7 @@ import { ConversationStream } from './components/ConversationStream'
 import { InfoDrawer } from './components/InfoDrawer'
 import { PluginNotifications } from './components/PluginNotifications'
 import { useWebSocket } from './hooks/useWebSocket'
+import { useMicrophone } from './hooks/useMicrophone'
 import { useAppStore } from './store/appStore'
 
 /* ── Cartoon doodles — left side ─────────────────────────────── */
@@ -106,6 +107,7 @@ const STATE_FOOTER: Record<string, { emoji: string; label: string }> = {
 
 export default function App() {
   useWebSocket()
+  useMicrophone()
   const voiceState = useAppStore((s) => s.voiceState)
   const [drawerOpen, setDrawerOpen] = useState(false)
 
@@ -138,7 +140,7 @@ export default function App() {
         >
           <span className="text-sm font-semibold flex items-center gap-1.5" style={{ color: '#ffffff' }}>
             {footer.emoji && <span>{footer.emoji}</span>}
-            {footer.label || <span style={{ color: 'rgba(255,255,255,0.7)' }}>Ready ✨</span>}
+            {footer.label || <span style={{ color: 'rgba(255,255,255,0.7)' }}>Getting Ready ✨</span>}
           </span>
 
           <button

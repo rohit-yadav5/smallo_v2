@@ -3,6 +3,8 @@ import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, S
 
 interface AppState {
   voiceState: VoiceState
+  wsConnected: boolean
+  micActive: boolean           // true once the AudioWorklet pipeline is running
   messages: ConversationMessage[]
   memoryNodes: MemoryNode[]
   pluginNotifications: PluginNotification[]
@@ -12,6 +14,8 @@ interface AppState {
   currentStreamId: string | null
 
   setVoiceState: (state: VoiceState) => void
+  setWsConnected: (connected: boolean) => void
+  setMicActive: (v: boolean) => void
   addUserMessage: (text: string, stt_time: number, transcription_time: number) => void
   startAssistantMessage: () => string
   appendToken: (id: string, token: string) => void
@@ -26,6 +30,8 @@ interface AppState {
 
 export const useAppStore = create<AppState>((set, get) => ({
   voiceState: 'idle',
+  wsConnected: false,
+  micActive: false,
   messages: [],
   memoryNodes: [],
   pluginNotifications: [],
@@ -35,6 +41,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   currentStreamId: null,
 
   setVoiceState: (state) => set({ voiceState: state }),
+  setWsConnected: (connected) => set({ wsConnected: connected }),
+  setMicActive: (v) => set({ micActive: v }),
 
   addUserMessage: (text, stt_time, transcription_time) => {
     const id = crypto.randomUUID()

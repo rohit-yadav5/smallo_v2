@@ -1,12 +1,13 @@
 import { useEffect, useRef } from 'react'
 import { useAppStore } from '../store/appStore'
+import { wsRef } from '../lib/wsRef'
 import type { WSEvent } from '../types/events'
 
 const WS_URL = 'ws://localhost:8765'
 
 export function useWebSocket() {
   const store = useAppStore()
-  const wsRef = useRef<WebSocket | null>(null)
+  const localWsRef = useRef<WebSocket | null>(null)
   const llmStartRef = useRef<number>(0)
   const currentMsgIdRef = useRef<string | null>(null)
   const llmTimeRef = useRef<number>(0)
@@ -16,7 +17,12 @@ export function useWebSocket() {
 
     function connect() {
       const ws = new WebSocket(WS_URL)
-      wsRef.current = ws
+      localWsRef.current = ws
+      wsRef.current = ws  // share with useMicrophone
+
+      ws.onopen = () => {
+        store.setWsConnected(true)
+      }
 
       ws.onmessage = (e) => {
         try {
@@ -26,6 +32,8 @@ export function useWebSocket() {
       }
 
       ws.onclose = () => {
+        wsRef.current = null
+        store.setWsConnected(false)
         reconnectTimer = setTimeout(connect, 3000)
       }
     }
@@ -90,7 +98,8 @@ export function useWebSocket() {
     connect()
     return () => {
       clearTimeout(reconnectTimer)
-      wsRef.current?.close()
+      localWsRef.current?.close()
+      wsRef.current = null
     }
   }, [])
 }
