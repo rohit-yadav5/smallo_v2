@@ -1,46 +1,123 @@
 import time
 from contextlib import contextmanager
+from datetime import datetime
+
+# ── ANSI colours ─────────────────────────────────────────────────────
+_R  = "\033[0m"
+_B  = "\033[1m"
+_DIM= "\033[2m"
+_GRN= "\033[92m"
+_YLW= "\033[93m"
+_RED= "\033[91m"
+_CYN= "\033[96m"
+_MAG= "\033[95m"
+_WHT= "\033[97m"
+_BLU= "\033[94m"
+
+# Speed thresholds (seconds)
+_FAST   = 0.5
+_MEDIUM = 2.0
+
+def _speed_color(secs: float) -> str:
+    if secs < _FAST:
+        return _GRN
+    if secs < _MEDIUM:
+        return _YLW
+    return _RED
+
+def _ts() -> str:
+    return datetime.now().strftime("%H:%M:%S.%f")[:12]
+
+def _bar(duration: float, longest: float, width: int = 20) -> str:
+    if longest <= 0:
+        return ""
+    filled = int((duration / longest) * width)
+    return "█" * filled + "░" * (width - filled)
 
 
 class LatencyTracker:
     """
-    Per-turn latency tracker.
+    Per-turn latency tracker with detailed timing, colour coding,
+    bottleneck detection, and sub-step annotations.
 
     Usage:
-        tracker = LatencyTracker()
+        tracker = LatencyTracker(turn=1)
         with tracker.step("STT"):
             ...
+            tracker.note("audio: 2.1s, 33 KB")
         tracker.summary()
     """
 
-    _BAR_WIDTH = 18
+    _BAR_WIDTH = 20
 
-    def __init__(self):
+    def __init__(self, turn: int = 0):
+        self._turn       = turn
         self._turn_start = time.perf_counter()
-        self._steps: list[tuple[str, float]] = []
+        self._steps      : list[tuple[str, float, list[str]]] = []
+        self._current_notes: list[str] = []
+
+    def note(self, msg: str):
+        """Attach a detail annotation to the current step."""
+        self._current_notes.append(msg)
+        print(f"  {_DIM}       ↳ {msg}{_R}", flush=True)
 
     @contextmanager
     def step(self, name: str):
-        print(f"  → {name}", flush=True)
+        ts = _ts()
+        print(f"\n  {_BLU}{_B}▶ {name}{_R}  {_DIM}({ts}){_R}", flush=True)
         t0 = time.perf_counter()
-        yield
-        duration = time.perf_counter() - t0
+        self._current_notes = []
+        try:
+            yield
+        except Exception as exc:
+            duration = time.perf_counter() - t0
+            self._steps.append((name, duration, list(self._current_notes)))
+            print(f"  {_RED}{_B}✗ {name}{_R}  {_RED}{duration:.3f}s  ERROR: {exc}{_R}", flush=True)
+            raise
+        duration   = time.perf_counter() - t0
         cumulative = time.perf_counter() - self._turn_start
-        self._steps.append((name, duration))
-        print(f"  ✓ {name:<32} {duration:6.3f}s   [+{cumulative:.3f}s]")
+        col        = _speed_color(duration)
+        self._steps.append((name, duration, list(self._current_notes)))
+        print(
+            f"  {col}{_B}✓ {name}{_R}"
+            f"  {col}{duration:.3f}s{_R}"
+            f"  {_DIM}[total {cumulative:.3f}s]{_R}",
+            flush=True,
+        )
 
     def summary(self):
-        total = time.perf_counter() - self._turn_start
-        longest = max((d for _, d in self._steps), default=1.0)
+        total   = time.perf_counter() - self._turn_start
+        longest = max((d for _, d, _ in self._steps), default=1.0)
+
+        # Find bottleneck
+        if self._steps:
+            bottleneck_name, bottleneck_dur, _ = max(self._steps, key=lambda x: x[1])
+        else:
+            bottleneck_name, bottleneck_dur = "–", 0.0
 
         print()
-        print("  ┌─ Turn Breakdown " + "─" * 35 + "┐")
-        for name, duration in self._steps:
-            pct = (duration / total * 100) if total > 0 else 0
-            bar_len = int((duration / longest) * self._BAR_WIDTH)
-            bar = "█" * bar_len
-            print(f"  │  {name:<28}  {duration:6.3f}s  {pct:5.1f}%  {bar}")
-        print("  ├" + "─" * 52 + "┤")
-        print(f"  │  {'TOTAL':<28}  {total:6.3f}s")
-        print("  └" + "─" * 52 + "┘")
+        print(f"  {_WHT}{_B}┌─ Turn {self._turn} Breakdown {'─' * 38}┐{_R}")
+        for name, dur, notes in self._steps:
+            col    = _speed_color(dur)
+            pct    = (dur / total * 100) if total > 0 else 0
+            bar    = _bar(dur, longest, self._BAR_WIDTH)
+            flag   = f"  {_RED}◀ BOTTLENECK{_R}" if name == bottleneck_name else ""
+            print(
+                f"  {_WHT}│{_R}  {name:<30}"
+                f"  {col}{dur:6.3f}s{_R}"
+                f"  {_DIM}{pct:5.1f}%{_R}"
+                f"  {col}{bar}{_R}"
+                f"{flag}"
+            )
+            for n in notes:
+                print(f"  {_WHT}│{_R}     {_DIM}↳ {n}{_R}")
+
+        print(f"  {_WHT}├{'─' * 64}┤{_R}")
+        total_col = _speed_color(total / max(len(self._steps), 1))
+        print(
+            f"  {_WHT}│{_R}  {'TOTAL':<30}  {total_col}{_B}{total:6.3f}s{_R}"
+            f"  {_DIM}({len(self._steps)} steps){_R}"
+        )
+        print(f"  {_WHT}│{_R}  {'BOTTLENECK':<30}  {_YLW}{bottleneck_name}  {bottleneck_dur:.3f}s{_R}")
+        print(f"  {_WHT}└{'─' * 64}┘{_R}")
         print()

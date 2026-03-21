@@ -10,6 +10,7 @@ export interface PluginAction {
   plugin: 'web' | 'computer' | 'security' | string
   action: string
   result: string
+  direct?: boolean
 }
 
 export interface LLMToken {
@@ -30,12 +31,13 @@ export interface MemoryEvent {
 }
 
 export type WSEvent =
-  | { event: 'STT_RESULT'; data: STTResult }
+  | { event: 'STT_RESULT';    data: STTResult }
   | { event: 'PLUGIN_ACTION'; data: PluginAction }
-  | { event: 'LLM_TOKEN'; data: LLMToken }
-  | { event: 'VOICE_STATE'; data: VoiceStateEvent }
-  | { event: 'MEMORY_EVENT'; data: MemoryEvent }
-  | { event: 'SYSTEM_STATS'; data: SystemStats }
+  | { event: 'LLM_TOKEN';     data: LLMToken }
+  | { event: 'VOICE_STATE';   data: VoiceStateEvent }
+  | { event: 'MEMORY_EVENT';  data: MemoryEvent }
+  | { event: 'SYSTEM_STATS';  data: SystemStats }
+  | { event: 'pong';          data: Record<string, never> }
 
 export interface SystemStats {
   cpu: number
@@ -48,8 +50,9 @@ export interface ConversationMessage {
   role: 'user' | 'assistant'
   text: string
   streaming?: boolean
-  stt_time?: number
-  llm_time?: number
+  stt_time?: number            // recording duration (how long user spoke)
+  transcription_time?: number  // whisper processing time
+  llm_time?: number            // LLM generation time (assistant only)
   tts_time?: number
   plugin?: string
 }

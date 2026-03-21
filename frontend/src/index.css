@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap');
 @import "tailwindcss";
 
 * {
@@ -9,17 +9,24 @@
 
 body {
   overflow: hidden;
-  background: #000000;
+  background: #FFD60A;
 }
 
-/* Thin scrollbar */
-::-webkit-scrollbar {
-  width: 3px;
+/* Hide scrollbars everywhere — scroll still works */
+* {
+  scrollbar-width: none;        /* Firefox */
+  -ms-overflow-style: none;     /* IE / Edge */
 }
-::-webkit-scrollbar-track {
-  background: transparent;
+*::-webkit-scrollbar {
+  display: none;                /* Chrome / Safari */
 }
-::-webkit-scrollbar-thumb {
-  background: rgba(139, 92, 246, 0.3);
-  border-radius: 2px;
+
+/* Side deco — hidden on narrow screens, shown when there's real side space */
+.side-deco {
+  display: none;
+}
+@media (min-width: 920px) {
+  .side-deco {
+    display: block;
+  }
 }
