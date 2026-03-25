@@ -28,6 +28,9 @@ interface AppState {
   setLatency:               (ms: number) => void
 }
 
+// Module-level map — cancels stale glow timers when same node glows again
+const _glowTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
 export const useAppStore = create<AppState>((set, get) => ({
   voiceState:          'idle',
   wsConnected:         false,
@@ -95,14 +98,21 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   glowMemoryNode: (id) => {
+    // Cancel any existing timer for this node before starting a new one
+    const existing = _glowTimers.get(id)
+    if (existing !== undefined) clearTimeout(existing)
+
     set((s) => ({
       memoryNodes: s.memoryNodes.map((n) => (n.id === id ? { ...n, glowing: true } : n)),
     }))
-    setTimeout(() => {
+
+    const t = setTimeout(() => {
+      _glowTimers.delete(id)
       set((s) => ({
         memoryNodes: s.memoryNodes.map((n) => (n.id === id ? { ...n, glowing: false } : n)),
       }))
     }, 1500)
+    _glowTimers.set(id, t)
   },
 
   addPluginNotification: (notif) => {
