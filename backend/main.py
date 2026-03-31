@@ -38,7 +38,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from stt import transcribe, warmup as stt_warmup
-from stt.vad import StreamingVAD
+from vad import StreamingVAD
 from llm import ask_llm_stream, warmup as llm_warmup
 from tts import speak, speak_stream, warmup as tts_warmup, abort_speaking
 from memory_system.retrieval.search import retrieve_memories
@@ -65,6 +65,15 @@ _interrupt_event: threading.Event = threading.Event()
 
 # Current voice state — cached so new WS clients get it immediately
 _current_voice_state: str = "idle"
+
+# Partial bot response saved when user barge-ins mid-sentence.
+# Injected into the next turn's LLM prompt so the bot knows where it left off.
+_interrupted_partial: str = ""
+
+# Barge-in utterance that completed (start→end) while TTS was still playing.
+# Saved here to bypass the stale-queue clearing at the start of the next turn.
+_barge_in_utterance: np.ndarray | None = None
+_barge_in_lock: threading.Lock = threading.Lock()
 
 
 def _emit(event: str, data: dict):
@@ -94,12 +103,22 @@ def _emit(event: str, data: dict):
 
 def _vad_loop():
     """
-    Read raw audio chunks from _audio_queue, feed to Silero VAD.
+    Read raw audio chunks from _audio_queue, feed to StreamingVAD.
 
-    Behaviour by pipeline state:
-      listening → accumulate speech; on complete utterance → _speech_queue
-      speaking  → detect speech onset → abort TTS + set _interrupt_event
-      idle/thinking → process to keep pre-speech buffer warm; discard output
+    Behaviour by pipeline state
+    ────────────────────────────
+    listening  → accumulate speech → on complete utterance → _speech_queue
+    speaking   → grace period (400 ms) then detect barge-in
+                 Requires 2 consecutive speech windows to avoid echo triggers.
+    idle/think → feed VAD to keep pre-speech ring warm; discard output.
+
+    Grace period
+    ────────────
+    After transitioning to "speaking", the first 400 ms of audio is ignored.
+    This prevents the bot's own TTS (echoed through the microphone) from
+    immediately triggering a false barge-in before any speech plays.
+
+    Inspired by vad_2/vad_engine_silero architecture.
     """
     vad = StreamingVAD(
         onset_threshold  = 0.50,
@@ -107,9 +126,17 @@ def _vad_loop():
         silence_ms       = 600,
         min_speech_ms    = 250,
         pre_pad_ms       = 200,
+        onset_count      = 2,    # 2 consecutive windows ≈ 32 ms before onset fires
     )
 
-    print("  [vad] Silero VAD ready")
+    print("  [vad] Silero VAD ready  (grace=400ms  onset_count=2  step=256)", flush=True)
+
+    # ── State-transition tracking ─────────────────────────────────────
+    _prev_state:          str   = ""
+    _speaking_started_at: float = 0.0
+    _BARGE_IN_GRACE_S:    float = 0.40   # 400 ms echo-suppression grace period
+    _barge_in_consec:     int   = 0      # consecutive speech-window counter
+    _BARGE_IN_MIN:        int   = 2      # windows needed to confirm barge-in
 
     while True:
         try:
@@ -136,26 +163,68 @@ def _vad_loop():
 
         state = _current_voice_state
 
-        # ── Barge-in detection (TTS speaking) ────────────
+        # ── Detect state transitions ─────────────────────
+        if state != _prev_state:
+            if state == "speaking":
+                # Reset LSTM so idle/thinking state doesn't bleed into barge-in
+                vad.reset()
+                _speaking_started_at = time.perf_counter()
+                _barge_in_consec     = 0
+                print("  [vad] → speaking  (LSTM reset, grace period armed)", flush=True)
+            elif state == "listening" and _prev_state in ("idle", "thinking"):
+                vad.reset()
+                print(f"  [vad] → listening  (LSTM reset, from {_prev_state})", flush=True)
+            _prev_state = state
+
+        # ── Speaking: barge-in detection ─────────────────
         if state == "speaking":
+            elapsed = time.perf_counter() - _speaking_started_at
+            if elapsed < _BARGE_IN_GRACE_S:
+                # Grace period — feed to keep ring warm but don't trigger barge-in
+                vad.process(samples)
+                continue
+
             utterance = vad.process(samples)
-            if vad.is_speaking and not _interrupt_event.is_set():
-                print("  [vad] ⚡ BARGE-IN — user spoke during TTS")
-                abort_speaking()          # cut audio immediately
-                _interrupt_event.set()   # signal pipeline to restart
-                vad.reset()              # clean state for next listen session
+
+            # Debounce: track consecutive speech windows
+            if vad.is_speaking:
+                _barge_in_consec += 1
+            else:
+                _barge_in_consec = max(0, _barge_in_consec - 1)
+
+            short_burst     = utterance is not None and len(utterance) > 0
+            sustained       = _barge_in_consec >= _BARGE_IN_MIN
+            speech_detected = sustained or short_burst
+
+            if speech_detected and not _interrupt_event.is_set():
+                kind = "sustained" if sustained else "burst"
+                dur  = (f"{len(utterance)/16_000:.2f}s" if short_burst
+                        else f"{_barge_in_consec} frames")
+                print(f"  [vad] ⚡ BARGE-IN ({kind}  {dur})  grace+{elapsed:.2f}s", flush=True)
+                abort_speaking()
+                _interrupt_event.set()
+                _barge_in_consec = 0
+
+            if _interrupt_event.is_set() and short_burst:
+                dur = len(utterance) / 16_000
+                print(f"  [vad] → barge-in utterance captured  {dur:.2f}s  (incl. pre-speech)", flush=True)
+                with _barge_in_lock:
+                    global _barge_in_utterance
+                    _barge_in_utterance = utterance
+                vad.reset()
             continue
 
-        # ── Normal speech capture (pipeline listening) ───
+        # ── Listening: normal speech capture ─────────────
         if state == "listening":
             utterance = vad.process(samples)
             if utterance is not None and len(utterance) > 0:
                 dur = len(utterance) / 16_000
-                print(f"  [vad] → utterance queued  {dur:.2f}s")
+                print(f"  [vad] → utterance queued  {dur:.2f}s", flush=True)
                 _speech_queue.put_nowait(utterance)
+                vad.reset()
             continue
 
-        # ── Idle / thinking — keep pre-speech buffer warm ─
+        # ── Idle / thinking — keep pre-speech ring warm ──
         vad.process(samples)
 
 
@@ -254,12 +323,23 @@ def _build_memory_context(user_text: str) -> str:
 # Token broadcaster
 # ──────────────────────────────────────────────────
 
-def _token_broadcaster(token_gen):
-    """Wrap an LLM generator: emit LLM_TOKEN events while yielding to TTS."""
+def _token_broadcaster(token_gen, interrupt_event=None):
+    """
+    Wrap an LLM generator: emit LLM_TOKEN events while yielding to TTS.
+
+    Stops emitting as soon as interrupt_event is set so the frontend doesn't
+    keep receiving tokens after a barge-in.  The generator itself keeps running
+    in its producer thread (inside speak_stream) until it's naturally exhausted.
+    """
+    _token_count = 0
     for token in token_gen:
+        if interrupt_event and interrupt_event.is_set():
+            _emit("LLM_TOKEN", {"token": "", "done": True})
+            return
         _emit("LLM_TOKEN", {"token": token, "done": False})
+        _token_count += 1
         yield token
-    _emit("LLM_TOKEN", {"token": "", "done": True})
+    _emit("LLM_TOKEN", {"token": "", "done": True, "token_count": _token_count})
 
 
 # ──────────────────────────────────────────────────
@@ -294,7 +374,7 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
         with tracker.step("LLM + TTS (plugin summarize)"):
             try:
                 ai_text, tts_timing = speak_stream(
-                    _token_broadcaster(ask_llm_stream(summary_prompt)),
+                    _token_broadcaster(ask_llm_stream(summary_prompt), _interrupt_event),
                     _interrupt_event,
                 )
             except Exception as e:
@@ -357,10 +437,10 @@ def _stats_loop():
 # ──────────────────────────────────────────────────
 
 def _pipeline_loop():
-    print("  Warming up models...")
-    t0 = time.perf_counter(); stt_warmup(); print(f"    STT  ready  ({time.perf_counter()-t0:.2f}s)")
-    t0 = time.perf_counter(); tts_warmup(); print(f"    TTS  ready  ({time.perf_counter()-t0:.2f}s)")
-    t0 = time.perf_counter(); llm_warmup(); print(f"    LLM  ready  ({time.perf_counter()-t0:.2f}s)")
+    print("  Warming up models...", flush=True)
+    t0 = time.perf_counter(); stt_warmup(); print(f"    STT  ready  ({time.perf_counter()-t0:.2f}s)", flush=True)
+    t0 = time.perf_counter(); tts_warmup(); print(f"    TTS  ready  ({time.perf_counter()-t0:.2f}s)", flush=True)
+    t0 = time.perf_counter(); llm_warmup(); print(f"    LLM  ready  ({time.perf_counter()-t0:.2f}s)", flush=True)
 
     print("\n  Loading plugins...")
     try:
@@ -390,6 +470,14 @@ def _pipeline_loop():
 
 def _run_turn(turn: int, tracker: LatencyTracker, router):
     """Execute one full pipeline turn. Called inside the crash-guard try/except."""
+    global _interrupted_partial, _barge_in_utterance
+
+    # ── Grab barge-in utterance BEFORE clearing the queue ─────────────────
+    # If the user's interrupting speech completed as a short burst while TTS was
+    # still playing, it was saved here to survive the stale-queue clearing below.
+    with _barge_in_lock:
+        carry_utterance = _barge_in_utterance
+        _barge_in_utterance = None
 
     # ── Clear stale complete utterances from previous turn ───────────────
     cleared = 0
@@ -408,13 +496,18 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
 
     with tracker.step("STT"):
         rec_start = time.perf_counter()
-        print(f"  [stt] waiting for utterance from VAD...")
-        try:
-            audio_data = _speech_queue.get(timeout=120)   # float32 @ 16kHz
-        except queue.Empty:
-            print("  [pipeline] no speech for 120s — re-entering listen loop")
-            _emit("VOICE_STATE", {"state": "idle"})
-            return
+        if carry_utterance is not None:
+            # Use the already-captured barge-in speech directly
+            print(f"  [stt] using barge-in utterance ({len(carry_utterance)/16_000:.2f}s)")
+            audio_data = carry_utterance
+        else:
+            print(f"  [stt] waiting for utterance from VAD...")
+            try:
+                audio_data = _speech_queue.get(timeout=120)   # float32 @ 16kHz
+            except queue.Empty:
+                print("  [pipeline] no speech for 120s — re-entering listen loop")
+                _emit("VOICE_STATE", {"state": "idle"})
+                return
         rec_secs = time.perf_counter() - rec_start
         dur      = len(audio_data) / 16_000
 
@@ -498,17 +591,37 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
         print(f"  [memory] context build error: {e}")
         prompt = user_text
 
+    # ── Interrupted-response context ─────────────────────────────────────
+    # If the bot was cut off mid-response, prepend what it had already said
+    # so it can acknowledge the interruption and seamlessly respond to the
+    # new query (or pick up where it left off if the user asks it to).
+    if _interrupted_partial:
+        snip = _interrupted_partial[:400] + ("…" if len(_interrupted_partial) > 400 else "")
+        prompt = (
+            f"[Context: you were mid-response saying \"{snip}\" when the user interrupted you. "
+            f"You don't need to repeat it; just respond naturally to what they said next.]\n\n"
+            f"{prompt}"
+        )
+        print(f"  [pipeline] injecting interrupted context ({len(_interrupted_partial)} chars)")
+        _interrupted_partial = ""
+
     # ── LLM + TTS ────────────────────────────────────────────────────────
+    print(f"  [pipeline] VOICE_STATE → speaking  |  prompt {len(prompt):,} chars", flush=True)
     _emit("VOICE_STATE", {"state": "speaking"})
     _interrupt_event.clear()   # arm: VAD can now set this on barge-in
 
     try:
         with tracker.step("LLM + TTS"):
             ai_text, tts_timing = speak_stream(
-                _token_broadcaster(ask_llm_stream(prompt)),
+                _token_broadcaster(ask_llm_stream(prompt), _interrupt_event),
                 _interrupt_event,
             )
-        print(f"    [tts] first word: {tts_timing['first_word_secs']:.3f}s  |  total: {tts_timing['total_secs']:.3f}s")
+        n_tok    = tts_timing.get("token_count", "?")
+        n_sent   = tts_timing.get("sentence_count", "?")
+        fw       = tts_timing["first_word_secs"]
+        total    = tts_timing["total_secs"]
+        print(f"    [tts] first_word={fw:.3f}s  total={total:.3f}s"
+              f"  tokens={n_tok}  sentences={n_sent}")
         print(f"\n  AI: {ai_text}\n")
     except Exception as e:
         print(f"  [llm/tts] error: {e}")
@@ -516,9 +629,17 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
         tracker.summary()
         return
 
-    # ── Barge-in: restart from listening immediately ──────────────────────
+    # ── Barge-in: save partial response, restart from listening ──────────
     if _interrupt_event.is_set():
-        print("  [pipeline] barge-in detected — restarting from listening")
+        # Save what the bot had said so the next turn can reference it
+        if ai_text.strip():
+            _interrupted_partial = ai_text.strip()
+            chars = len(_interrupted_partial)
+            snip  = _interrupted_partial[:80] + ("…" if chars > 80 else "")
+            print(f"  [pipeline] ⚡ BARGE-IN — partial saved ({chars} chars): \"{snip}\"")
+        else:
+            print("  [pipeline] ⚡ BARGE-IN — no partial (interrupted before first word)")
+        print("  [pipeline] restarting turn from listening state")
         _emit("VOICE_STATE", {"state": "listening"})
         tracker.summary()
         return   # next loop iteration emits listening again at top

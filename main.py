@@ -1,5 +1,9 @@
 """main.py – Start Small O: backend WebSocket server + frontend dev server.
 
+Pipeline: Browser mic → AudioWorklet → WebSocket → Silero VAD → Whisper → LLM → Piper TTS
+Barge-in: user speech during TTS cuts playback immediately; partial response is saved and
+          injected as context into the next LLM call so the bot knows where it left off.
+
 Usage:
     python main.py
 """
@@ -44,7 +48,8 @@ def _kill_tree(proc: subprocess.Popen, label: str) -> None:
 
 def main():
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(BACKEND)
+    env["PYTHONPATH"]       = str(BACKEND)
+    env["PYTHONUNBUFFERED"] = "1"   # force line-buffered output in subprocesses
 
     procs: list[subprocess.Popen] = []
     frontend_proc: subprocess.Popen | None = None
@@ -52,7 +57,7 @@ def main():
 
     try:
         backend_proc = subprocess.Popen(
-            [PYTHON, "main.py"],
+            [PYTHON, "-u", "main.py"],   # -u: unbuffered stdout/stderr
             cwd=BACKEND, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )

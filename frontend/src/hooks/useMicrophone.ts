@@ -74,7 +74,18 @@ export function useMicrophone() {
     if (activeRef.current) return
     try {
       console.log('[mic] requesting getUserMedia...')
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+      // Explicit AEC constraints — without these the browser may not apply
+      // acoustic echo cancellation, causing the bot's own TTS output (played
+      // through speakers) to be picked up by the mic and trigger false barge-ins.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation:  true,
+          noiseSuppression:  true,
+          autoGainControl:   true,
+          channelCount:      1,
+        },
+        video: false,
+      })
       streamRef.current = stream
       console.log('[mic] getUserMedia OK — track:', stream.getAudioTracks()[0]?.label)
 

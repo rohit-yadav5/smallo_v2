@@ -1,4 +1,5 @@
 import io
+import queue as _queue
 import re
 import threading
 import time
@@ -18,38 +19,28 @@ voice.config.length_scale = 0.7  # <1.0 = faster, >1.0 = slower
 
 _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
-# Module-level reference to the active OutputStream so abort_speaking()
-# can stop it from any thread (VAD loop, pipeline, etc.)
-_stream_lock   = threading.Lock()
-_active_stream: sd.OutputStream | None = None
-
-
-def _set_active_stream(s: sd.OutputStream | None):
-    global _active_stream
-    with _stream_lock:
-        _active_stream = s
+# ── Abort flag ────────────────────────────────────────────────────────────────
+# Instead of managing a raw PortAudio OutputStream we use sd.play() which is
+# simpler, more reliable on macOS CoreAudio, and easily stopped via sd.stop().
+# _abort_flag is set by abort_speaking() (from the VAD barge-in thread) and
+# read by _synth_and_write() between chunk-plays.
+_abort_flag = threading.Event()
 
 
 def abort_speaking():
     """
-    Immediately cut TTS audio playback. Thread-safe.
+    Immediately stop TTS playback.  Thread-safe.
     Called by the VAD loop on barge-in detection.
     """
-    with _stream_lock:
-        s = _active_stream
-    if s is not None:
-        try:
-            s.abort()   # Pa_AbortStream: drops buffered audio immediately
-        except Exception:
-            pass
-
-
-def _split_sentences(text: str) -> list[str]:
-    return [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+    _abort_flag.set()
+    try:
+        sd.stop()   # cut PortAudio playback immediately
+    except Exception:
+        pass
 
 
 def _synthesize_to_buffer(sentence: str) -> tuple:
-    """Synthesize a single sentence into an in-memory buffer. Returns (audio, sr)."""
+    """Synthesize a single sentence into a NumPy array. Returns (audio, sr)."""
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav_file:
         voice.synthesize_wav(sentence, wav_file)
@@ -59,97 +50,170 @@ def _synthesize_to_buffer(sentence: str) -> tuple:
 
 
 def warmup():
-    """Run a dummy synthesis so Piper ONNX JIT-compiles on startup, not on first response."""
+    """Run a dummy synthesis so Piper ONNX JIT-compiles on startup."""
     _synthesize_to_buffer("Hi.")
 
 
 def speak(text: str, interrupt_event=None):
     if not text.strip():
         return
-
-    sentences = _split_sentences(text) or [text.strip()]
-
-    import queue as _queue
-    audio_queue: _queue.Queue = _queue.Queue(maxsize=2)
-
-    def producer():
-        for sentence in sentences:
-            if interrupt_event and interrupt_event.is_set():
-                break
-            audio, sr = _synthesize_to_buffer(sentence)
-            audio_queue.put((audio, sr))
-        audio_queue.put(None)
-
-    threading.Thread(target=producer, daemon=True).start()
-
-    while True:
-        item = audio_queue.get()
-        if item is None:
+    _abort_flag.clear()
+    for sentence in [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]:
+        if (interrupt_event and interrupt_event.is_set()) or _abort_flag.is_set():
             break
-        if interrupt_event and interrupt_event.is_set():
-            break
-        audio, sr = item
-        sd.play(audio, samplerate=sr)
-        sd.wait()
+        audio, sr = _synthesize_to_buffer(sentence)
+        sd.play(audio, samplerate=sr, blocking=False)
+        while sd.get_stream().active:
+            if (interrupt_event and interrupt_event.is_set()) or _abort_flag.is_set():
+                sd.stop()
+                return
+            time.sleep(0.02)
 
 
 def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
     """
-    Consume a token generator from the LLM and play audio sentence-by-sentence.
+    Stream tokens from the LLM and play audio sentence-by-sentence.
 
-    interrupt_event — threading.Event that, when set, stops playback immediately.
-    Called by the VAD loop when user speaks during TTS (barge-in).
+    Architecture
+    ────────────
+    _producer thread  — iterates the token generator (LLM HTTP stream), pushes
+                        tokens to _tok_q.  Runs in a daemon thread so the main
+                        thread can check interrupt every 50 ms even when the LLM
+                        is slow to yield the next token (e.g. barge-in before
+                        the first sentence is synthesised).
 
-    Returns:
-        text    — the full text spoken (may be partial if interrupted)
-        timing  — dict with first_word_secs and total_secs
+    Main thread       — polls _tok_q with a 50 ms timeout, accumulates tokens
+                        into sentences, calls _synth_and_write per sentence.
+
+    _synth_and_write  — synthesises with Piper, plays via sd.play() + 20 ms poll.
+                        Uses sd.stop() for immediate barge-in cut (cleaner than
+                        PortAudio OutputStream.abort() on macOS CoreAudio).
+
+    Returns
+    ───────
+    (text_spoken, timing_dict)
+    text_spoken     — full response text up to the interrupt (may be "")
+    timing_dict     — first_word_secs, total_secs, token_count, sentence_count
     """
-    _start = time.perf_counter()
+    _abort_flag.clear()
+
+    _start        = time.perf_counter()
     _timing: dict = {}
 
-    full_text = ""
-    buffer    = ""
-    stream: sd.OutputStream | None = None
-    first = True
+    full_text     = ""
+    buffer        = ""
+    first_word    = True
+    _token_count  = 0
+    _sentence_num = 0
 
-    # Write chunk size for interrupt granularity: ~93ms @ 22050 Hz
-    WRITE_CHUNK = 2048
+    LLM_TIMEOUT_S = 30.0    # abort if no token arrives within this many seconds
+    _last_wait_log = -1     # heartbeat bucket index
+
+    # ── Producer thread ───────────────────────────────────────────────────────
+    _tok_q: _queue.Queue = _queue.Queue(maxsize=64)
+
+    def _producer():
+        _t0    = time.perf_counter()
+        _first = True
+        try:
+            for token in token_gen:
+                # Check abort FIRST — breaking the for-loop calls token_gen.close()
+                # which propagates GeneratorExit through the generator chain and
+                # cancels the underlying Ollama HTTP connection.  Without this, a
+                # barge-in leaves a dangling Ollama request that blocks the next turn.
+                if _abort_flag.is_set():
+                    break
+                if _first:
+                    print(f"  [llm] ✓ first token  {time.perf_counter() - _t0:.3f}s", flush=True)
+                    _first = False
+                # Use a short timeout so the abort flag is checked regularly even
+                # when the consumer (main loop) is slow or has already exited.
+                while not _abort_flag.is_set():
+                    try:
+                        _tok_q.put(token, timeout=0.1)
+                        break
+                    except _queue.Full:
+                        pass   # queue full — keep spinning until abort or space
+        except Exception as e:
+            print(f"  [llm] ✗ producer error: {e}", flush=True)
+        finally:
+            # Non-blocking sentinel put: if main loop already exited, the queue
+            # may be full or nobody cares — don't block the thread here.
+            try:
+                _tok_q.put(None, block=False)
+            except _queue.Full:
+                pass
+
+    threading.Thread(target=_producer, daemon=True, name="llm-producer").start()
+    print(f"  [llm] producer started", flush=True)
+
+    # ── Interrupt helper ──────────────────────────────────────────────────────
 
     def _stopped() -> bool:
-        return interrupt_event is not None and interrupt_event.is_set()
+        return (interrupt_event is not None and interrupt_event.is_set()) \
+               or _abort_flag.is_set()
+
+    # ── Per-sentence synthesis + playback ─────────────────────────────────────
 
     def _synth_and_write(sentence: str):
-        nonlocal stream, first
+        nonlocal first_word, _sentence_num
         if _stopped():
             return
 
-        print(f"    [tts] speaking: {sentence!r:.60}")
+        _sentence_num += 1
+        t0      = time.perf_counter()
         audio, sr = _synthesize_to_buffer(sentence)
+        synth_s = time.perf_counter() - t0
+        audio_s = len(audio) / sr
+        print(
+            f"  [tts] synth #{_sentence_num}  {synth_s:.2f}s → {audio_s:.2f}s audio"
+            f"  '{sentence[:55]}{'…' if len(sentence) > 55 else ''}'",
+            flush=True,
+        )
 
         if _stopped():
             return
 
-        if stream is None:
-            s = sd.OutputStream(samplerate=sr, channels=1, dtype="float32")
-            s.start()
-            _set_active_stream(s)
-            stream = s
-
-        if first:
+        if first_word:
             _timing["first_word_secs"] = time.perf_counter() - _start
-            first = False
+            first_word = False
 
-        # Write in small chunks so we can react to interrupt quickly
-        for i in range(0, len(audio), WRITE_CHUNK):
+        # sd.play() + 20 ms poll — simple, reliable, immediately interruptible
+        sd.play(audio, samplerate=sr, blocking=False)
+        while sd.get_stream().active:
             if _stopped():
+                sd.stop()
                 return
-            stream.write(audio[i : i + WRITE_CHUNK])
+            time.sleep(0.02)
 
-    # ── Token consumption loop ─────────────────────────────────────────────
+    # ── Token consumption loop ─────────────────────────────────────────────────
     try:
-        for token in token_gen:
+        while True:
             if _stopped():
+                sd.stop()
                 break
+            try:
+                token = _tok_q.get(timeout=0.05)
+            except _queue.Empty:
+                if not full_text:
+                    elapsed = time.perf_counter() - _start
+                    bucket  = int(elapsed / 5)
+                    if bucket > _last_wait_log:
+                        _last_wait_log = bucket
+                        print(f"  [llm] ◌ waiting for first token...  {elapsed:.0f}s", flush=True)
+                    if elapsed > LLM_TIMEOUT_S:
+                        print(
+                            f"  [llm] ✗ no tokens in {LLM_TIMEOUT_S:.0f}s — "
+                            f"Ollama may be hung (run: ollama ps)",
+                            flush=True,
+                        )
+                        break
+                continue
+
+            if token is None:
+                break   # generator exhausted or producer errored
+
+            _token_count += 1
             buffer    += token
             full_text += token
 
@@ -165,21 +229,29 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
             _synth_and_write(buffer.strip())
 
     finally:
-        if stream is not None:
-            _set_active_stream(None)
-            try:
-                if _stopped():
-                    stream.abort()   # immediate cut — barge-in
-                else:
-                    stream.stop()    # drain remaining samples cleanly
-                stream.close()
-            except Exception:
-                pass
+        # Make sure any lingering sd.play() is stopped
+        try:
+            if _stopped():
+                sd.stop()
+        except Exception:
+            pass
 
-    _timing["total_secs"] = time.perf_counter() - _start
+    _timing["total_secs"]     = time.perf_counter() - _start
+    _timing["token_count"]    = _token_count
+    _timing["sentence_count"] = _sentence_num
     _timing.setdefault("first_word_secs", _timing["total_secs"])
+
+    if _token_count > 0:
+        tok_per_s = _token_count / max(_timing["total_secs"], 0.001)
+        print(
+            f"  [llm] ■ {_token_count} tokens  {tok_per_s:.1f} tok/s"
+            f"  first_word={_timing['first_word_secs']:.2f}s"
+            f"  total={_timing['total_secs']:.2f}s",
+            flush=True,
+        )
+
     return full_text.strip(), _timing
 
 
 if __name__ == "__main__":
-    speak("Hello Rohit. This is Small O speaking. Using Piper text to speech. The streaming should feel much faster now.")
+    speak("Hello Rohit. This is Small O speaking. Using Piper text to speech.")

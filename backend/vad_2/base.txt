@@ -1,0 +1,61 @@
+                          ┌───────────────────────────┐
+                          │     Audio Input Stream     │
+                          │  (16 kHz, 10–20 ms frames) │
+                          └──────────────┬────────────┘
+                                         │
+                                         ▼
+                        ┌─────────────────────────────────┐
+                        │     1. Audio Buffer Manager      │
+                        │  (Rolling 1–2 sec circular buf)  │
+                        └─────────────────┬─────────────────┘
+                                          │
+                                          ▼
+                  ┌──────────────────────────────────────────────────┐
+                  │            2. FAST VAD (TEN-VAD)                 │
+                  │  - Detects possible speech in 30–60 ms           │
+                  │  - Output: vad_prob (0–1), speech_frame_flag     │
+                  └───────────────────────┬──────────────────────────┘
+                                          │
+                        IF vad_prob < threshold → IGNORE (noise)
+                                          │
+                                          ▼
+               ┌────────────────────────────────────────────────────────┐
+               │     3. Speech-Type Classifier (Speech vs Noise)        │
+               │  - CNN / Wav2Vec2 checks if it is REAL HUMAN SPEECH   │
+               │  - Output: speech_type = {speech/noise/background}    │
+               │  - Confidence threshold = 0.7                          │
+               └──────────────────────┬─────────────────────────────────┘
+                                      │
+                     IF NOT real speech → IGNORE (sneeze, cough, etc)
+                                      │
+                                      ▼
+         ┌──────────────────────────────────────────────────────────────────┐
+         │                 4. Relevance Detection Module                    │
+         │                                                                  │
+         │   4A. Wake-word Detector                                         │
+         │       - “Hey Bot”, “Listen”, etc                                 │
+         │       ────────────────────────────────────────────────┐         │
+         │                                                       ▼         │
+         │   4B. Direction of Arrival (Optional)                 Accept if  │
+         │       - Checks if sound comes from user direction     any of     │
+         │       ────────────────────────────────────────────────┤         │
+         │                                                       │         │
+         │   4C. Tiny ASR + Intent Classifier                    │         │
+         │       - Checks if speech is relevant to bot           ▼         │
+         └──────────────────────────┬──────────────────────────────────────┘
+                                    │
+                     IF NOT relevant → IGNORE and bot continues talking
+                                    │
+                                    ▼
+            ┌─────────────────────────────────────────────────────────┐
+            │                 5. Decision Engine                      │
+            │  Combines: VAD + Speech-Type + Relevance + Smoothing   │
+            │                                                        │
+            │  IF relevant human speech detected → INTERRUPT BOT     │
+            │  ELSE → CONTINUE BOT SPEAKING                         │
+            └────────────────────────┬────────────────────────────────┘
+                                     │
+                  ┌──────────────────┴───────────────────┐
+                  ▼                                      ▼
+      Bot stops speaking                               Bot continues
+      and switches to LISTENING MODE                   speaking normally
