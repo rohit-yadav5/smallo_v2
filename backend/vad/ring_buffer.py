@@ -91,6 +91,15 @@ class RingBuffer:
                     self._buf[:n - first].copy(),
                 ])
 
+    # ── Clear ──────────────────────────────────────────────────────────────
+
+    def clear(self) -> None:
+        """Reset the buffer to all zeros (keeps capacity; next read returns silence)."""
+        with self._lock:
+            self._buf[:]    = 0.0
+            self._write_pos = 0
+            self._is_full   = False
+
     @property
     def filled_samples(self) -> int:
         """How many valid samples are currently in the buffer."""

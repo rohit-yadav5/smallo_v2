@@ -31,12 +31,21 @@ def abort_speaking():
     """
     Immediately stop TTS playback.  Thread-safe.
     Called by the VAD loop on barge-in detection.
+
+    IMPORTANT: this is the ONLY function that calls sd.stop().
+    The main speak_stream thread must never call sd.stop() — two concurrent
+    Pa_StopStream() calls on macOS CoreAudio trigger a SIGTRAP (signal -5).
+    After abort_speaking() sets _abort_flag + stops the stream, the main
+    thread's sd.get_stream().active polling loop exits naturally.
     """
     _abort_flag.set()
     try:
-        sd.stop()   # cut PortAudio playback immediately
+        # Guard: only stop if a stream is actually active.
+        # Calling Pa_StopStream on an already-stopped stream can assert on macOS.
+        if sd.get_stream().active:
+            sd.stop()
     except Exception:
-        pass
+        pass  # RuntimeError if no current stream — safe to ignore
 
 
 def _synthesize_to_buffer(sentence: str) -> tuple:
@@ -63,9 +72,15 @@ def speak(text: str, interrupt_event=None):
             break
         audio, sr = _synthesize_to_buffer(sentence)
         sd.play(audio, samplerate=sr, blocking=False)
-        while sd.get_stream().active:
+        while True:
+            try:
+                active = sd.get_stream().active
+            except RuntimeError:
+                break   # stream already gone
+            if not active:
+                break   # finished naturally
             if (interrupt_event and interrupt_event.is_set()) or _abort_flag.is_set():
-                sd.stop()
+                # abort_speaking() already called sd.stop() — don't call it again
                 return
             time.sleep(0.02)
 
@@ -137,12 +152,17 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
         except Exception as e:
             print(f"  [llm] ✗ producer error: {e}", flush=True)
         finally:
-            # Non-blocking sentinel put: if main loop already exited, the queue
-            # may be full or nobody cares — don't block the thread here.
-            try:
-                _tok_q.put(None, block=False)
-            except _queue.Full:
-                pass
+            # Always deliver the sentinel so the main loop knows the stream is
+            # done.  The main loop may be mid-synthesis (slow consumer), so the
+            # queue can be full — retry briefly.  Give up only if abort fired
+            # (main loop already exited and nobody reads the queue anymore).
+            for _ in range(100):          # up to 10 s
+                try:
+                    _tok_q.put(None, timeout=0.1)
+                    break
+                except _queue.Full:
+                    if _abort_flag.is_set():
+                        break            # main loop gone; sentinel not needed
 
     threading.Thread(target=_producer, daemon=True, name="llm-producer").start()
     print(f"  [llm] producer started", flush=True)
@@ -178,19 +198,26 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
             _timing["first_word_secs"] = time.perf_counter() - _start
             first_word = False
 
-        # sd.play() + 20 ms poll — simple, reliable, immediately interruptible
+        # sd.play() + 20 ms poll — simple, reliable, immediately interruptible.
+        # abort_speaking() is the SOLE caller of sd.stop(); we only break here
+        # so that we never issue two concurrent Pa_StopStream() calls (SIGTRAP).
         sd.play(audio, samplerate=sr, blocking=False)
-        while sd.get_stream().active:
+        while True:
+            try:
+                active = sd.get_stream().active
+            except RuntimeError:
+                break           # stream already cleaned up
+            if not active:
+                break           # finished naturally
             if _stopped():
-                sd.stop()
-                return
+                return          # abort_speaking() already stopped it — just exit
             time.sleep(0.02)
 
     # ── Token consumption loop ─────────────────────────────────────────────────
     try:
         while True:
             if _stopped():
-                sd.stop()
+                # abort_speaking() already called sd.stop() — just break cleanly
                 break
             try:
                 token = _tok_q.get(timeout=0.05)
@@ -229,12 +256,10 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
             _synth_and_write(buffer.strip())
 
     finally:
-        # Make sure any lingering sd.play() is stopped
-        try:
-            if _stopped():
-                sd.stop()
-        except Exception:
-            pass
+        # Nothing to do: either playback finished naturally, or abort_speaking()
+        # already called sd.stop().  A second sd.stop() here would race with
+        # abort_speaking() on CoreAudio and trigger a SIGTRAP (exit -5).
+        pass
 
     _timing["total_secs"]     = time.perf_counter() - _start
     _timing["token_count"]    = _token_count

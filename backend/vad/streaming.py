@@ -68,7 +68,7 @@ class StreamingVAD:
         onset_threshold:  float = 0.50,
         offset_threshold: float = 0.35,
         silence_ms:       int   = 600,
-        min_speech_ms:    int   = 250,
+        min_speech_ms:    int   = 120,   # 120 ms: captures short words (yes/no/ok)
         max_speech_s:     int   = 30,
         pre_pad_ms:       int   = 200,
         onset_count:      int   = 2,
@@ -152,10 +152,17 @@ class StreamingVAD:
                     self._onset_buf = 0
                     self._speaking  = True
                     self._silence   = 0
-                    # Seed speech with pre-speech buffer (captures word beginning)
+                    # Seed speech with pre-speech buffer (captures word beginning).
+                    # IMPORTANT: add only _STEP (256) samples here, NOT the full
+                    # _WINDOW (512).  The loop advances by _STEP after this block,
+                    # so the next iteration starts at pos+_STEP and adds
+                    # audio[pos+_STEP : pos+2*_STEP].  If we added the full window
+                    # (audio[pos : pos+_WINDOW]) the slice audio[pos+_STEP : pos+_WINDOW]
+                    # would appear twice — creating a 16 ms duplicate at the start of
+                    # every utterance that corrupts the first word for Whisper.
                     pre_audio = self._pre.get_last_samples(self._pre_samples)
-                    self._speech    = [pre_audio, window]
-                    self._n_samples = len(pre_audio) + _WINDOW
+                    self._speech    = [pre_audio, audio_16k[pos : pos + _STEP]]
+                    self._n_samples = len(pre_audio) + _STEP
                     print(f"  [vad] ▶  speech start  prob={prob:.3f}", flush=True)
 
             pos += _STEP
@@ -168,6 +175,10 @@ class StreamingVAD:
         """
         Full reset — clears all buffers AND Silero LSTM hidden states.
         Call between pipeline turns for a clean detection state.
+
+        _pre ring is now also cleared so that TTS echo accumulated during the
+        barge-in grace period is not prepended to the next utterance and fed to
+        Whisper.  The ring re-fills naturally within pre_pad_ms of new audio.
         """
         self._engine.reset_states()
         self._speech    = []
@@ -176,7 +187,7 @@ class StreamingVAD:
         self._speaking  = False
         self._onset_buf = 0
         self._leftover  = np.empty(0, dtype=np.float32)
-        # Don't clear _pre — it's a ring buffer that keeps the last 200 ms warm
+        self._pre.clear()   # ← wipe echo / stale audio from previous state
 
     @property
     def is_speaking(self) -> bool:

@@ -77,7 +77,12 @@ _LLM_OPTIONS = {
 
 
 def warmup():
-    """Send a 1-token request so Ollama pages phi3 into RAM before first real turn."""
+    """Check Ollama health, then warm the model into RAM."""
+    # Health check — surfaces problems early with clear instructions
+    if not check_ollama():
+        print("  [llm] ⚠  Ollama not ready — first real turn may be slow or fail", flush=True)
+        return
+    # Send a 1-token request so phi3 is fully paged into RAM
     try:
         requests.post(
             OLLAMA_URL,
@@ -85,8 +90,9 @@ def warmup():
                   "options": {"num_predict": 1}},
             timeout=30
         )
-    except Exception:
-        pass  # Ollama not running yet — will load on first real request
+        print(f"  [llm] ✓ model '{MODEL}' warmed up", flush=True)
+    except Exception as e:
+        print(f"  [llm] ⚠  warmup request failed: {e}", flush=True)
 
 
 def check_ollama() -> bool:
@@ -126,11 +132,6 @@ def ask_llm_stream(user_text: str):
     )
 
     print(f"  [llm] ▶ {len(prompt):,} char prompt → {MODEL}", flush=True)
-
-    # Fast pre-flight: if Ollama is down, surface the error immediately instead
-    # of waiting for the 10 s connect timeout inside requests.post().
-    if not check_ollama():
-        return   # yields nothing → speak_stream will log "no tokens in 30s"
 
     response = requests.post(
         OLLAMA_URL,

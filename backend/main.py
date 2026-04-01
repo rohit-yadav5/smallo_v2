@@ -29,9 +29,34 @@ import time
 from collections import Counter
 from pathlib import Path
 
+import math
+
 import numpy as np
 import psutil
 import websockets
+
+# High-quality audio resampling — scipy is always available (scikit-learn dep).
+# resample_poly uses a polyphase FIR filter with anti-aliasing, far better than
+# np.interp (linear interpolation has no anti-alias filter and folds frequencies
+# > target_SR/2 back into the audio band as noise, confusing Whisper).
+try:
+    from scipy.signal import resample_poly as _resample_poly
+    def _resample(x: np.ndarray, src_sr: int, dst_sr: int = 16_000) -> np.ndarray:
+        if src_sr == dst_sr:
+            return x
+        g    = math.gcd(src_sr, dst_sr)
+        up   = dst_sr  // g
+        down = src_sr  // g
+        return _resample_poly(x, up, down).astype(np.float32)
+except ImportError:
+    # Fallback: linear interpolation (lower quality but always works)
+    def _resample(x: np.ndarray, src_sr: int, dst_sr: int = 16_000) -> np.ndarray:
+        if src_sr == dst_sr:
+            return x
+        n = int(len(x) * dst_sr / src_sr)
+        return np.interp(
+            np.linspace(0, len(x), n), np.arange(len(x)), x
+        ).astype(np.float32)
 
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
@@ -124,19 +149,22 @@ def _vad_loop():
         onset_threshold  = 0.50,
         offset_threshold = 0.35,
         silence_ms       = 600,
-        min_speech_ms    = 250,
+        min_speech_ms    = 120,  # 120 ms captures short words (yes/no/ok/stop)
         pre_pad_ms       = 200,
-        onset_count      = 2,    # 2 consecutive windows ≈ 32 ms before onset fires
+        onset_count      = 3,   # 3 × 16 ms = 48 ms sustained speech before onset fires
     )
 
-    print("  [vad] Silero VAD ready  (grace=400ms  onset_count=2  step=256)", flush=True)
+    print("  [vad] Silero VAD ready  (grace=1000ms  onset_count=3  step=256  min_speech=120ms)", flush=True)
 
     # ── State-transition tracking ─────────────────────────────────────
     _prev_state:          str   = ""
     _speaking_started_at: float = 0.0
-    _BARGE_IN_GRACE_S:    float = 0.40   # 400 ms echo-suppression grace period
+    # 1 000 ms grace period: PortAudio TTS bypasses the browser's AEC so the
+    # mic picks up the bot's own voice.  A full second lets the first sentence
+    # start playing AND lets the speaker echo settle before barge-in is armed.
+    _BARGE_IN_GRACE_S:    float = 1.0
     _barge_in_consec:     int   = 0      # consecutive speech-window counter
-    _BARGE_IN_MIN:        int   = 2      # windows needed to confirm barge-in
+    _BARGE_IN_MIN:        int   = 3      # windows needed to confirm barge-in (~48 ms)
 
     while True:
         try:
@@ -151,15 +179,12 @@ def _vad_loop():
         if src_sr == 0 or src_sr > 192_000:
             continue
 
-        # ── Decode & resample to 16 kHz ─────────────────
+        # ── Decode & resample to 16 kHz ──────────────────
         samples = np.frombuffer(raw[4:], dtype=np.float32).copy()
-        if src_sr != 16_000:
-            n       = int(len(samples) * 16_000 / src_sr)
-            samples = np.interp(
-                np.linspace(0, len(samples), n),
-                np.arange(len(samples)),
-                samples,
-            ).astype(np.float32)
+        samples = _resample(samples, src_sr, 16_000)
+        # Clip just in case — do NOT normalise per-chunk here because that
+        # would amplify silent frames to full-scale and confuse Silero VAD.
+        np.clip(samples, -1.0, 1.0, out=samples)
 
         state = _current_voice_state
 
@@ -171,7 +196,11 @@ def _vad_loop():
                 _speaking_started_at = time.perf_counter()
                 _barge_in_consec     = 0
                 print("  [vad] → speaking  (LSTM reset, grace period armed)", flush=True)
-            elif state == "listening" and _prev_state in ("idle", "thinking"):
+            elif state == "listening":
+                # Reset on ANY transition to listening — including speaking→listening
+                # after a barge-in.  Without this the LSTM retains echo/speech state
+                # from the barge-in detection and immediately fires again on the next
+                # listening window, causing an infinite false-barge-in loop.
                 vad.reset()
                 print(f"  [vad] → listening  (LSTM reset, from {_prev_state})", flush=True)
             _prev_state = state
@@ -180,8 +209,12 @@ def _vad_loop():
         if state == "speaking":
             elapsed = time.perf_counter() - _speaking_started_at
             if elapsed < _BARGE_IN_GRACE_S:
-                # Grace period — feed to keep ring warm but don't trigger barge-in
-                vad.process(samples)
+                # Grace period — discard audio entirely.
+                # Do NOT call vad.process() here: it would fill _pre ring with
+                # TTS echo that gets prepended to the barge-in utterance, causing
+                # Whisper to hear the bot's own voice and transcribe garbage.
+                # _pre was cleared on the speaking→transition reset() above, so
+                # the first barge-in utterance starts with clean (zero) pre-padding.
                 continue
 
             utterance = vad.process(samples)
@@ -503,9 +536,9 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
         else:
             print(f"  [stt] waiting for utterance from VAD...")
             try:
-                audio_data = _speech_queue.get(timeout=120)   # float32 @ 16kHz
+                audio_data = _speech_queue.get(timeout=30)   # float32 @ 16kHz
             except queue.Empty:
-                print("  [pipeline] no speech for 120s — re-entering listen loop")
+                print("  [pipeline] no speech for 30 s — going idle (speak to wake)")
                 _emit("VOICE_STATE", {"state": "idle"})
                 return
         rec_secs = time.perf_counter() - rec_start
@@ -629,20 +662,33 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
         tracker.summary()
         return
 
-    # ── Barge-in: save partial response, restart from listening ──────────
+    # ── Barge-in: save partial response, decide next state ───────────────
     if _interrupt_event.is_set():
-        # Save what the bot had said so the next turn can reference it
+        with _barge_in_lock:
+            has_utterance = _barge_in_utterance is not None
+
         if ai_text.strip():
+            # Bot had started speaking — real barge-in.  Save partial so the next
+            # turn can acknowledge it, then listen for the user's follow-up.
             _interrupted_partial = ai_text.strip()
             chars = len(_interrupted_partial)
             snip  = _interrupted_partial[:80] + ("…" if chars > 80 else "")
             print(f"  [pipeline] ⚡ BARGE-IN — partial saved ({chars} chars): \"{snip}\"")
+            print("  [pipeline] restarting turn from listening state")
+            _emit("VOICE_STATE", {"state": "listening"})
+        elif has_utterance:
+            # Bot hadn't spoken yet but a real utterance was captured — process it.
+            print("  [pipeline] ⚡ BARGE-IN — bot silent, utterance captured — restarting")
+            _emit("VOICE_STATE", {"state": "listening"})
         else:
-            print("  [pipeline] ⚡ BARGE-IN — no partial (interrupted before first word)")
-        print("  [pipeline] restarting turn from listening state")
-        _emit("VOICE_STATE", {"state": "listening"})
+            # No bot speech, no captured utterance → almost certainly a false
+            # barge-in (echo spike).  Going back to "listening" would leave the
+            # pipeline stuck waiting 30 s for speech that may never come.
+            # Go idle so the user can start the next turn themselves.
+            print("  [pipeline] ⚡ False barge-in (no text, no utterance) — going idle")
+            _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
-        return   # next loop iteration emits listening again at top
+        return
 
     _emit("VOICE_STATE", {"state": "idle"})
     tracker.summary()

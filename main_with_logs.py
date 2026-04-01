@@ -91,6 +91,12 @@ def _banner():
     print(f"  {DIM}Backend  : {BACKEND}{R}")
     print(f"  {DIM}Frontend : {FRONTEND}{R}")
     print()
+    print(f"  {DIM}Pipeline config:{R}")
+    print(f"    {DIM}STT  : faster-whisper  base.en  int8  (beam=5  vad_filter=True){R}")
+    print(f"    {DIM}VAD  : Silero  grace=1000ms  onset_count=3  step=256  min_speech=120ms{R}")
+    print(f"    {DIM}TTS  : Piper  en_US-amy-medium  length_scale=0.7{R}")
+    print(f"    {DIM}LLM  : Ollama  phi3  (stream  timeout=10/60s){R}")
+    print()
     print(f"  {DIM}Log colour legend:{R}")
     print(f"    {TL}■{R} VAD      {BLU}■{R} STT      {YLW}■{R} TTS      {CYN}■{R} LLM")
     print(f"    {PRP}■{R} Memory   {ORG}■{R} Plugin   {MAG}■{R} Barge-in {RED}■{R} Error")
@@ -110,20 +116,23 @@ def _format_backend_line(line: str) -> str:
     Return a fully formatted string for one backend log line.
 
     Handles:
-      ┌── Turn separators  (──── Turn N ────)
-      ├── User transcript  (You said: …)
-      ├── Bot response     (  AI: …)
-      ├── Barge-in events  (⚡ BARGE-IN …)
-      ├── [vad]  tagged    (speech start/end/discard/utterance queued)
-      ├── [stt]  tagged    (waiting / received / timing)
-      ├── [tts]  tagged    (synth timing / audio duration / speaking sentence)
-      ├── [llm]  tagged    (first token / waiting heartbeat / timeout / throughput)
-      ├── [pipeline] tagged (state transitions / prompt size / interrupted context)
-      ├── [memory] tagged  (retrieved / inserted)
-      ├── [plugin] tagged  (routed / action)
-      ├── [ws]   tagged    (connect / disconnect — dim)
-      ├── Latency tracker  (▶ Step / ✓ Step timing)
-      ├── Warmup / ready
+      ┌── Turn separators     (──── Turn N ────)
+      ├── User transcript      (You said: …)
+      ├── Bot response         (  AI: …)
+      ├── Barge-in / false     (⚡ BARGE-IN … / ⚡ False barge-in …)
+      ├── [vad]  tagged        (▶ speech start prob=X / ■ speech end / ✗ too short /
+      │                         → utterance queued|captured / → speaking|listening)
+      ├── [stt]  tagged        (◌ waiting / ● received / timing)
+      ├── [tts]  tagged        (⚙ synth #N Xs→Xs / ■ first_word/total/tokens)
+      ├── [llm]  tagged        (▶ prompt / ✓ first token / ✓ warmed up /
+      │                         ⚠ not ready / ◌ waiting / ✗ timeout / ■ throughput)
+      ├── [pipeline] tagged    (◆ VOICE_STATE → / prompt chars / false barge-in /
+      │                         injecting interrupted / no speech / cleared stale)
+      ├── [memory] tagged      (🧠 retrieved / 💾 insert)
+      ├── [plugin] tagged      (⚙ routed / action)
+      ├── [ws]   tagged        (connect / disconnect — dim)
+      ├── Latency tracker      (▶ Step start / ✓ Step Xs)
+      ├── Warmup / ready lines
       └── Errors / tracebacks
     """
     stripped = line.strip()
@@ -177,8 +186,12 @@ def _format_backend_line(line: str) -> str:
     # ── Barge-in / interrupt events ───────────────────────────────────
     if any(k in line for k in ("⚡", "BARGE-IN", "barge-in", "barge_in",
                                 "partial saved", "injecting interrupted",
-                                "barge-in utterance", "restarting turn")):
-        return f"{indent}{DIM}{ts}{R}  {MAG}{B}⚡  {stripped}{R}"
+                                "barge-in utterance", "restarting turn",
+                                "False barge-in", "bot silent")):
+        # False barge-in (no real speech) shown dimmer — it's noise, not a real event
+        is_false = "false barge-in" in ll or "false barge" in ll
+        col = f"{MAG}{DIM}" if is_false else f"{MAG}{B}"
+        return f"{indent}{DIM}{ts}{R}  {col}⚡  {stripped}{R}"
 
     # ── Latency tracker lines (▶ Step / ✓ Step) ──────────────────────
     if re.match(r"\s*[▶✓]\s", stripped):
@@ -196,20 +209,33 @@ def _format_backend_line(line: str) -> str:
 
         # ── [vad] ────────────────────────────────────────────────────
         if tag == "vad":
-            if "▶" in line or "speech start" in ll:
-                prob = re.search(r"prob=(\S+)", line)
-                prob_str = f"  prob={WHT}{prob.group(1)}{TL}" if prob else ""
+            # ▶ speech start  prob=0.xxx
+            if "speech start" in ll:
+                prob = re.search(r"prob=([\d.]+)", line)
+                prob_val = float(prob.group(1)) if prob else 0.0
+                # Colour prob by confidence: green ≥0.8, yellow ≥0.6, default otherwise
+                prob_col = (GRN if prob_val >= 0.8 else YLW if prob_val >= 0.6 else TL)
+                prob_str = f"  prob={prob_col}{prob.group(1)}{TL}" if prob else ""
                 return f"{indent}{DIM}{ts}{R}  {TL}{B}▶ {stripped}{prob_str}{R}"
-            if "■" in line or "speech end" in ll or "speech forced" in ll:
+            # ■ speech end / forced
+            if "speech end" in ll or "speech forced" in ll or (
+                    "■" in line and "speech" in ll):
                 formatted = _hi(stripped, TL)
                 return f"{indent}{DIM}{ts}{R}  {TL}■ {formatted}{R}"
-            if "✗" in line or "too short" in ll or "discarding" in ll:
+            # ✗ too short — discarded (dim, not an error)
+            if "too short" in ll or "discarding" in ll:
                 return f"{indent}{DIM}{ts}{R}  {DIM}✗ {stripped}{R}"
+            # → utterance queued / barge-in utterance captured
             if "utterance queued" in ll or "utterance captured" in ll:
                 formatted = _hi(stripped, TL)
                 return f"{indent}{DIM}{ts}{R}  {TL}{B}→ {formatted}{R}"
+            # ● Silero VAD ready (startup)
             if "silero vad ready" in ll:
                 return f"{indent}{DIM}{ts}{R}  {TL}● {stripped}{R}"
+            # → speaking / → listening  (LSTM reset state transitions)
+            if "→ speaking" in ll or "→ listening" in ll:
+                state_col = GRN if "speaking" in ll else BLU
+                return f"{indent}{DIM}{ts}{R}  {TL}◈  {state_col}{stripped}{R}"
             return f"{indent}{DIM}{ts}{R}  {col}{stripped}{R}"
 
         # ── [stt] ────────────────────────────────────────────────────
@@ -241,7 +267,8 @@ def _format_backend_line(line: str) -> str:
         # ── [llm] ────────────────────────────────────────────────────
         if tag == "llm":
             # [llm] ▶ N char prompt → model
-            if "▶" in line or ("prompt" in ll and "char" in ll):
+            if ("prompt" in ll and "char" in ll) or (
+                    "▶" in line and "prompt" in ll):
                 chars_m = re.search(r"([\d,]+)\s+char", stripped)
                 chars   = chars_m.group(1) if chars_m else "?"
                 model_m = re.search(r"→\s+(\S+)$", stripped)
@@ -250,10 +277,21 @@ def _format_backend_line(line: str) -> str:
                         f"{CYN}▶  prompt {WHT}{chars}{CYN} chars"
                         f"{f'  →  {WHT}{model}{CYN}' if model else ''}{R}")
 
-            # [llm] ✓ first token  Xs
-            if "✓" in line or "first token" in ll:
+            # [llm] ✓ first token  Xs  (runtime — bold cyan, timing highlighted)
+            if "first token" in ll:
                 formatted = re.sub(r"(\d+\.?\d+)s", f"{WHT}\\1s{CYN}", stripped)
                 return f"{indent}{DIM}{ts}{R}  {CYN}{B}✓  {formatted}{R}"
+
+            # [llm] ✓ model 'phi3' warmed up  (startup — green, not timing-critical)
+            if "warmed up" in ll or ("✓" in line and "model" in ll):
+                model_m = re.search(r"'([^']+)'", stripped)
+                model   = model_m.group(1) if model_m else ""
+                return (f"{indent}{DIM}{ts}{R}  "
+                        f"{GRN}✓  LLM model {WHT}{model}{GRN} warmed up{R}")
+
+            # [llm] ⚠  Ollama not ready / warmup failed
+            if "⚠" in line or "not ready" in ll or "warmup" in ll:
+                return f"{indent}{DIM}{ts}{R}  {YLW}{B}⚠  {stripped}{R}"
 
             # [llm] ◌ waiting for first token...  Ns
             if "◌" in line or "waiting for first token" in ll:
@@ -262,7 +300,8 @@ def _format_backend_line(line: str) -> str:
                 return (f"{indent}{DIM}{ts}{R}  "
                         f"{DIM}{CYN}◌  waiting for first token...  {WHT}{elapsed}s{DIM}{R}")
 
-            # [llm] ✗ no tokens in Xs — hung?
+            # [llm] ✗ no tokens / timeout / error  (already caught at top by error
+            # handler, but kept here as a safety net for any that slip through)
             if "✗" in line or "no tokens" in ll or "hung" in ll:
                 return f"{indent}{DIM}{ts}{R}  {RED}{B}✗  {stripped}{R}"
 
@@ -273,7 +312,8 @@ def _format_backend_line(line: str) -> str:
                 fmt = re.sub(r"(\d+\.?\d+)s",         f"{WHT}\\1s{CYN}",        fmt)
                 return f"{indent}{DIM}{ts}{R}  {CYN}■  {fmt}{R}"
 
-            return f"{indent}{DIM}{ts}{R}  {CYN}{stripped}{R}"
+            # producer started / other dim [llm] lines
+            return f"{indent}{DIM}{ts}{R}  {DIM}{CYN}{stripped}{R}"
 
         # ── [pipeline] ───────────────────────────────────────────────
         if tag == "pipeline":
@@ -285,8 +325,10 @@ def _format_backend_line(line: str) -> str:
                     "listening": BLU, "thinking": YLW,
                     "speaking":  GRN, "idle":     DIM,
                 }.get(state, WHT)
+                extra = stripped.split("|")[1].strip() if "|" in stripped else ""
                 return (f"{indent}{DIM}{ts}{R}  {WHT}◆  VOICE_STATE → "
-                        f"{_state_col}{B}{state}{R}  {DIM}{stripped.split('|')[1].strip() if '|' in stripped else ''}{R}")
+                        f"{_state_col}{B}{state}{R}"
+                        f"{f'  {DIM}{extra}' if extra else ''}{R}")
             if "prompt" in ll and "chars" in ll:
                 formatted = re.sub(r"([\d,]+)\s+chars", f"{WHT}\\1{WHT} chars", stripped)
                 return f"{indent}{DIM}{ts}{R}  {WHT}◆  {formatted}{R}"
@@ -296,6 +338,12 @@ def _format_backend_line(line: str) -> str:
                 return f"{indent}{DIM}{ts}{R}  {MAG}{stripped}{R}"
             if "no speech for" in ll:
                 return f"{indent}{DIM}{ts}{R}  {YLW}⏱  {stripped}{R}"
+            # False barge-in — dim magenta (it's noise, not a real interrupt)
+            if "false barge-in" in ll:
+                return f"{indent}{DIM}{ts}{R}  {MAG}{DIM}⚡  {stripped}{R}"
+            # Real barge-in with or without partial — bright magenta
+            if "barge-in" in ll or "barge_in" in ll:
+                return f"{indent}{DIM}{ts}{R}  {MAG}{B}⚡  {stripped}{R}"
             return f"{indent}{DIM}{ts}{R}  {WHT}{stripped}{R}"
 
         # ── [memory] ─────────────────────────────────────────────────
@@ -404,12 +452,32 @@ def _preflight():
         print(f"       {RED}→ run:  cd frontend && npm install{R}")
         ok = False
 
-    # Piper voice model
+    # Piper voice model (TTS)
     voice_path = Path.home() / "piper-voices" / "en_US-amy-medium.onnx"
     voice_ok   = voice_path.exists()
     sym        = f"{GRN}✓{R}" if voice_ok else f"{YLW}!{R}"
     note       = "" if voice_ok else f"  {YLW}← TTS will fail{R}"
     print(f"    {sym}  Piper voice  {DIM}{voice_path}{R}{note}")
+
+    # faster-whisper base.en model cache
+    whisper_cache = (Path.home() / ".cache" / "huggingface" / "hub"
+                     / "models--Systran--faster-whisper-base.en")
+    whisper_ok = whisper_cache.exists()
+    sym  = f"{GRN}✓{R}" if whisper_ok else f"{YLW}!{R}"
+    note = ("" if whisper_ok
+            else f"  {YLW}← will auto-download on first run (~150 MB){R}")
+    print(f"    {sym}  Whisper base.en  {DIM}{whisper_cache}{R}{note}")
+
+    # scipy (high-quality resampler)
+    try:
+        import scipy  # noqa: F401
+        scipy_ok = True
+    except ImportError:
+        scipy_ok = False
+    sym  = f"{GRN}✓{R}" if scipy_ok else f"{YLW}!{R}"
+    note = ("" if scipy_ok
+            else f"  {YLW}← fallback linear resampler active (lower audio quality){R}")
+    print(f"    {sym}  scipy  {DIM}(polyphase resampler){R}{note}")
 
     # Ports free
     for port, name in [(8765, "WebSocket :8765"), (5173, "Vite      :5173")]:
