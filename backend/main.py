@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import math
@@ -100,6 +101,11 @@ _interrupted_partial: str = ""
 _barge_in_utterance: np.ndarray | None = None
 _barge_in_lock: threading.Lock = threading.Lock()
 
+# Early STT — thread pool used by the first-silence callback in _vad_loop.
+# Transcription starts at the first silence frame so it overlaps with the
+# silence_ms confirmation window (600 ms), saving ~300–500 ms per turn.
+_stt_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt-early")
+
 
 def _emit(event: str, data: dict):
     """Thread-safe broadcast to all connected WebSocket clients."""
@@ -145,6 +151,20 @@ def _vad_loop():
 
     Inspired by vad_2/vad_engine_silero architecture.
     """
+    # Mutable container so the nested callback can write back to the VAD loop.
+    _pending_stt: list = [None]   # [0] = concurrent.futures.Future | None
+
+    def _on_first_silence(snapshot: np.ndarray) -> None:
+        """Fire at the very first silence frame — starts Whisper in background.
+
+        By the time the 600 ms silence_ms window elapses (confirming the
+        utterance is over), the transcription is already done.  _run_turn
+        reads the result via the Future instead of blocking on a new call.
+        """
+        dur = len(snapshot) / 16_000
+        print(f"  [stt] ▶ early STT started  ({dur:.2f}s snapshot)", flush=True)
+        _pending_stt[0] = _stt_pool.submit(transcribe, snapshot)
+
     vad = StreamingVAD(
         onset_threshold  = 0.50,
         offset_threshold = 0.35,
@@ -152,6 +172,7 @@ def _vad_loop():
         min_speech_ms    = 120,  # 120 ms captures short words (yes/no/ok/stop)
         pre_pad_ms       = 200,
         onset_count      = 3,   # 3 × 16 ms = 48 ms sustained speech before onset fires
+        first_silence_cb = _on_first_silence,
     )
 
     print("  [vad] Silero VAD ready  (grace=1000ms  onset_count=3  step=256  min_speech=120ms)", flush=True)
@@ -252,8 +273,11 @@ def _vad_loop():
             utterance = vad.process(samples)
             if utterance is not None and len(utterance) > 0:
                 dur = len(utterance) / 16_000
+                # Grab the early-STT future (may be None if callback never fired)
+                fut = _pending_stt[0]
+                _pending_stt[0] = None
                 print(f"  [vad] → utterance queued  {dur:.2f}s", flush=True)
-                _speech_queue.put_nowait(utterance)
+                _speech_queue.put_nowait((utterance, fut))
                 vad.reset()
             continue
 
@@ -528,15 +552,18 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
     print(f"  [pipeline] VOICE_STATE → listening")
 
     with tracker.step("STT"):
-        rec_start = time.perf_counter()
+        rec_start  = time.perf_counter()
+        stt_future = None
         if carry_utterance is not None:
-            # Use the already-captured barge-in speech directly
+            # Use the already-captured barge-in speech directly (no early STT future)
             print(f"  [stt] using barge-in utterance ({len(carry_utterance)/16_000:.2f}s)")
             audio_data = carry_utterance
         else:
             print(f"  [stt] waiting for utterance from VAD...")
             try:
-                audio_data = _speech_queue.get(timeout=30)   # float32 @ 16kHz
+                # Queue items are (float32_array, Future | None) tuples since the
+                # early-STT callback fires at the first silence frame.
+                audio_data, stt_future = _speech_queue.get(timeout=30)
             except queue.Empty:
                 print("  [pipeline] no speech for 30 s — going idle (speak to wake)")
                 _emit("VOICE_STATE", {"state": "idle"})
@@ -548,7 +575,17 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
         print(f"  [stt] utterance received after {rec_secs:.3f}s — {dur:.2f}s")
 
         try:
-            user_text, trans_secs = transcribe(audio_data)
+            # If early STT already finished in the background, use its result
+            # (saves the full Whisper inference time from the critical path).
+            if stt_future is not None:
+                try:
+                    user_text, trans_secs = stt_future.result(timeout=2.0)
+                    print(f"  [stt] ✓ early result ready  ({trans_secs:.3f}s Whisper)", flush=True)
+                except Exception as e:
+                    print(f"  [stt] early result failed ({e}) — falling back to sync", flush=True)
+                    stt_future = None
+            if stt_future is None:
+                user_text, trans_secs = transcribe(audio_data)
         except Exception as e:
             print(f"  [stt] transcribe failed: {e}")
             _emit("VOICE_STATE", {"state": "idle"})

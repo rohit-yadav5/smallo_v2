@@ -143,8 +143,8 @@ def _format_backend_line(line: str) -> str:
     # ── Hard errors / exceptions ─────────────────────────────────────
     if any(k in ll for k in ("error", "exception", "traceback", "!! unhandled",
                               "failed", "crash", "✗", "hung?")):
-        # Keep "too short" VAD discards out of the error bucket
-        if "too short" not in ll:
+        # Keep "too short" VAD discards and early-STT fallbacks out of the error bucket
+        if "too short" not in ll and "falling back" not in ll:
             return f"{indent}{DIM}{ts}{R}  {RED}{B}{stripped}{R}"
 
     # ── Warnings ─────────────────────────────────────────────────────
@@ -245,6 +245,17 @@ def _format_backend_line(line: str) -> str:
             if "utterance received" in ll or "using barge-in" in ll:
                 formatted = _hi(stripped, BLU)
                 return f"{indent}{DIM}{ts}{R}  {BLU}{B}● {formatted}{R}"
+            # Early STT start — fired at first silence frame
+            if "early stt started" in ll or "early transcription started" in ll:
+                formatted = _hi(stripped, BLU)
+                return f"{indent}{DIM}{ts}{R}  {BLU}{B}▶ {formatted}{R}"
+            # Early STT result used (saves full Whisper time from critical path)
+            if "early result ready" in ll:
+                formatted = _hi(stripped, BLU)
+                return f"{indent}{DIM}{ts}{R}  {BLU}{B}✓ {formatted}{R}"
+            # Early STT fallback — warning, not error
+            if "early result failed" in ll or "falling back" in ll:
+                return f"{indent}{DIM}{ts}{R}  {YLW}⚠  {stripped}{R}"
             formatted = _hi(stripped, BLU)
             return f"{indent}{DIM}{ts}{R}  {BLU}{formatted}{R}"
 

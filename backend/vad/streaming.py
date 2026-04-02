@@ -72,6 +72,11 @@ class StreamingVAD:
         max_speech_s:     int   = 30,
         pre_pad_ms:       int   = 200,
         onset_count:      int   = 2,
+        first_silence_cb  = None,        # callable(audio_snapshot) — called once at
+                                         # the first silence frame so the caller can
+                                         # start STT in the background while the
+                                         # silence confirmation window (silence_ms)
+                                         # elapses.  Called at most once per utterance.
     ):
         self._engine = SileroEngine(threshold=onset_threshold)
         self._offset = offset_threshold
@@ -94,6 +99,10 @@ class StreamingVAD:
         # Onset hysteresis — require consecutive speech windows before onset
         self._onset_count    = onset_count
         self._onset_buf: int = 0   # consecutive-above-threshold counter
+
+        # Early-STT callback — fired once per utterance at first silence frame
+        self._first_silence_cb   = first_silence_cb
+        self._early_stt_fired    = False  # guard: fire at most once per utterance
 
         # Runtime state
         self._speaking:  bool = False
@@ -129,6 +138,19 @@ class StreamingVAD:
 
                 if prob < self._offset:
                     self._silence += 1
+                    # First silence frame: fire early-STT callback so the caller
+                    # can start Whisper in the background while the silence
+                    # confirmation window (silence_ms) elapses.  Guarded by
+                    # _early_stt_fired so mid-speech pauses don't re-trigger it.
+                    if self._silence == 1 and not self._early_stt_fired \
+                            and self._first_silence_cb is not None:
+                        self._early_stt_fired = True
+                        snapshot = (np.concatenate(self._speech)
+                                    if self._speech else np.empty(0, dtype=np.float32))
+                        try:
+                            self._first_silence_cb(snapshot)
+                        except Exception:
+                            pass
                     if self._silence >= self._silence_threshold:
                         result = self._flush()
                 else:
@@ -183,12 +205,13 @@ class StreamingVAD:
         Whisper.  The ring re-fills naturally within pre_pad_ms of new audio.
         """
         self._engine.reset_states()
-        self._speech    = []
-        self._n_samples = 0
-        self._silence   = 0
-        self._speaking  = False
-        self._onset_buf = 0
-        self._leftover  = np.empty(0, dtype=np.float32)
+        self._speech         = []
+        self._n_samples      = 0
+        self._silence        = 0
+        self._speaking       = False
+        self._onset_buf      = 0
+        self._early_stt_fired = False
+        self._leftover       = np.empty(0, dtype=np.float32)
         self._pre.clear()   # ← wipe echo / stale audio from previous state
 
     @property
@@ -213,8 +236,9 @@ class StreamingVAD:
             audio = np.empty(0, dtype=np.float32)
 
         # Reset per-utterance state (LSTM hidden states preserved until reset() called)
-        self._speech    = []
-        self._n_samples = 0
-        self._silence   = 0
-        self._speaking  = False
+        self._speech          = []
+        self._n_samples       = 0
+        self._silence         = 0
+        self._speaking        = False
+        self._early_stt_fired = False
         return audio

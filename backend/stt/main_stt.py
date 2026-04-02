@@ -1,3 +1,4 @@
+import threading
 import time
 import numpy as np
 from faster_whisper import WhisperModel
@@ -12,6 +13,11 @@ model = WhisperModel(
     compute_type="int8"
 )
 
+# faster-whisper's WhisperModel is not thread-safe (shared ONNX session state).
+# This lock serialises the background early-STT thread and the foreground
+# fallback call so they never run concurrently on the same model instance.
+_stt_lock = threading.Lock()
+
 
 def warmup():
     """Run a dummy transcription so ONNX JIT-compiles on startup, not on first user speech."""
@@ -23,6 +29,9 @@ def transcribe(audio_data: np.ndarray) -> tuple[str, float]:
     """
     Transcribe float32 audio at 16 kHz.
 
+    Thread-safe: serialised by _stt_lock so the background early-STT thread
+    and the foreground fallback never call the model at the same time.
+
     Args:
         audio_data — float32 numpy array at 16 kHz
 
@@ -30,6 +39,12 @@ def transcribe(audio_data: np.ndarray) -> tuple[str, float]:
         text               — transcribed string (empty if audio is too quiet)
         transcription_secs — time Whisper spent (0.0 if energy gate rejects it)
     """
+    with _stt_lock:
+        return _transcribe(audio_data)
+
+
+def _transcribe(audio_data: np.ndarray) -> tuple[str, float]:
+    """Inner transcription — caller must hold _stt_lock."""
     audio_data = audio_data.copy()
     np.clip(audio_data, -1.0, 1.0, out=audio_data)
 
