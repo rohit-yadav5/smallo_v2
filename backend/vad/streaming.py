@@ -139,31 +139,33 @@ class StreamingVAD:
                     result = self._flush(forced=True)
 
             else:
-                # Pre-speech: keep ring buffer warm for word-start padding
-                self._pre.add_frames(audio_16k[pos : pos + _STEP])
-
-                # Onset hysteresis: require consecutive speech windows
+                # Onset hysteresis: require consecutive speech windows before
+                # committing to speech.  Check BEFORE adding to _pre so that
+                # the onset step is never written into the ring and then read
+                # back out again — that would place it twice in _speech
+                # (once in pre_audio, once as _speech[1]), creating a 16 ms
+                # duplicate phoneme at the very start of every utterance.
+                # Symptom: Whisper mis-decodes the first word on every turn
+                # ("what is your name" → "i is your name", etc.).
                 if is_speech_raw:
                     self._onset_buf += 1
                 else:
                     self._onset_buf = max(0, self._onset_buf - 1)
 
                 if self._onset_buf >= self._onset_count:
+                    # Onset fires.  Current step is the first real speech chunk.
+                    # _pre does NOT contain it yet (we skipped the add above),
+                    # so pre_audio + current_step has no overlap.
                     self._onset_buf = 0
                     self._speaking  = True
                     self._silence   = 0
-                    # Seed speech with pre-speech buffer (captures word beginning).
-                    # IMPORTANT: add only _STEP (256) samples here, NOT the full
-                    # _WINDOW (512).  The loop advances by _STEP after this block,
-                    # so the next iteration starts at pos+_STEP and adds
-                    # audio[pos+_STEP : pos+2*_STEP].  If we added the full window
-                    # (audio[pos : pos+_WINDOW]) the slice audio[pos+_STEP : pos+_WINDOW]
-                    # would appear twice — creating a 16 ms duplicate at the start of
-                    # every utterance that corrupts the first word for Whisper.
                     pre_audio = self._pre.get_last_samples(self._pre_samples)
                     self._speech    = [pre_audio, audio_16k[pos : pos + _STEP]]
                     self._n_samples = len(pre_audio) + _STEP
                     print(f"  [vad] ▶  speech start  prob={prob:.3f}", flush=True)
+                else:
+                    # Not onset yet — keep ring warm for word-start padding.
+                    self._pre.add_frames(audio_16k[pos : pos + _STEP])
 
             pos += _STEP
 
