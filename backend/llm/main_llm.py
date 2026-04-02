@@ -55,6 +55,7 @@ def ask_llm(user_text: str) -> str:
             "model": MODEL,
             "prompt": prompt,
             "stream": False,
+            "keep_alive": -1,
             "options": {
                 "num_predict": -1
             }
@@ -77,16 +78,48 @@ _LLM_OPTIONS = {
 
 
 def warmup():
-    """Send a 1-token request so Ollama pages phi3 into RAM before first real turn."""
+    """Check Ollama health, then warm the model into RAM."""
+    # Health check — surfaces problems early with clear instructions
+    if not check_ollama():
+        print("  [llm] ⚠  Ollama not ready — first real turn may be slow or fail", flush=True)
+        return
+    # Send a 1-token request so phi3 is fully paged into RAM
     try:
         requests.post(
             OLLAMA_URL,
             json={"model": MODEL, "prompt": "Hi.", "stream": False,
-                  "options": {"num_predict": 1}},
+                  "keep_alive": -1, "options": {"num_predict": 1}},
             timeout=30
         )
-    except Exception:
-        pass  # Ollama not running yet — will load on first real request
+        print(f"  [llm] ✓ model '{MODEL}' warmed up", flush=True)
+    except Exception as e:
+        print(f"  [llm] ⚠  warmup request failed: {e}", flush=True)
+
+
+def check_ollama() -> bool:
+    """
+    Quick health probe: confirm Ollama is reachable and the model is loaded.
+    Returns True if ready, False otherwise.  Never raises.
+    """
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=3)
+        if r.status_code != 200:
+            print(f"  [llm] ✗ Ollama health check failed (HTTP {r.status_code})", flush=True)
+            return False
+        tags = r.json().get("models", [])
+        names = [m.get("name", "") for m in tags]
+        if not any(MODEL in n for n in names):
+            print(f"  [llm] ✗ Model '{MODEL}' not found in Ollama. "
+                  f"Available: {names}  →  run: ollama pull {MODEL}", flush=True)
+            return False
+        return True
+    except requests.exceptions.ConnectionError:
+        print(f"  [llm] ✗ Cannot connect to Ollama at {OLLAMA_URL} — "
+              f"is it running?  (run: ollama serve)", flush=True)
+        return False
+    except Exception as e:
+        print(f"  [llm] ✗ Ollama health check error: {e}", flush=True)
+        return False
 
 
 def ask_llm_stream(user_text: str):
@@ -99,16 +132,22 @@ def ask_llm_stream(user_text: str):
         "Assistant:"
     )
 
+    print(f"  [llm] ▶ {len(prompt):,} char prompt → {MODEL}", flush=True)
+
     response = requests.post(
         OLLAMA_URL,
         json={
             "model": MODEL,
             "prompt": prompt,
             "stream": True,
+            "keep_alive": -1,
             "options": _LLM_OPTIONS
         },
         stream=True,
-        timeout=60
+        # (connect_timeout, read_timeout_per_chunk)
+        # read_timeout applies to each iter_lines() call — prevents infinite hang
+        # if Ollama stops mid-generation.
+        timeout=(10, 90),
     )
 
     response.raise_for_status()

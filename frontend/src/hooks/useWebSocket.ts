@@ -54,7 +54,16 @@ export function useWebSocket() {
       localWsRef.current = ws
       wsRef.current      = ws
 
+      // Safety: if neither onopen nor onclose fires within 10s, force-close
+      const connectTimeout = setTimeout(() => {
+        if (ws.readyState === WebSocket.CONNECTING) {
+          console.warn('[ws] connection attempt timed out — closing')
+          ws.close()
+        }
+      }, 10_000)
+
       ws.onopen = () => {
+        clearTimeout(connectTimeout)
         console.log('[ws] connected')
         retryDelay = 1_000          // reset backoff on success
         store.setWsConnected(true)
@@ -67,6 +76,7 @@ export function useWebSocket() {
       }
 
       ws.onclose = () => {
+        clearTimeout(connectTimeout)
         console.log(`[ws] closed — retry in ${retryDelay / 1000}s`)
         stopHeartbeat()
         wsRef.current = null
