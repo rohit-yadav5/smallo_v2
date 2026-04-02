@@ -121,7 +121,7 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
     _token_count  = 0
     _sentence_num = 0
 
-    LLM_TIMEOUT_S = 30.0    # abort if no token arrives within this many seconds
+    LLM_TIMEOUT_S = 60.0    # abort if no token arrives within this many seconds
     _last_wait_log = -1     # heartbeat bucket index
 
     # ── Producer thread ───────────────────────────────────────────────────────

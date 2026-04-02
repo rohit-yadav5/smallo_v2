@@ -92,10 +92,11 @@ def _banner():
     print(f"  {DIM}Frontend : {FRONTEND}{R}")
     print()
     print(f"  {DIM}Pipeline config:{R}")
-    print(f"    {DIM}STT  : faster-whisper  base.en  int8  (beam=5  vad_filter=True){R}")
-    print(f"    {DIM}VAD  : Silero  grace=1000ms  onset_count=3  step=256  min_speech=120ms{R}")
+    print(f"    {DIM}STT  : faster-whisper  small  int8  vad_filter=True{R}")
+    print(f"    {DIM}VAD  : Silero  grace=1000ms  silence=1500ms  onset_count=2  pre_pad=1500ms  step=256  min_speech=120ms{R}")
+    print(f"    {DIM}VAD  : pre-audio silence trimmed before Whisper (100ms lead-in kept){R}")
     print(f"    {DIM}TTS  : Piper  en_US-amy-medium  length_scale=0.7{R}")
-    print(f"    {DIM}LLM  : Ollama  phi3  (stream  timeout=10/60s){R}")
+    print(f"    {DIM}LLM  : Ollama  phi3  (stream  connect=10s  read=90s  keep_alive=forever){R}")
     print()
     print(f"  {DIM}Log colour legend:{R}")
     print(f"    {TL}■{R} VAD      {BLU}■{R} STT      {YLW}■{R} TTS      {CYN}■{R} LLM")
@@ -209,14 +210,19 @@ def _format_backend_line(line: str) -> str:
 
         # ── [vad] ────────────────────────────────────────────────────
         if tag == "vad":
-            # ▶ speech start  prob=0.xxx
+            # ▶ speech start  prob=0.xxx  pre=Xms  (trimmed Xms silence)
             if "speech start" in ll:
-                prob = re.search(r"prob=([\d.]+)", line)
+                prob     = re.search(r"prob=([\d.]+)", line)
+                pre_m    = re.search(r"pre=([\d.]+)ms", line)
+                trim_m   = re.search(r"trimmed\s+([\d.]+)ms", line)
                 prob_val = float(prob.group(1)) if prob else 0.0
-                # Colour prob by confidence: green ≥0.8, yellow ≥0.6, default otherwise
-                prob_col = (GRN if prob_val >= 0.8 else YLW if prob_val >= 0.6 else TL)
+                prob_col = GRN if prob_val >= 0.8 else YLW if prob_val >= 0.6 else TL
                 prob_str = f"  prob={prob_col}{prob.group(1)}{TL}" if prob else ""
-                return f"{indent}{DIM}{ts}{R}  {TL}{B}▶ {stripped}{prob_str}{R}"
+                pre_str  = (f"  {DIM}pre={WHT}{pre_m.group(1)}ms{TL}" if pre_m else "")
+                trim_str = (f"  {DIM}↓{trim_m.group(1)}ms silence trimmed{TL}"
+                            if trim_m and float(trim_m.group(1)) > 50 else "")
+                return (f"{indent}{DIM}{ts}{R}  {TL}{B}▶ speech start"
+                        f"{prob_str}{pre_str}{trim_str}{R}")
             # ■ speech end / forced
             if "speech end" in ll or "speech forced" in ll or (
                     "■" in line and "speech" in ll):
@@ -229,9 +235,15 @@ def _format_backend_line(line: str) -> str:
             if "utterance queued" in ll or "utterance captured" in ll:
                 formatted = _hi(stripped, TL)
                 return f"{indent}{DIM}{ts}{R}  {TL}{B}→ {formatted}{R}"
-            # ● Silero VAD ready (startup)
+            # ● Silero VAD ready (startup) — parse and highlight each config value
             if "silero vad ready" in ll:
-                return f"{indent}{DIM}{ts}{R}  {TL}● {stripped}{R}"
+                # highlight key=value pairs: e.g. silence=1500ms → bold white value
+                formatted = re.sub(
+                    r"([\w_]+=)(\S+)",
+                    lambda m: f"{DIM}{m.group(1)}{WHT}{m.group(2)}{TL}",
+                    stripped,
+                )
+                return f"{indent}{DIM}{ts}{R}  {TL}● {formatted}{R}"
             # → speaking / → listening  (LSTM reset state transitions)
             if "→ speaking" in ll or "→ listening" in ll:
                 state_col = GRN if "speaking" in ll else BLU

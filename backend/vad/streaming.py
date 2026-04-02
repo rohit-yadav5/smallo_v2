@@ -44,6 +44,31 @@ _SR     = 16_000
 _WINDOW = 512    # Silero requirement
 _STEP   = 256    # 50 % overlap → 16 ms step → smoother probability estimates
 
+# How many samples to keep before the first real sound when trimming pre-audio.
+# 100 ms of natural room-noise context helps Whisper calibrate before the first
+# word; without it the first consonant sits at sample-0 and can be mis-decoded.
+_LEAD_IN_SAMPLES = int(0.10 * _SR)   # 1 600 samples = 100 ms
+
+
+def _trim_leading_silence(audio: np.ndarray, threshold: float = 0.005) -> np.ndarray:
+    """Strip leading near-zero samples added by RingBuffer.clear() zero-fill.
+
+    Keeps _LEAD_IN_SAMPLES of context before the first sample that exceeds
+    `threshold` (~-46 dBFS) so Whisper receives natural-sounding audio that
+    starts close to the actual speech rather than 1.5 s of dead silence.
+
+    If the entire array is below the threshold (pure silence) the array is
+    returned unchanged so the caller can decide what to do with it.
+    """
+    if len(audio) == 0:
+        return audio
+    hits = np.flatnonzero(np.abs(audio) > threshold)
+    if len(hits) == 0:
+        return audio                        # all silence — leave as-is
+    first_sound = int(hits[0])
+    start = max(0, first_sound - _LEAD_IN_SAMPLES)
+    return audio[start:]
+
 
 class StreamingVAD:
     """
@@ -147,6 +172,8 @@ class StreamingVAD:
                         self._early_stt_fired = True
                         snapshot = (np.concatenate(self._speech)
                                     if self._speech else np.empty(0, dtype=np.float32))
+                        # Trim leading silence so early-STT snapshot is also clean
+                        snapshot = _trim_leading_silence(snapshot)
                         try:
                             self._first_silence_cb(snapshot)
                         except Exception:
@@ -182,9 +209,21 @@ class StreamingVAD:
                     self._speaking  = True
                     self._silence   = 0
                     pre_audio = self._pre.get_last_samples(self._pre_samples)
+                    # Trim leading zeros injected by RingBuffer.clear() so
+                    # Whisper receives audio that starts near actual sound
+                    # rather than 1.5 s of dead silence (which confuses its
+                    # internal VAD and causes the first word to be mis-decoded).
+                    raw_pre_ms  = len(pre_audio) / _SR * 1000
+                    pre_audio   = _trim_leading_silence(pre_audio)
+                    trimmed_ms  = raw_pre_ms - len(pre_audio) / _SR * 1000
                     self._speech    = [pre_audio, audio_16k[pos : pos + _STEP]]
                     self._n_samples = len(pre_audio) + _STEP
-                    print(f"  [vad] ▶  speech start  prob={prob:.3f}", flush=True)
+                    print(
+                        f"  [vad] ▶  speech start  prob={prob:.3f}"
+                        f"  pre={len(pre_audio)/_SR*1000:.0f}ms"
+                        f"  (trimmed {trimmed_ms:.0f}ms silence)",
+                        flush=True,
+                    )
                 else:
                     # Not onset yet — keep ring warm for word-start padding.
                     self._pre.add_frames(audio_16k[pos : pos + _STEP])

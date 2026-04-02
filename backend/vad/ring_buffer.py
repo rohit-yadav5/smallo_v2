@@ -94,11 +94,20 @@ class RingBuffer:
     # ── Clear ──────────────────────────────────────────────────────────────
 
     def clear(self) -> None:
-        """Reset the buffer to all zeros (keeps capacity; next read returns silence)."""
+        """Reset the buffer to all zeros and mark it as full of silence.
+
+        Marking _is_full=True is critical: it forces get_last_samples() to use
+        the circular-buffer read path immediately after a clear, so it always
+        returns exactly n zero-padded samples even before any real audio has
+        arrived.  Without this, if the user speaks within the first few frames
+        after a reset, the pre-speech ring is nearly empty and get_last_samples()
+        returns far fewer samples than requested — causing onset lookback to miss
+        the first words of the utterance.
+        """
         with self._lock:
             self._buf[:]    = 0.0
             self._write_pos = 0
-            self._is_full   = False
+            self._is_full   = True   # treat cleared buffer as "full of silence"
 
     @property
     def filled_samples(self) -> int:

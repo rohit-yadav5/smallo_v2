@@ -37,19 +37,20 @@ def _kill_tree(proc: subprocess.Popen, label: str) -> None:
             try: p.kill()
             except psutil.NoSuchProcess: pass
     except Exception:
-        # Fallback if psutil unavailable or process already gone
         try:
             proc.terminate()
             proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
         except Exception:
-            try: proc.kill()
-            except Exception: pass
+            pass
 
 
 def main():
     env = os.environ.copy()
     env["PYTHONPATH"]       = str(BACKEND)
-    env["PYTHONUNBUFFERED"] = "1"   # force line-buffered output in subprocesses
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONUTF8"]       = "1"
 
     procs: list[subprocess.Popen] = []
     frontend_proc: subprocess.Popen | None = None
@@ -70,7 +71,7 @@ def main():
         )
         procs.append(frontend_proc)
 
-        time.sleep(1.5)
+        time.sleep(2.0)
         webbrowser.open("http://localhost:5173")
         print("  Small O is running  →  http://localhost:5173")
         print("  Press Ctrl+C to stop.\n")

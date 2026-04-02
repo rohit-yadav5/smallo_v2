@@ -168,14 +168,14 @@ def _vad_loop():
     vad = StreamingVAD(
         onset_threshold  = 0.50,
         offset_threshold = 0.35,
-        silence_ms       = 600,
+        silence_ms       = 1500, # 1.5 s — allows natural mid-sentence pauses
         min_speech_ms    = 120,  # 120 ms captures short words (yes/no/ok/stop)
-        pre_pad_ms       = 200,
-        onset_count      = 3,   # 3 × 16 ms = 48 ms sustained speech before onset fires
+        pre_pad_ms       = 1500, # 1.5 s — captures words even after mid-sentence pauses
+        onset_count      = 2,   # 2 × 16 ms = 32 ms sustained speech before onset fires
         first_silence_cb = _on_first_silence,
     )
 
-    print("  [vad] Silero VAD ready  (grace=1000ms  onset_count=3  step=256  min_speech=120ms)", flush=True)
+    print("  [vad] Silero VAD ready  (grace=1000ms  silence=1500ms  onset_count=2  pre_pad=1500ms  step=256  min_speech=120ms)", flush=True)
 
     # ── State-transition tracking ─────────────────────────────────────
     _prev_state:          str   = ""

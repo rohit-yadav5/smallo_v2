@@ -55,6 +55,7 @@ def ask_llm(user_text: str) -> str:
             "model": MODEL,
             "prompt": prompt,
             "stream": False,
+            "keep_alive": -1,
             "options": {
                 "num_predict": -1
             }
@@ -87,7 +88,7 @@ def warmup():
         requests.post(
             OLLAMA_URL,
             json={"model": MODEL, "prompt": "Hi.", "stream": False,
-                  "options": {"num_predict": 1}},
+                  "keep_alive": -1, "options": {"num_predict": 1}},
             timeout=30
         )
         print(f"  [llm] ✓ model '{MODEL}' warmed up", flush=True)
@@ -139,13 +140,14 @@ def ask_llm_stream(user_text: str):
             "model": MODEL,
             "prompt": prompt,
             "stream": True,
+            "keep_alive": -1,
             "options": _LLM_OPTIONS
         },
         stream=True,
         # (connect_timeout, read_timeout_per_chunk)
         # read_timeout applies to each iter_lines() call — prevents infinite hang
         # if Ollama stops mid-generation.
-        timeout=(10, 60),
+        timeout=(10, 90),
     )
 
     response.raise_for_status()
