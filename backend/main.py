@@ -101,6 +101,11 @@ _interrupted_partial: str = ""
 _barge_in_utterance: np.ndarray | None = None
 _barge_in_lock: threading.Lock = threading.Lock()
 
+# Pre-roll audio captured during barge-in detection, right before vad.reset()
+# wipes _pre and _speech on the speaking→listening transition.  Contains the
+# user's first word(s) that would otherwise be lost.  Protected by _barge_in_lock.
+_barge_in_pre_roll: np.ndarray | None = None
+
 # Streaming STT — one StreamingTranscriber per utterance.
 # It runs Whisper every 500 ms during speech (live word-by-word display)
 # and produces the final result in finalize() at turn end.
@@ -228,10 +233,25 @@ def _vad_loop():
                 _barge_in_consec     = 0
                 print("  [vad] → speaking  (LSTM reset, grace period armed)", flush=True)
             elif state == "listening":
-                # Reset on ANY transition to listening — including speaking→listening
-                # after a barge-in.  Without this the LSTM retains echo/speech state
-                # from the barge-in detection and immediately fires again on the next
-                # listening window, causing an infinite false-barge-in loop.
+                # On barge-in transition only: capture the audio accumulated during
+                # barge-in detection BEFORE reset() destroys it.  _pre holds audio
+                # from the ring up to VAD onset; _speech holds audio from onset to
+                # now.  Together they cover the user's first word(s) that would
+                # otherwise be clipped ("what is your name" → "it is your name").
+                # Other transitions (idle→listening, thinking→listening) have nothing
+                # meaningful in _pre/_speech, so we skip them.
+                if _prev_state == "speaking":
+                    global _barge_in_pre_roll
+                    _roll = vad.get_barge_in_audio()
+                    if len(_roll) > 0:
+                        with _barge_in_lock:
+                            _barge_in_pre_roll = _roll
+                        pre_ms = len(_roll) / 16_000 * 1000
+                        print(f"  [vad] → barge-in pre-roll captured  {pre_ms:.0f}ms", flush=True)
+                # LSTM reset is still required on every listening transition —
+                # without it the LSTM retains echo/speech state from barge-in
+                # detection and immediately re-fires on the first listening window,
+                # causing an infinite false-barge-in loop.
                 vad.reset()
                 print(f"  [vad] → listening  (LSTM reset, from {_prev_state})", flush=True)
             _prev_state = state
@@ -538,14 +558,16 @@ def _pipeline_loop():
 
 def _run_turn(turn: int, tracker: LatencyTracker, router):
     """Execute one full pipeline turn. Called inside the crash-guard try/except."""
-    global _interrupted_partial, _barge_in_utterance
+    global _interrupted_partial, _barge_in_utterance, _barge_in_pre_roll
 
-    # ── Grab barge-in utterance BEFORE clearing the queue ─────────────────
-    # If the user's interrupting speech completed as a short burst while TTS was
-    # still playing, it was saved here to survive the stale-queue clearing below.
+    # ── Grab barge-in globals BEFORE clearing the queue ───────────────────
+    # Consume both atomically under one lock acquisition to avoid a race where
+    # _vad_loop writes a new pre-roll between the two reads.
     with _barge_in_lock:
-        carry_utterance = _barge_in_utterance
+        carry_utterance    = _barge_in_utterance
         _barge_in_utterance = None
+        carry_pre_roll     = _barge_in_pre_roll   # first-word pre-roll from barge-in
+        _barge_in_pre_roll = None                  # consume once
 
     # ── Clear stale complete utterances from previous turn ───────────────
     cleared = 0
@@ -579,6 +601,21 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
                 print("  [pipeline] no speech for 30 s — going idle (speak to wake)")
                 _emit("VOICE_STATE", {"state": "idle"})
                 return
+            # Prepend barge-in pre-roll if captured.  This is the audio that
+            # accumulated in StreamingVAD._pre and ._speech during barge-in
+            # detection — containing the user's first word(s) — which would
+            # have been destroyed when vad.reset() was called on the
+            # speaking→listening transition.  Without this, "what is your name"
+            # transcribes as "it is your name" because the first 50–200 ms of
+            # speech are missing from what Whisper receives.
+            # Note: NOT applied to carry_utterance (short-burst path) — that
+            # utterance was assembled by vad.process() which already included
+            # its own pre-roll via _pre.get_last_samples() at onset.
+            if carry_pre_roll is not None and len(audio_data) > 0:
+                audio_data = np.concatenate([carry_pre_roll, audio_data])
+                pre_ms = len(carry_pre_roll) / 16_000 * 1000
+                print(f"  [stt] pre-roll prepended  {pre_ms:.0f}ms → {len(audio_data)/16_000:.2f}s total",
+                      flush=True)
         rec_secs = time.perf_counter() - rec_start
         dur      = len(audio_data) / 16_000
 

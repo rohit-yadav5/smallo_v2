@@ -265,6 +265,36 @@ class StreamingVAD:
         self._leftover        = np.empty(0, dtype=np.float32)
         self._pre.clear()   # ← wipe echo / stale audio from previous state
 
+    def get_barge_in_audio(self) -> np.ndarray:
+        """Snapshot of all barge-in audio accumulated so far.
+
+        Returns _pre ring contents (up to VAD onset) concatenated with
+        _speech contents (from VAD onset onward), trimmed of leading silence.
+
+        Call this BEFORE reset() on the speaking→listening transition to
+        capture audio that would otherwise be destroyed by reset() wiping
+        both _pre and _speech.  Returns an empty array if nothing was
+        accumulated (onset never fired — e.g. a very brief false barge-in).
+
+        Before / after barge-in transition
+        ───────────────────────────────────
+        BEFORE (bug):
+          vad.reset() wipes _pre + _speech
+          → Whisper receives silence before user speech
+          → "what is your name" transcribed as "it is your name"
+
+        AFTER (fix):
+          audio = vad.get_barge_in_audio()   ← snapshot before wipe
+          vad.reset()
+          audio prepended to next listening utterance
+          → "what is your name" transcribed correctly
+        """
+        pre = self._pre.get_last_samples(self._pre_samples)
+        pre = _trim_leading_silence(pre)
+        if self._speech:
+            return np.concatenate([pre, np.concatenate(self._speech)])
+        return pre
+
     @property
     def is_speaking(self) -> bool:
         """True while a speech segment is being accumulated (not yet sealed)."""
