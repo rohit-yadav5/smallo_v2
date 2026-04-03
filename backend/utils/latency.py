@@ -61,6 +61,28 @@ class LatencyTracker:
         self._current_notes.append(msg)
         print(f"  {_DIM}       ↳ {msg}{_R}", flush=True)
 
+    def record(self, name: str, duration: float, notes: list[str] | None = None):
+        """Record a pre-measured step (timing captured externally).
+
+        Use this when the code being timed runs outside a context manager —
+        e.g. when a single function (speak_stream) internally measures multiple
+        sub-phases and returns them in a timing dict.
+        """
+        ts         = _ts()
+        cumulative = time.perf_counter() - self._turn_start
+        col        = _speed_color(duration)
+        notes      = notes or []
+        print(f"\n  {_BLU}{_B}▶ {name}{_R}  {_DIM}({ts}){_R}", flush=True)
+        for n in notes:
+            print(f"  {_DIM}       ↳ {n}{_R}", flush=True)
+        print(
+            f"  {col}{_B}✓ {name}{_R}"
+            f"  {col}{duration:.3f}s{_R}"
+            f"  {_DIM}[total {cumulative:.3f}s]{_R}",
+            flush=True,
+        )
+        self._steps.append((name, duration, notes))
+
     @contextmanager
     def step(self, name: str):
         ts = _ts()

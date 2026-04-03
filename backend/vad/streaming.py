@@ -102,6 +102,10 @@ class StreamingVAD:
                                          # start STT in the background while the
                                          # silence confirmation window (silence_ms)
                                          # elapses.  Called at most once per utterance.
+        speech_chunk_cb   = None,        # callable(chunk: np.ndarray) — called for
+                                         # every 16 ms speech chunk while accumulating.
+                                         # Used by StreamingTranscriber to run Whisper
+                                         # incrementally for live word-by-word display.
     ):
         self._engine = SileroEngine(threshold=onset_threshold)
         self._offset = offset_threshold
@@ -128,6 +132,8 @@ class StreamingVAD:
         # Early-STT callback — fired once per utterance at first silence frame
         self._first_silence_cb   = first_silence_cb
         self._early_stt_fired    = False  # guard: fire at most once per utterance
+        # Streaming-STT callback — fired for every 16 ms speech chunk
+        self._speech_chunk_cb    = speech_chunk_cb
 
         # Runtime state
         self._speaking:  bool = False
@@ -160,6 +166,12 @@ class StreamingVAD:
                 new_chunk = audio_16k[pos : pos + _STEP]
                 self._speech.append(new_chunk)
                 self._n_samples += len(new_chunk)
+                # Feed every chunk to StreamingTranscriber for live word display
+                if self._speech_chunk_cb is not None:
+                    try:
+                        self._speech_chunk_cb(new_chunk)
+                    except Exception:
+                        pass
 
                 if prob < self._offset:
                     self._silence += 1
@@ -244,14 +256,44 @@ class StreamingVAD:
         Whisper.  The ring re-fills naturally within pre_pad_ms of new audio.
         """
         self._engine.reset_states()
-        self._speech         = []
-        self._n_samples      = 0
-        self._silence        = 0
-        self._speaking       = False
-        self._onset_buf      = 0
+        self._speech          = []
+        self._n_samples       = 0
+        self._silence         = 0
+        self._speaking        = False
+        self._onset_buf       = 0
         self._early_stt_fired = False
-        self._leftover       = np.empty(0, dtype=np.float32)
+        self._leftover        = np.empty(0, dtype=np.float32)
         self._pre.clear()   # ← wipe echo / stale audio from previous state
+
+    def get_barge_in_audio(self) -> np.ndarray:
+        """Snapshot of all barge-in audio accumulated so far.
+
+        Returns _pre ring contents (up to VAD onset) concatenated with
+        _speech contents (from VAD onset onward), trimmed of leading silence.
+
+        Call this BEFORE reset() on the speaking→listening transition to
+        capture audio that would otherwise be destroyed by reset() wiping
+        both _pre and _speech.  Returns an empty array if nothing was
+        accumulated (onset never fired — e.g. a very brief false barge-in).
+
+        Before / after barge-in transition
+        ───────────────────────────────────
+        BEFORE (bug):
+          vad.reset() wipes _pre + _speech
+          → Whisper receives silence before user speech
+          → "what is your name" transcribed as "it is your name"
+
+        AFTER (fix):
+          audio = vad.get_barge_in_audio()   ← snapshot before wipe
+          vad.reset()
+          audio prepended to next listening utterance
+          → "what is your name" transcribed correctly
+        """
+        pre = self._pre.get_last_samples(self._pre_samples)
+        pre = _trim_leading_silence(pre)
+        if self._speech:
+            return np.concatenate([pre, np.concatenate(self._speech)])
+        return pre
 
     @property
     def is_speaking(self) -> bool:

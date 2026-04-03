@@ -10,6 +10,7 @@ Usage:
 import os
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -28,20 +29,23 @@ def _kill_tree(proc: subprocess.Popen, label: str) -> None:
         parent   = psutil.Process(proc.pid)
         children = parent.children(recursive=True)
         for child in children:
-            try: child.terminate()
+            try:   child.terminate()
             except psutil.NoSuchProcess: pass
-        try: parent.terminate()
+        try:   parent.terminate()
         except psutil.NoSuchProcess: pass
         _, alive = psutil.wait_procs([parent] + children, timeout=3)
         for p in alive:
-            try: p.kill()
+            try:   p.kill()
             except psutil.NoSuchProcess: pass
+        print(f"  ✓  {label} stopped")
     except Exception:
         try:
             proc.terminate()
             proc.wait(timeout=5)
+            print(f"  ✓  {label} stopped")
         except subprocess.TimeoutExpired:
             proc.kill()
+            print(f"  !  {label} killed (didn't stop in time)")
         except Exception:
             pass
 
@@ -53,6 +57,7 @@ def main():
     env["PYTHONUTF8"]       = "1"
 
     procs: list[subprocess.Popen] = []
+    stop          = threading.Event()
     frontend_proc: subprocess.Popen | None = None
     backend_proc:  subprocess.Popen | None = None
 
@@ -80,8 +85,11 @@ def main():
             for p in procs:
                 code = p.poll()
                 if code is not None:
-                    label = "frontend" if p is frontend_proc else "backend"
-                    print(f"\n  [{label}] crashed (code {code}). Shutting down.")
+                    label = "BACKEND" if p is backend_proc else "FRONTEND"
+                    print(f"\n  [{label}] exited with code {code}. Shutting down.")
+                    if code != 0:
+                        print(f"  Run python main_with_logs.py for detailed diagnostics.")
+                    stop.set()
                     return
             time.sleep(0.5)
 
@@ -89,6 +97,7 @@ def main():
         print("\n  Stopping Small O...")
 
     finally:
+        stop.set()
         for p, label in [(frontend_proc, "frontend"), (backend_proc, "backend")]:
             if p is not None:
                 _kill_tree(p, label)

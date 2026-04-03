@@ -104,7 +104,12 @@ export function useWebSocket() {
           store.setVoiceState(msg.data.state)
           break
 
+        case 'STT_PARTIAL':
+          store.setPartialUserText(msg.data.text, msg.data.hypothesis ?? '')
+          break
+
         case 'STT_RESULT':
+          store.clearPartialUserText()
           store.addUserMessage(
             msg.data.text,
             msg.data.recording_time,

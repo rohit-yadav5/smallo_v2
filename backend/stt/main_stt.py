@@ -1,82 +1,192 @@
-import threading
+"""
+stt/main_stt.py — Public transcribe() entry point.
+
+Wires together:
+  - engine.py   (model loading, device detection, stt_lock)
+  - filters.py  (hallucination blocklist + repetition detector)
+
+Public API is unchanged:
+  transcribe(audio_data: np.ndarray) -> tuple[str, float]
+  warmup() -> None
+
+Improvements over the original base.en implementation:
+  - Model:           distil-small.en  (2–3× faster, higher accuracy)
+  - Device:          CUDA float16 if available, else CPU int8
+  - initial_prompt:  "Small O."  (primes bot-name transcription)
+  - word_timestamps: True  (collected for future word-highlight feature)
+  - no_speech gate:  per-segment Python check at 0.55 in addition to
+                     Whisper's own internal gate at 0.6
+  - Hallucination filter: blocklist + repetition detector (filters.py)
+"""
 import time
+
 import numpy as np
-from faster_whisper import WhisperModel
 
-SAMPLE_RATE = 16000
+from stt.engine  import load_model, warmup as _engine_warmup, stt_lock, SAMPLE_RATE
+from stt.filters import is_hallucination
 
-# "base.en" is the English-only base model — ~3× more accurate than "tiny"
-# with only a modest latency increase (~0.5–1 s extra on CPU with int8).
-model = WhisperModel(
-    "base.en",
-    device="cpu",
-    compute_type="int8"
-)
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-# faster-whisper's WhisperModel is not thread-safe (shared ONNX session state).
-# This lock serialises the background early-STT thread and the foreground
-# fallback call so they never run concurrently on the same model instance.
-_stt_lock = threading.Lock()
+# Seed Whisper's context window with the bot's name so it transcribes
+# "Small O" correctly instead of "smallo" / "small oh" / "small zero".
+# The period trains the model that this is statement context, not mid-clause.
+# Keep it short — a long prompt can bleed into short utterance transcriptions.
+_INITIAL_PROMPT = "Small O."
+
+# Peak amplitude below this value (~-46 dBFS) is definitionally inaudible.
+# Reject before calling Whisper — saves the full inference time on silence.
+_ENERGY_THRESHOLD = 0.005
+
+# Whisper reports no_speech_prob per segment.  Segments above this threshold
+# are discarded even if they produced text (hallucinations on background noise).
+# Slightly more aggressive than Whisper's own internal 0.6 gate.
+_NO_SPEECH_THRESH = 0.55
+
+# Partial-transcription no_speech gate — more permissive than the final gate
+# because the final call will correct any errors from the fast partial path.
+_PARTIAL_NO_SPEECH_THRESH = 0.65
+
+# ── Model (loaded once at import time) ────────────────────────────────────────
+_model = load_model()
 
 
-def warmup():
-    """Run a dummy transcription so ONNX JIT-compiles on startup, not on first user speech."""
-    dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1 second of silence
-    list(model.transcribe(dummy, language="en")[0])
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def warmup() -> None:
+    """Pre-warms CTranslate2 JIT on startup.  Called once from main.py."""
+    _engine_warmup(_model)
+
+
+def transcribe_partial(
+    audio_data: np.ndarray,
+) -> tuple[str, list[tuple[str, float, float]], float]:
+    """Fast partial transcription for live display.  Thread-safe.
+
+    Uses beam_size=1 (greedy, ~3× faster than transcribe()). Returns per-word
+    timestamps so StreamingTranscriber can anchor its agreement algorithm on
+    absolute word positions rather than text alone — this prevents jitter when
+    Whisper rewrites punctuation or capitalisation across consecutive runs.
+
+    Returns:
+        (text, [(word_str, start_secs, probability), ...], secs)
+        text and words list are both "" / [] if audio is silent or hallucination.
+    """
+    with stt_lock:
+        return _transcribe_partial(audio_data)
 
 
 def transcribe(audio_data: np.ndarray) -> tuple[str, float]:
-    """
-    Transcribe float32 audio at 16 kHz.
-
-    Thread-safe: serialised by _stt_lock so the background early-STT thread
-    and the foreground fallback never call the model at the same time.
+    """Transcribe float32 audio at 16 kHz.  Thread-safe.
 
     Args:
-        audio_data — float32 numpy array at 16 kHz
+        audio_data: float32 numpy array at SAMPLE_RATE (16 000 Hz).
 
     Returns:
-        text               — transcribed string (empty if audio is too quiet)
-        transcription_secs — time Whisper spent (0.0 if energy gate rejects it)
+        (text, transcription_secs) — text is "" if the audio is too quiet,
+        all segments fail the no_speech gate, or the result is a known
+        hallucination.
     """
-    with _stt_lock:
+    with stt_lock:
         return _transcribe(audio_data)
 
 
+# ── Internal ──────────────────────────────────────────────────────────────────
+
 def _transcribe(audio_data: np.ndarray) -> tuple[str, float]:
-    """Inner transcription — caller must hold _stt_lock."""
+    """Inner transcription — caller must hold stt_lock."""
     audio_data = audio_data.copy()
     np.clip(audio_data, -1.0, 1.0, out=audio_data)
 
-    # ── Energy gate ────────────────────────────────────────────────────────
-    # Reject near-silent audio before passing to Whisper.  Without this, Whisper
-    # hallucinates filler words ("you", "thank you", "bye") on silence/noise.
-    # Peak < 0.005 is below ~-46 dBFS — too quiet to be real speech.
+    # ── Layer 1: Amplitude gate ───────────────────────────────────────────
+    # Cheap numpy max — avoids the full Whisper inference on near-silence.
     peak = float(np.abs(audio_data).max())
-    if peak < 0.005:
+    if peak < _ENERGY_THRESHOLD:
         return "", 0.0
 
-    # ── Normalise once per utterance ──────────────────────────────────────
-    # Scale to 90 % of full scale so Whisper always sees a well-levelled signal
-    # regardless of mic gain.  We only do this after the energy gate so that
-    # near-silent frames are not amplified to full-scale (which causes hallucinations).
+    # Normalise to 90 % of full scale after the energy gate — this way
+    # near-silent frames are not amplified to full-scale and passed to Whisper.
     audio_data = (audio_data / peak * 0.9).astype(np.float32)
 
+    # ── Layer 2: Whisper inference ────────────────────────────────────────
     t0 = time.perf_counter()
-    segments, _ = model.transcribe(
+    segments_gen, _ = _model.transcribe(
         audio_data,
-        language        = "en",
-        beam_size       = 5,      # 5 beams → noticeably better accuracy vs beam=1
-        best_of         = 1,      # only meaningful when temperature > 0; set to 1
-        temperature     = 0.0,    # greedy / deterministic — best for clean voice
-        condition_on_previous_text = False,   # prevent prior turns biasing output
-        # vad_filter is intentionally disabled.  Our Silero VAD already provides
-        # clean speech-only segments with 200 ms pre-speech padding.  Whisper's
-        # own VAD (also Silero-based) double-filters and can clip the start of
-        # short words, causing words like "yes"/"ok" to be mis-transcribed.
-        vad_filter          = False,
-        no_speech_threshold = 0.6,    # suppress hallucinations (Whisper's own gate)
-        word_timestamps     = False,  # not needed, saves ~10 % inference time
+        language                   = "en",
+        beam_size                  = 5,
+        best_of                    = 1,
+        temperature                = 0.0,    # greedy / deterministic
+        condition_on_previous_text = False,  # prevent prior-turn bleeding
+        vad_filter                 = False,  # Silero VAD already handled this
+        no_speech_threshold        = 0.6,    # Layer 2: Whisper's internal gate
+        initial_prompt             = _INITIAL_PROMPT,
+        word_timestamps            = True,   # enables seg.words for future use
     )
-    text = " ".join(seg.text for seg in segments).strip()
-    return text, time.perf_counter() - t0
+
+    # ── Layer 3: Per-segment no_speech_prob gate ──────────────────────────
+    # Inspect each yielded segment's probability directly — slightly more
+    # aggressive than Whisper's own 0.6 internal gate.
+    kept_texts: list[str] = []
+
+    for seg in segments_gen:
+        if seg.no_speech_prob > _NO_SPEECH_THRESH:
+            continue   # discard segment — model is unsure speech is present
+        kept_texts.append(seg.text)
+        # seg.words is list[Word] with .word, .start, .end, .probability
+        # Available for future word-highlight frontend feature.
+
+    transcription_secs = time.perf_counter() - t0
+    text = " ".join(kept_texts).strip()
+
+    # ── Layers 4 + 5: Hallucination filter ───────────────────────────────
+    if is_hallucination(text):
+        return "", transcription_secs
+
+    return text, transcription_secs
+
+
+def _transcribe_partial(audio_data: np.ndarray) -> tuple[str, list[tuple[str, float, float]], float]:
+    """Inner partial transcription — caller must hold stt_lock."""
+    audio_data = audio_data.copy()
+    np.clip(audio_data, -1.0, 1.0, out=audio_data)
+
+    # ── Layer 1: Amplitude gate ───────────────────────────────────────────
+    peak = float(np.abs(audio_data).max())
+    if peak < _ENERGY_THRESHOLD:
+        return "", [], 0.0
+    audio_data = (audio_data / peak * 0.9).astype(np.float32)
+
+    # ── Layer 2: Whisper inference (greedy — beam_size=1) ─────────────────
+    t0 = time.perf_counter()
+    segments_gen, _ = _model.transcribe(
+        audio_data,
+        language                   = "en",
+        beam_size                  = 1,          # greedy: ~3× faster on CPU
+        best_of                    = 1,
+        temperature                = 0.0,
+        condition_on_previous_text = False,
+        vad_filter                 = False,
+        no_speech_threshold        = _PARTIAL_NO_SPEECH_THRESH,
+        initial_prompt             = _INITIAL_PROMPT,
+        word_timestamps            = True,
+    )
+
+    # ── Layer 3: Per-segment no_speech_prob gate ──────────────────────────
+    kept_texts: list[str]                      = []
+    all_words:  list[tuple[str, float, float]] = []
+
+    for seg in segments_gen:
+        if seg.no_speech_prob > _PARTIAL_NO_SPEECH_THRESH:
+            continue
+        kept_texts.append(seg.text)
+        if seg.words:
+            for w in seg.words:
+                all_words.append((w.word, w.start, w.probability))
+
+    secs = time.perf_counter() - t0
+    text = " ".join(kept_texts).strip()
+
+    # ── Layers 4 + 5: Hallucination filter ───────────────────────────────
+    if is_hallucination(text):
+        return "", [], secs
+
+    return text, all_words, secs
