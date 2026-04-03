@@ -6,6 +6,8 @@ interface AppState {
   wsConnected:          boolean
   micActive:            boolean          // true once AudioWorklet pipeline is running
   messages:             ConversationMessage[]
+  partialUserText:      string           // confirmed words from streaming STT
+  partialHypothesis:    string           // unconfirmed trailing words (faded in UI)
   memoryNodes:          MemoryNode[]
   pluginNotifications:  PluginNotification[]
   systemStats:          SystemStats
@@ -16,6 +18,8 @@ interface AppState {
   setVoiceState:            (state: VoiceState) => void
   setWsConnected:           (connected: boolean) => void
   setMicActive:             (v: boolean) => void
+  setPartialUserText:       (text: string, hypothesis: string) => void
+  clearPartialUserText:     () => void
   addUserMessage:           (text: string, stt_time: number, transcription_time: number) => void
   startAssistantMessage:    () => string
   appendToken:              (id: string, token: string) => void
@@ -36,6 +40,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   wsConnected:         false,
   micActive:           false,
   messages:            [],
+  partialUserText:     '',
+  partialHypothesis:   '',
   memoryNodes:         [],
   pluginNotifications: [],
   systemStats:         { cpu: 0, ram: 0, battery: 0 },
@@ -43,9 +49,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   latency:             0,
   currentStreamId:     null,
 
-  setVoiceState:  (state)     => set({ voiceState: state }),
-  setWsConnected: (connected) => set({ wsConnected: connected }),
-  setMicActive:   (v)         => set({ micActive: v }),
+  setVoiceState:        (state)     => set({ voiceState: state }),
+  setWsConnected:       (connected) => set({ wsConnected: connected }),
+  setMicActive:         (v)         => set({ micActive: v }),
+  setPartialUserText:   (text, hyp) => set({ partialUserText: text, partialHypothesis: hyp }),
+  clearPartialUserText: ()          => set({ partialUserText: '', partialHypothesis: '' }),
 
   addUserMessage: (text, stt_time, transcription_time) => {
     const id = crypto.randomUUID()

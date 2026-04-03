@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from concurrent.futures import Future, ThreadPoolExecutor
+
 from pathlib import Path
 
 import math
@@ -63,7 +63,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from stt import transcribe, warmup as stt_warmup
+from stt import transcribe, transcribe_partial, warmup as stt_warmup, StreamingTranscriber
 from vad import StreamingVAD
 from llm import ask_llm_stream, warmup as llm_warmup
 from tts import speak, speak_stream, warmup as tts_warmup, abort_speaking
@@ -101,10 +101,21 @@ _interrupted_partial: str = ""
 _barge_in_utterance: np.ndarray | None = None
 _barge_in_lock: threading.Lock = threading.Lock()
 
-# Early STT — thread pool used by the first-silence callback in _vad_loop.
-# Transcription starts at the first silence frame so it overlaps with the
-# silence_ms confirmation window (600 ms), saving ~300–500 ms per turn.
-_stt_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stt-early")
+# Streaming STT — one StreamingTranscriber per utterance.
+# It runs Whisper every 500 ms during speech (live word-by-word display)
+# and produces the final result in finalize() at turn end.
+def _make_transcriber() -> StreamingTranscriber:
+    """Create a fresh StreamingTranscriber that emits STT_PARTIAL events."""
+    def _on_partial(confirmed: str, hypothesis: str) -> None:
+        _emit("STT_PARTIAL", {"text": confirmed, "hypothesis": hypothesis})
+    return StreamingTranscriber(
+        transcribe_fn         = transcribe,
+        on_partial            = _on_partial,
+        chunk_interval_s      = 0.3,
+        transcribe_partial_fn = transcribe_partial,
+    )
+
+_active_transcriber: list = [None]   # [StreamingTranscriber | None]
 
 
 def _emit(event: str, data: dict):
@@ -151,19 +162,8 @@ def _vad_loop():
 
     Inspired by vad_2/vad_engine_silero architecture.
     """
-    # Mutable container so the nested callback can write back to the VAD loop.
-    _pending_stt: list = [None]   # [0] = concurrent.futures.Future | None
-
-    def _on_first_silence(snapshot: np.ndarray) -> None:
-        """Fire at the very first silence frame — starts Whisper in background.
-
-        By the time the 600 ms silence_ms window elapses (confirming the
-        utterance is over), the transcription is already done.  _run_turn
-        reads the result via the Future instead of blocking on a new call.
-        """
-        dur = len(snapshot) / 16_000
-        print(f"  [stt] ▶ early STT started  ({dur:.2f}s snapshot)", flush=True)
-        _pending_stt[0] = _stt_pool.submit(transcribe, snapshot)
+    # Create the first StreamingTranscriber — a fresh one is made for each turn.
+    _active_transcriber[0] = _make_transcriber()
 
     vad = StreamingVAD(
         onset_threshold  = 0.50,
@@ -171,11 +171,21 @@ def _vad_loop():
         silence_ms       = 1500, # 1.5 s — allows natural mid-sentence pauses
         min_speech_ms    = 120,  # 120 ms captures short words (yes/no/ok/stop)
         pre_pad_ms       = 1500, # 1.5 s — captures words even after mid-sentence pauses
-        onset_count      = 2,   # 2 × 16 ms = 32 ms sustained speech before onset fires
-        first_silence_cb = _on_first_silence,
+        onset_count      = 2,    # 2 × 16 ms = 32 ms sustained speech before onset fires
+        # fire start_finalize at first silence so background Whisper overlaps
+        # with the silence_ms confirmation window — same latency saving as before
+        first_silence_cb = lambda snap: (
+            _active_transcriber[0].start_finalize(snap)
+            if _active_transcriber[0] else None
+        ),
+        # feed every 16 ms chunk to the transcriber for live word-by-word display
+        speech_chunk_cb  = lambda chunk: (
+            _active_transcriber[0].feed(chunk)
+            if _active_transcriber[0] else None
+        ),
     )
 
-    print("  [vad] Silero VAD ready  (grace=1000ms  silence=1500ms  onset_count=2  pre_pad=1500ms  step=256  min_speech=120ms)", flush=True)
+    print("  [vad] Silero VAD ready  (grace=1000ms  silence=1500ms  onset_count=2  pre_pad=1500ms  step=256  min_speech=120ms  streaming_stt=300ms)", flush=True)
 
     # ── State-transition tracking ─────────────────────────────────────
     _prev_state:          str   = ""
@@ -273,11 +283,12 @@ def _vad_loop():
             utterance = vad.process(samples)
             if utterance is not None and len(utterance) > 0:
                 dur = len(utterance) / 16_000
-                # Grab the early-STT future (may be None if callback never fired)
-                fut = _pending_stt[0]
-                _pending_stt[0] = None
+                # Grab the transcriber for this utterance and create a fresh
+                # one immediately so the next turn starts clean.
+                transcriber             = _active_transcriber[0]
+                _active_transcriber[0] = _make_transcriber()
                 print(f"  [vad] → utterance queued  {dur:.2f}s", flush=True)
-                _speech_queue.put_nowait((utterance, fut))
+                _speech_queue.put_nowait((utterance, transcriber))
                 vad.reset()
             continue
 
@@ -552,18 +563,18 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
     print(f"  [pipeline] VOICE_STATE → listening")
 
     with tracker.step("STT"):
-        rec_start  = time.perf_counter()
-        stt_future = None
+        rec_start = time.perf_counter()
         if carry_utterance is not None:
-            # Use the already-captured barge-in speech directly (no early STT future)
+            # Barge-in path: utterance was captured during speaking state.
+            # No StreamingTranscriber for barge-in — just transcribe directly.
             print(f"  [stt] using barge-in utterance ({len(carry_utterance)/16_000:.2f}s)")
-            audio_data = carry_utterance
+            audio_data  = carry_utterance
+            transcriber = None
         else:
             print(f"  [stt] waiting for utterance from VAD...")
             try:
-                # Queue items are (float32_array, Future | None) tuples since the
-                # early-STT callback fires at the first silence frame.
-                audio_data, stt_future = _speech_queue.get(timeout=30)
+                # Queue items are (float32_array, StreamingTranscriber) tuples.
+                audio_data, transcriber = _speech_queue.get(timeout=30)
             except queue.Empty:
                 print("  [pipeline] no speech for 30 s — going idle (speak to wake)")
                 _emit("VOICE_STATE", {"state": "idle"})
@@ -575,16 +586,12 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
         print(f"  [stt] utterance received after {rec_secs:.3f}s — {dur:.2f}s")
 
         try:
-            # If early STT already finished in the background, use its result
-            # (saves the full Whisper inference time from the critical path).
-            if stt_future is not None:
-                try:
-                    user_text, trans_secs = stt_future.result(timeout=2.0)
-                    print(f"  [stt] ✓ early result ready  ({trans_secs:.3f}s Whisper)", flush=True)
-                except Exception as e:
-                    print(f"  [stt] early result failed ({e}) — falling back to sync", flush=True)
-                    stt_future = None
-            if stt_future is None:
+            if transcriber is not None:
+                # finalize() uses the background snapshot result if ready and the
+                # audio hasn't grown too much; otherwise re-transcribes full audio.
+                user_text, trans_secs = transcriber.finalize(audio_data)
+                print(f"  [stt] ✓ streaming finalize  ({trans_secs:.3f}s Whisper)", flush=True)
+            else:
                 user_text, trans_secs = transcribe(audio_data)
         except Exception as e:
             print(f"  [stt] transcribe failed: {e}")
@@ -681,17 +688,27 @@ def _run_turn(turn: int, tracker: LatencyTracker, router):
     _interrupt_event.clear()   # arm: VAD can now set this on barge-in
 
     try:
-        with tracker.step("LLM + TTS"):
-            ai_text, tts_timing = speak_stream(
-                _token_broadcaster(ask_llm_stream(prompt), _interrupt_event),
-                _interrupt_event,
-            )
-        n_tok    = tts_timing.get("token_count", "?")
-        n_sent   = tts_timing.get("sentence_count", "?")
-        fw       = tts_timing["first_word_secs"]
-        total    = tts_timing["total_secs"]
-        print(f"    [tts] first_word={fw:.3f}s  total={total:.3f}s"
-              f"  tokens={n_tok}  sentences={n_sent}")
+        ai_text, tts_timing = speak_stream(
+            _token_broadcaster(ask_llm_stream(prompt), _interrupt_event),
+            _interrupt_event,
+        )
+        first_token = tts_timing.get("first_token_secs", tts_timing["first_word_secs"])
+        first_audio = tts_timing["first_word_secs"]
+        total_t     = tts_timing["total_secs"]
+        n_tok       = tts_timing.get("token_count", "?")
+        n_sent      = tts_timing.get("sentence_count", "?")
+        tts_synth_s = max(0.0, first_audio - first_token)
+        speaking_s  = max(0.0, total_t - first_audio)
+
+        tracker.record("LLM", first_token, [
+            f"first token in {first_token:.3f}s  ({n_tok} tokens total)"
+        ])
+        tracker.record("TTS", tts_synth_s, [
+            f"Piper synth first sentence: {tts_synth_s:.3f}s  ({n_sent} sentences)"
+        ])
+        tracker.record("Speaking", speaking_s, [
+            f"audio playback: {speaking_s:.3f}s"
+        ])
         print(f"\n  AI: {ai_text}\n")
     except Exception as e:
         print(f"  [llm/tts] error: {e}")

@@ -139,6 +139,7 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
                 if _abort_flag.is_set():
                     break
                 if _first:
+                    _timing["first_token_secs"] = time.perf_counter() - _start
                     print(f"  [llm] ✓ first token  {time.perf_counter() - _t0:.3f}s", flush=True)
                     _first = False
                 # Use a short timeout so the abort flag is checked regularly even

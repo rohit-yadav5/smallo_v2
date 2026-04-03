@@ -102,6 +102,10 @@ class StreamingVAD:
                                          # start STT in the background while the
                                          # silence confirmation window (silence_ms)
                                          # elapses.  Called at most once per utterance.
+        speech_chunk_cb   = None,        # callable(chunk: np.ndarray) — called for
+                                         # every 16 ms speech chunk while accumulating.
+                                         # Used by StreamingTranscriber to run Whisper
+                                         # incrementally for live word-by-word display.
     ):
         self._engine = SileroEngine(threshold=onset_threshold)
         self._offset = offset_threshold
@@ -128,6 +132,8 @@ class StreamingVAD:
         # Early-STT callback — fired once per utterance at first silence frame
         self._first_silence_cb   = first_silence_cb
         self._early_stt_fired    = False  # guard: fire at most once per utterance
+        # Streaming-STT callback — fired for every 16 ms speech chunk
+        self._speech_chunk_cb    = speech_chunk_cb
 
         # Runtime state
         self._speaking:  bool = False
@@ -160,6 +166,12 @@ class StreamingVAD:
                 new_chunk = audio_16k[pos : pos + _STEP]
                 self._speech.append(new_chunk)
                 self._n_samples += len(new_chunk)
+                # Feed every chunk to StreamingTranscriber for live word display
+                if self._speech_chunk_cb is not None:
+                    try:
+                        self._speech_chunk_cb(new_chunk)
+                    except Exception:
+                        pass
 
                 if prob < self._offset:
                     self._silence += 1
@@ -244,13 +256,13 @@ class StreamingVAD:
         Whisper.  The ring re-fills naturally within pre_pad_ms of new audio.
         """
         self._engine.reset_states()
-        self._speech         = []
-        self._n_samples      = 0
-        self._silence        = 0
-        self._speaking       = False
-        self._onset_buf      = 0
+        self._speech          = []
+        self._n_samples       = 0
+        self._silence         = 0
+        self._speaking        = False
+        self._onset_buf       = 0
         self._early_stt_fired = False
-        self._leftover       = np.empty(0, dtype=np.float32)
+        self._leftover        = np.empty(0, dtype=np.float32)
         self._pre.clear()   # ← wipe echo / stale audio from previous state
 
     @property

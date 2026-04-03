@@ -48,6 +48,18 @@ ORG  = "\033[33m"   # orange (plugin)
 PRP  = "\033[35m"   # purple (memory)
 TL   = "\033[38;5;51m"   # teal (VAD)
 
+# ── ANSI stripper (remove escape sequences from backend output) ───────
+_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
+
+# ── Latency step name → display colour ───────────────────────────────
+_STEP_COLORS: dict[str, str] = {
+    "LLM":      CYN,
+    "TTS":      YLW,
+    "SPEAKING": GRN,
+    "STT":      BLU,
+    "VAD":      TL,
+}
+
 # ── Per-subsystem tag → ANSI colour ──────────────────────────────────
 _TAG_COLORS = {
     "vad":      TL,

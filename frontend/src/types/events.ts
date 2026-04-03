@@ -30,8 +30,14 @@ export interface MemoryEvent {
   retrieved?: boolean
 }
 
+export interface STTPartial {
+  text:       string   // confirmed words (solid display)
+  hypothesis: string   // unconfirmed trailing words (faded display)
+}
+
 export type WSEvent =
   | { event: 'STT_RESULT';    data: STTResult }
+  | { event: 'STT_PARTIAL';   data: STTPartial }
   | { event: 'PLUGIN_ACTION'; data: PluginAction }
   | { event: 'LLM_TOKEN';     data: LLMToken }
   | { event: 'VOICE_STATE';   data: VoiceStateEvent }
