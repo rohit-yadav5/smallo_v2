@@ -206,13 +206,57 @@ def _format_backend_line(line: str) -> str:
         col = f"{MAG}{DIM}" if is_false else f"{MAG}{B}"
         return f"{indent}{DIM}{ts}{R}  {col}⚡  {stripped}{R}"
 
-    # ── Latency tracker lines (▶ Step / ✓ Step) ──────────────────────
-    if re.match(r"\s*[▶✓]\s", stripped):
-        is_start  = stripped.startswith("▶")
-        step_col  = DIM if not is_start else WHT
-        sym       = f"{WHT}▶{R}" if is_start else f"{GRN}✓{R}"
-        formatted = re.sub(r"(\d+\.?\d*)(s\b)", f"{WHT}\\1\\2{DIM}", stripped)
-        return f"{indent}{DIM}{ts}{R}  {step_col}{formatted}{R}"
+    # ── Latency tracker lines (▶ Step / ✓ Step / ↳ note) ────────────
+    clean = _ANSI_RE.sub("", stripped)
+    if re.match(r"[▶✓]\s", clean):
+        is_start = clean.startswith("▶")
+        # Extract step name (first word after the symbol)
+        name_m   = re.match(r"[▶✓]\s+(\w+)", clean)
+        step_key = name_m.group(1).upper() if name_m else ""
+        col      = _STEP_COLORS.get(step_key, WHT)
+        sym      = f"{col}▶{R}" if is_start else f"{col}✓{R}"
+        # Highlight timing numbers in white, rest in step colour
+        formatted = re.sub(r"(\d+\.?\d*)(s\b)", f"{WHT}\\1\\2{col}", clean)
+        return f"{indent}{DIM}{ts}{R}  {col}{formatted}{R}"
+
+    # ── Latency tracker: note lines (↳ …) ────────────────────────────
+    if re.match(r"\s*↳\s", clean):
+        # Highlight numbers in white, rest dim
+        formatted = re.sub(r"(\d+\.?\d*)(s\b)", f"{WHT}\\1\\2{DIM}", clean)
+        return f"{indent}          {DIM}{formatted}{R}"
+
+    # ── Latency tracker: summary table (│ / ┌ / ├ / └) ───────────────
+    if re.match(r"[│┌├└┤]", clean):
+        # BOTTLENECK row — highlight step name and duration
+        if "BOTTLENECK" in clean:
+            bm = re.search(r"BOTTLENECK\s+(\w+)\s+([\d.]+)s", clean)
+            if bm:
+                bkey = bm.group(1).upper()
+                bcol = _STEP_COLORS.get(bkey, YLW)
+                dur  = bm.group(2)
+                return (f"{indent}          {WHT}│{R}  "
+                        f"{DIM}BOTTLENECK{R}  "
+                        f"{bcol}{B}{bm.group(1)}{R}  "
+                        f"{bcol}{dur}s{R}")
+        # TOTAL row
+        if "TOTAL" in clean:
+            fmt = re.sub(r"(\d+\.?\d*)(s\b)", f"{WHT}\\1\\2{DIM}", clean)
+            return f"{indent}          {WHT}{fmt}{R}"
+        # Step data row: │  LLM  ...  / │  TTS  ...  / │  Speaking  ...
+        sm = re.match(r"[│]\s{2}(\w+)\s", clean)
+        if sm:
+            skey = sm.group(1).upper()
+            scol = _STEP_COLORS.get(skey, WHT)
+            fmt  = re.sub(r"(\d+\.?\d*)(s\b)", f"{WHT}\\1\\2{DIM}", clean)
+            # Colour the step name
+            fmt  = re.sub(
+                rf"\b{re.escape(sm.group(1))}\b",
+                f"{scol}{sm.group(1)}{DIM}",
+                fmt, count=1,
+            )
+            return f"{indent}          {WHT}│{R}  {DIM}{fmt}{R}"
+        # Border / header rows — plain dim
+        return f"{indent}          {DIM}{clean}{R}"
 
     # ── [subsystem] tagged lines ──────────────────────────────────────
     m = re.search(r"\[(\w+)\]", line)
@@ -287,7 +331,6 @@ def _format_backend_line(line: str) -> str:
         if tag == "tts":
             # [tts] synth #N  Xs → Xs audio  'sentence'
             if "synth" in ll:
-                # Highlight the timing numbers
                 formatted = re.sub(r"(\d+\.?\d+)s", f"{WHT}\\1s{YLW}", stripped)
                 return f"{indent}{DIM}{ts}{R}  {YLW}⚙  {formatted}{R}"
             # [tts] first_word=Xs  total=Xs  tokens=N  sentences=N
@@ -295,7 +338,11 @@ def _format_backend_line(line: str) -> str:
                 formatted = re.sub(r"(\d+\.?\d+)s", f"{WHT}\\1s{YLW}", stripped)
                 formatted = re.sub(r"(tokens|sentences)=(\d+)", f"\\1={WHT}\\2{YLW}", formatted)
                 return f"{indent}{DIM}{ts}{R}  {YLW}■ {formatted}{R}"
-            # [tts] plugin speak or other
+            # Piper synth first sentence note (↳ from tracker.record)
+            if "piper synth" in ll or ("sentences)" in ll and "synth" in ll):
+                formatted = re.sub(r"(\d+\.?\d+)s", f"{WHT}\\1s{YLW}", stripped)
+                formatted = re.sub(r"\((\d+)\s+sentences\)", f"({WHT}\\1{YLW} sentences)", formatted)
+                return f"{indent}{DIM}{ts}{R}  {YLW}⚙  {formatted}{R}"
             formatted = re.sub(r"(\d+\.?\d+)s", f"{WHT}\\1s{YLW}", stripped)
             return f"{indent}{DIM}{ts}{R}  {YLW}{formatted}{R}"
 
@@ -312,9 +359,18 @@ def _format_backend_line(line: str) -> str:
                         f"{CYN}▶  prompt {WHT}{chars}{CYN} chars"
                         f"{f'  →  {WHT}{model}{CYN}' if model else ''}{R}")
 
+            # [llm] ◌ waiting for first token...  Ns  (must come before ✓ first token check)
+            if "◌" in line or "waiting for first token" in ll:
+                elapsed_m = re.search(r"(\d+)s$", stripped)
+                elapsed   = elapsed_m.group(1) if elapsed_m else "?"
+                return (f"{indent}{DIM}{ts}{R}  "
+                        f"{DIM}{CYN}◌  waiting for first token...  {WHT}{elapsed}s{DIM}{R}")
+
             # [llm] ✓ first token  Xs  (runtime — bold cyan, timing highlighted)
+            # also matches tracker note: "first token in Xs  (N tokens total)"
             if "first token" in ll:
                 formatted = re.sub(r"(\d+\.?\d+)s", f"{WHT}\\1s{CYN}", stripped)
+                formatted = re.sub(r"\((\d+)\s+tokens", f"({WHT}\\1{CYN} tokens", formatted)
                 return f"{indent}{DIM}{ts}{R}  {CYN}{B}✓  {formatted}{R}"
 
             # [llm] ✓ model 'phi3' warmed up  (startup — green, not timing-critical)
@@ -327,13 +383,6 @@ def _format_backend_line(line: str) -> str:
             # [llm] ⚠  Ollama not ready / warmup failed
             if "⚠" in line or "not ready" in ll or "warmup" in ll:
                 return f"{indent}{DIM}{ts}{R}  {YLW}{B}⚠  {stripped}{R}"
-
-            # [llm] ◌ waiting for first token...  Ns
-            if "◌" in line or "waiting for first token" in ll:
-                elapsed_m = re.search(r"(\d+)s$", stripped)
-                elapsed   = elapsed_m.group(1) if elapsed_m else "?"
-                return (f"{indent}{DIM}{ts}{R}  "
-                        f"{DIM}{CYN}◌  waiting for first token...  {WHT}{elapsed}s{DIM}{R}")
 
             # [llm] ✗ no tokens / timeout / error  (already caught at top by error
             # handler, but kept here as a safety net for any that slip through)

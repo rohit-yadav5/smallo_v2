@@ -8,7 +8,8 @@ from llm.SYSTEM_PROMPT import SYSTEM_PROMPT
 # OLLAMA CONFIG
 # =====================
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
+OLLAMA_CHAT_URL     = "http://localhost:11434/api/chat"
 MODEL = "phi3"
 
 # =====================
@@ -43,28 +44,23 @@ def _sanitize_user_text(text: str) -> str:
 def ask_llm(user_text: str) -> str:
     safe_text = _sanitize_user_text(user_text)
 
-    prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"{safe_text}\n\n"
-        "Assistant:"
-    )
-
     response = requests.post(
-        OLLAMA_URL,
+        OLLAMA_CHAT_URL,
         json={
-            "model": MODEL,
-            "prompt": prompt,
-            "stream": False,
+            "model":      MODEL,
+            "messages":   [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": safe_text},
+            ],
+            "stream":     False,
             "keep_alive": -1,
-            "options": {
-                "num_predict": -1
-            }
+            "options":    {"num_predict": 150},
         },
-        timeout=60
+        timeout=60,
     )
 
     response.raise_for_status()
-    return response.json()["response"].strip()
+    return response.json()["message"]["content"].strip()
 
 
 # =====================
@@ -72,24 +68,32 @@ def ask_llm(user_text: str) -> str:
 # =====================
 
 _LLM_OPTIONS = {
-    "num_predict": -1,
-    "stop": ["User:", "Human:"]
+    "num_predict": 150,          # 1–2 spoken sentences ≈ 40–80 tokens; 150 gives headroom
+    "stop":        ["User:", "Human:"],
 }
 
 
 def warmup():
     """Check Ollama health, then warm the model into RAM."""
-    # Health check — surfaces problems early with clear instructions
     if not check_ollama():
         print("  [llm] ⚠  Ollama not ready — first real turn may be slow or fail", flush=True)
         return
-    # Send a 1-token request so phi3 is fully paged into RAM
+    # Use the chat endpoint so the system-prompt KV cache is seeded on the very
+    # first real turn (generate would seed a different cache slot).
     try:
         requests.post(
-            OLLAMA_URL,
-            json={"model": MODEL, "prompt": "Hi.", "stream": False,
-                  "keep_alive": -1, "options": {"num_predict": 1}},
-            timeout=30
+            OLLAMA_CHAT_URL,
+            json={
+                "model":      MODEL,
+                "messages":   [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": "Hi."},
+                ],
+                "stream":     False,
+                "keep_alive": -1,
+                "options":    {"num_predict": 1},
+            },
+            timeout=30,
         )
         print(f"  [llm] ✓ model '{MODEL}' warmed up", flush=True)
     except Exception as e:
@@ -114,7 +118,7 @@ def check_ollama() -> bool:
             return False
         return True
     except requests.exceptions.ConnectionError:
-        print(f"  [llm] ✗ Cannot connect to Ollama at {OLLAMA_URL} — "
+        print(f"  [llm] ✗ Cannot connect to Ollama at {OLLAMA_CHAT_URL} — "
               f"is it running?  (run: ollama serve)", flush=True)
         return False
     except Exception as e:
@@ -126,27 +130,35 @@ def ask_llm_stream(user_text: str):
     """Yield response tokens one at a time as they arrive from Ollama."""
     safe_text = _sanitize_user_text(user_text)
 
-    prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
-        f"{safe_text}\n\n"
-        "Assistant:"
-    )
+    # Split memory context (prefix) from the raw user utterance so that Ollama
+    # can place them in appropriate message slots.  _build_memory_context formats
+    # the combined string as:  "<context>\n\nUser: <utterance>"
+    if "\n\nUser: " in safe_text:
+        memory_ctx, utterance = safe_text.split("\n\nUser: ", 1)
+        messages = [
+            {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{memory_ctx}"},
+            {"role": "user",   "content": utterance},
+        ]
+    else:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": safe_text},
+        ]
 
-    print(f"  [llm] ▶ {len(prompt):,} char prompt → {MODEL}", flush=True)
+    total_chars = sum(len(m["content"]) for m in messages)
+    print(f"  [llm] ▶ {total_chars:,} char prompt → {MODEL}", flush=True)
 
     response = requests.post(
-        OLLAMA_URL,
+        OLLAMA_CHAT_URL,
         json={
-            "model": MODEL,
-            "prompt": prompt,
-            "stream": True,
+            "model":      MODEL,
+            "messages":   messages,
+            "stream":     True,
             "keep_alive": -1,
-            "options": _LLM_OPTIONS
+            "options":    _LLM_OPTIONS,
         },
         stream=True,
         # (connect_timeout, read_timeout_per_chunk)
-        # read_timeout applies to each iter_lines() call — prevents infinite hang
-        # if Ollama stops mid-generation.
         timeout=(10, 90),
     )
 
@@ -156,4 +168,4 @@ def ask_llm_stream(user_text: str):
         if line:
             data = json.loads(line)
             if not data.get("done", False):
-                yield data.get("response", "")
+                yield data.get("message", {}).get("content", "")
