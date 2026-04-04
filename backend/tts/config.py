@@ -172,6 +172,32 @@ class TTSConfig:
         "TTS_LOG_SENTENCE_CHARS", 55,
     ))
 
+    # ── Remote audio delivery (WebSocket streaming) ───────────────────────────
+    # Set TTS_REMOTE_AUDIO=true to stream synthesized audio to WS clients.
+    # When false (default) audio is played locally only (no WS send).
+    remote_audio: bool = field(default_factory=lambda:
+        os.getenv("TTS_REMOTE_AUDIO", "false").lower() == "true"
+    )
+
+    # Audio format sent to WS clients: "pcm16" (raw signed-16-bit, no header)
+    # or "opus" (compressed, requires opuslib).  Falls back to pcm16 if opus
+    # is unavailable regardless of this setting.
+    audio_format: str = field(default_factory=lambda: _env_str(
+        "TTS_AUDIO_FORMAT", "pcm16",
+    ))
+
+    # Duration of each audio chunk sent over WS, in milliseconds.
+    # Smaller → lower latency; larger → fewer messages.  Default: 20 ms.
+    audio_chunk_ms: int = field(default_factory=lambda: _env_int(
+        "TTS_AUDIO_CHUNK_MS", 20,
+    ))
+
+    # When true, ALSO play audio locally via sounddevice even when
+    # remote_audio is enabled.  Useful for server-side monitoring.
+    monitor_locally: bool = field(default_factory=lambda:
+        os.getenv("TTS_MONITOR_LOCALLY", "false").lower() == "true"
+    )
+
 
 # Module-level singleton — imported by main_tts.py
 TTS_CONFIG = TTSConfig()

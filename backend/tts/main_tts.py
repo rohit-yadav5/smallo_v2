@@ -10,6 +10,7 @@ import sounddevice as sd
 import soundfile as sf
 
 from tts.config import TTS_CONFIG
+from tts.audio_utils import encode_pcm16, encode_opus, chunk_audio
 
 # ── Engine singletons ─────────────────────────────────────────────────────────
 # Both are None until warmup() is called.  Only one will be populated
@@ -29,6 +30,71 @@ _abort_flag = threading.Event()
 # Piper: PiperVoice.synthesize_wav() is also not thread-safe.
 # Both engines serialize through this lock.
 _synth_lock = threading.Lock()
+
+# ── WebSocket audio sender hook ───────────────────────────────────────────────
+# Registered by main.py so that synthesized audio can be streamed to browser
+# clients without importing main.py (avoids circular imports).
+#
+# Signature: fn(audio: np.ndarray, sample_rate: int) -> None
+#   Called once per synthesized sentence after synthesis, before sd.play().
+#   Must be non-blocking (schedules async send via run_coroutine_threadsafe).
+#
+# Cleared back to None when the connection pool is empty.
+_ws_audio_sender = None   # Callable[[np.ndarray, int], None] | None
+
+
+def register_ws_audio_sender(fn) -> None:
+    """Register (or clear) the WebSocket audio send callback."""
+    global _ws_audio_sender
+    _ws_audio_sender = fn
+
+
+def _send_audio_to_ws(audio: np.ndarray, sr: int) -> None:
+    """
+    Send synthesized audio to all connected WebSocket clients.
+
+    Chunks audio → encodes each chunk → sends metadata frame (JSON) then
+    each chunk as raw bytes.  All sends are non-blocking (fire-and-forget
+    via the registered sender callback).
+
+    No-op when remote_audio is disabled or no sender is registered.
+    """
+    if not TTS_CONFIG.remote_audio or _ws_audio_sender is None:
+        return
+
+    encode_fn = encode_opus if TTS_CONFIG.audio_format == "opus" else encode_pcm16
+    chunks    = chunk_audio(audio, sr, TTS_CONFIG.audio_chunk_ms)
+    if not chunks:
+        return
+
+    # Metadata frame: tells the client how many chunks to expect + format details
+    _ws_audio_sender({
+        "event": "AUDIO_CHUNK",
+        "data": {
+            "format":      TTS_CONFIG.audio_format,
+            "sample_rate": sr,
+            "chunk_count": len(chunks),
+            "chunk_ms":    TTS_CONFIG.audio_chunk_ms,
+        },
+    }, None)
+
+    # Binary frames: one per chunk
+    for chunk in chunks:
+        _ws_audio_sender(None, encode_fn(chunk, sr))
+
+
+def _send_audio_abort_to_ws() -> None:
+    """Signal clients to stop buffered audio immediately (barge-in)."""
+    if not TTS_CONFIG.remote_audio or _ws_audio_sender is None:
+        return
+    _ws_audio_sender({"event": "AUDIO_ABORT", "data": {}}, None)
+
+
+def _send_audio_done_to_ws() -> None:
+    """Signal clients that the current utterance audio stream is complete."""
+    if not TTS_CONFIG.remote_audio or _ws_audio_sender is None:
+        return
+    _ws_audio_sender({"event": "AUDIO_DONE", "data": {}}, None)
 
 
 def _safe_stop() -> None:
@@ -64,6 +130,7 @@ def abort_speaking():
     """
     _abort_flag.set()
     _safe_stop()
+    _send_audio_abort_to_ws()
 
 
 # ── Low-level synthesis (engine-dispatched) ───────────────────────────────────
@@ -319,7 +386,12 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
             _timing["first_word_secs"] = time.perf_counter() - _start
             first_word = False
 
-        sd.play(audio, samplerate=sr, blocking=False)
+        # ── Remote audio delivery ─────────────────────────────────────────
+        _send_audio_to_ws(audio, sr)
+
+        # ── Local playback ────────────────────────────────────────────────
+        if not TTS_CONFIG.remote_audio or TTS_CONFIG.monitor_locally:
+            sd.play(audio, samplerate=sr, blocking=False)
 
         # Start pre-synthesis of next sentence while current audio plays
         if next_sentence and not _stopped():
@@ -334,16 +406,20 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
                 name="tts-presyn",
             ).start()
 
-        while True:
-            try:
-                active = sd.get_stream().active
-            except RuntimeError:
-                break
-            if not active:
-                break
-            if _stopped():
-                return
-            time.sleep(TTS_CONFIG.poll_interval_s)
+        # Polling loop: wait for local playback to finish.
+        # Skipped when remote_audio is on and monitor_locally is off
+        # (no sd.play() was called so there is no stream to poll).
+        if not TTS_CONFIG.remote_audio or TTS_CONFIG.monitor_locally:
+            while True:
+                try:
+                    active = sd.get_stream().active
+                except RuntimeError:
+                    break
+                if not active:
+                    break
+                if _stopped():
+                    return
+                time.sleep(TTS_CONFIG.poll_interval_s)
 
     # ── Chunking helpers ──────────────────────────────────────────────────────
 
@@ -433,6 +509,12 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
 
     finally:
         pass   # abort_speaking() owns sd.stop() — never call it here
+
+    # Signal clients that all audio for this utterance has been sent.
+    # Skipped on barge-in (_abort_flag set) because abort_speaking() already
+    # sent AUDIO_ABORT and the client has already flushed its queue.
+    if not _abort_flag.is_set():
+        _send_audio_done_to_ws()
 
     _timing["total_secs"]     = time.perf_counter() - _start
     _timing["token_count"]    = _token_count
