@@ -24,7 +24,7 @@ in real time, streamed token by token to a cartoon-styled frontend.
 | Resample | Python (numpy) | Converts any browser sample rate to 16 kHz for Whisper |
 | Transcribe | faster-whisper | Local `base` model; returns text + latency |
 | LLM | Ollama (`phi3`) | Streamed token-by-token via HTTP; `num_predict: -1` (unlimited) |
-| TTS | piper-tts | Sentence-level streaming; plays through system speakers |
+| TTS | Kokoro ONNX | Sentence-level streaming; local neural TTS, no API key required |
 
 ### WebSocket event types (backend → frontend)
 
@@ -72,18 +72,16 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Download Piper TTS model
+### 3. Download Kokoro TTS model
 
-Piper needs a voice model (`.onnx` + `.onnx.json`) placed in `backend/tts/models/`.
-Download from [piper-samples](https://rhasspy.github.io/piper-samples/):
+Kokoro needs two model files placed in `kokoro-models/` at the project root:
 
 ```bash
-mkdir -p backend/tts/models
-# Example: English (US) — Ryan medium
-curl -L -o backend/tts/models/en_US-ryan-medium.onnx \
-  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx
-curl -L -o backend/tts/models/en_US-ryan-medium.onnx.json \
-  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx.json
+mkdir -p kokoro-models
+curl -L -o kokoro-models/kokoro-v1.0.onnx \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+curl -L -o kokoro-models/voices-v1.0.bin \
+  https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 ```
 
 ### 4. Initialise the memory database

@@ -1,22 +1,17 @@
-import io
 import queue as _queue
 import re
 import threading
 import time
-import wave
 
 import numpy as np
 import sounddevice as sd
-import soundfile as sf
 
 from tts.config import TTS_CONFIG
-from tts.audio_utils import encode_pcm16, encode_opus, chunk_audio
+from tts.audio_utils import encode_pcm16, encode_opus, chunk_audio, resample_audio
 
-# ── Engine singletons ─────────────────────────────────────────────────────────
-# Both are None until warmup() is called.  Only one will be populated
-# depending on TTS_CONFIG.engine ("kokoro" or "piper").
+# ── Kokoro singleton ──────────────────────────────────────────────────────────
+# None until warmup() is called.
 _kokoro = None   # kokoro_onnx.Kokoro instance
-_piper  = None   # piper.voice.PiperVoice instance
 
 _SENTENCE_SPLIT = re.compile(TTS_CONFIG.sentence_split_pattern)
 
@@ -24,11 +19,10 @@ _SENTENCE_SPLIT = re.compile(TTS_CONFIG.sentence_split_pattern)
 _abort_flag = threading.Event()
 
 # ── Synthesis lock ────────────────────────────────────────────────────────────
-# Kokoro: onnxruntime InferenceSession.run() is NOT safe when multiple Python
-# threads share one session — 8-thread stress tests show non-deterministic
-# output lengths, indicating shared mutable state in the session.
-# Piper: PiperVoice.synthesize_wav() is also not thread-safe.
-# Both engines serialize through this lock.
+# Kokoro's onnxruntime InferenceSession.run() is NOT thread-safe — 8-thread
+# stress tests show non-deterministic output lengths, indicating shared mutable
+# state in the session.  Both the main synthesis path and the pre-synthesis
+# background thread serialize through this lock.
 _synth_lock = threading.Lock()
 
 # ── WebSocket audio sender hook ───────────────────────────────────────────────
@@ -133,76 +127,54 @@ def abort_speaking():
     _send_audio_abort_to_ws()
 
 
-# ── Low-level synthesis (engine-dispatched) ───────────────────────────────────
+# ── Low-level synthesis ───────────────────────────────────────────────────────
 
 def _synthesize_to_buffer(text: str) -> tuple[np.ndarray, int]:
     """
     Synthesize text → (float32 audio array, sample_rate).
 
-    Dispatches to Kokoro or Piper based on TTS_CONFIG.engine.
-    Acquires _synth_lock because neither engine is thread-safe.
-
-    Called by both the main thread and the pre-synthesis background thread,
-    hence the lock is required for correctness.
+    Acquires _synth_lock because Kokoro's InferenceSession is not thread-safe.
+    Called by both the main thread and the pre-synthesis background thread.
     """
     with _synth_lock:
-        if TTS_CONFIG.engine == "piper":
-            return _synth_piper(text)
-        return _synth_kokoro(text)
-
-
-def _synth_kokoro(text: str) -> tuple[np.ndarray, int]:
-    """Synthesize one chunk with Kokoro (called under _synth_lock)."""
-    audio, sr = _kokoro.create(
-        text,
-        voice=TTS_CONFIG.kokoro_voice,
-        speed=TTS_CONFIG.kokoro_speed,
-        lang="en-us",
-    )
-    return audio.astype(np.float32), sr
-
-
-def _synth_piper(text: str) -> tuple[np.ndarray, int]:
-    """Synthesize one chunk with Piper (called under _synth_lock)."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wav_file:
-        _piper.synthesize_wav(text, wav_file)
-    buf.seek(0)
-    audio, sr = sf.read(buf, dtype="float32")
-    return audio, sr
+        audio, sr = _kokoro.create(
+            text,
+            voice=TTS_CONFIG.kokoro_voice,
+            speed=TTS_CONFIG.kokoro_speed,
+            lang="en-us",
+        )
+        return audio.astype(np.float32), sr
 
 
 # ── Warmup ────────────────────────────────────────────────────────────────────
 
 def warmup() -> None:
     """
-    Load the TTS engine and force ONNX/model JIT compile with a short
-    synthesis so the first real utterance has no cold-start penalty.
+    Load Kokoro and force ONNX JIT compile with a short synthesis so the
+    first real utterance has no cold-start penalty.
     """
-    global _kokoro, _piper
-
-    if TTS_CONFIG.engine == "piper":
-        from piper.voice import PiperVoice
-        _piper = PiperVoice.load(TTS_CONFIG.voice_path)
-        _piper.config.length_scale = TTS_CONFIG.length_scale
-        _piper.config.noise_scale  = TTS_CONFIG.noise_scale
-        _piper.config.noise_w      = TTS_CONFIG.noise_w
-        _synthesize_to_buffer("Hi.")
+    global _kokoro
+    import os
+    from kokoro_onnx import Kokoro
+    model_path  = os.path.normpath(TTS_CONFIG.kokoro_model_path)
+    voices_path = os.path.normpath(TTS_CONFIG.kokoro_voices_path)
+    _kokoro = Kokoro(model_path, voices_path)
+    _synthesize_to_buffer("Hi.")
+    print(
+        f"  [tts] Kokoro ready  voice={TTS_CONFIG.kokoro_voice}  "
+        f"speed={TTS_CONFIG.kokoro_speed}  sr={TTS_CONFIG.sample_rate}",
+        flush=True,
+    )
+    if TTS_CONFIG.sample_rate != TTS_CONFIG.device_sample_rate:
         print(
-            f"  [tts] Piper ready  voice={TTS_CONFIG.voice_path}  "
-            f"speed={TTS_CONFIG.length_scale}  sr=22050",
+            f"  [tts] resampling active: "
+            f"Kokoro {TTS_CONFIG.sample_rate} Hz → device {TTS_CONFIG.device_sample_rate} Hz",
             flush=True,
         )
     else:
-        from kokoro_onnx import Kokoro
-        import os
-        model_path  = os.path.normpath(TTS_CONFIG.kokoro_model_path)
-        voices_path = os.path.normpath(TTS_CONFIG.kokoro_voices_path)
-        _kokoro = Kokoro(model_path, voices_path)
-        _synthesize_to_buffer("Hi.")
         print(
-            f"  [tts] Kokoro ready  voice={TTS_CONFIG.kokoro_voice}  "
-            f"speed={TTS_CONFIG.kokoro_speed}  sr={TTS_CONFIG.sample_rate}",
+            f"  [tts] no resampling needed — "
+            f"device matches Kokoro at {TTS_CONFIG.sample_rate} Hz",
             flush=True,
         )
 
@@ -210,6 +182,7 @@ def warmup() -> None:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def speak(text: str, interrupt_event=None):
+    # speak() is used only by warmup() — production uses speak_stream()
     if not text.strip():
         return
     _abort_flag.clear()
@@ -217,7 +190,8 @@ def speak(text: str, interrupt_event=None):
         if (interrupt_event and interrupt_event.is_set()) or _abort_flag.is_set():
             break
         audio, sr = _synthesize_to_buffer(sentence)
-        sd.play(audio, samplerate=sr, blocking=False)
+        audio_out = resample_audio(audio, sr, TTS_CONFIG.device_sample_rate)
+        sd.play(audio_out, samplerate=TTS_CONFIG.device_sample_rate, blocking=False)
         while True:
             try:
                 active = sd.get_stream().active
@@ -391,7 +365,8 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
 
         # ── Local playback ────────────────────────────────────────────────
         if not TTS_CONFIG.remote_audio or TTS_CONFIG.monitor_locally:
-            sd.play(audio, samplerate=sr, blocking=False)
+            audio_out = resample_audio(audio, sr, TTS_CONFIG.device_sample_rate)
+            sd.play(audio_out, samplerate=TTS_CONFIG.device_sample_rate, blocking=False)
 
         # Start pre-synthesis of next sentence while current audio plays
         if next_sentence and not _stopped():

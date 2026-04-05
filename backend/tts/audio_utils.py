@@ -1,7 +1,11 @@
-"""tts/audio_utils.py — Audio encoding helpers for WebSocket delivery.
+"""tts/audio_utils.py — Audio encoding and resampling helpers.
 
 Functions
 ─────────
+resample_audio(audio, src_rate, dst_rate) → np.ndarray
+    High-quality polyphase resampling via scipy.signal.resample_poly.
+    No-op when src_rate == dst_rate.
+
 encode_pcm16(audio, sample_rate) → bytes
     Convert float32 audio to raw signed-16-bit PCM bytes.
     No header — just the raw samples.  Decodable by the Web Audio API:
@@ -15,7 +19,29 @@ chunk_audio(audio, sample_rate, chunk_ms) → list[np.ndarray]
     Split audio into equal-sized chunks of chunk_ms milliseconds.
     The last chunk is zero-padded to a full chunk if shorter.
 """
+from math import gcd
+
 import numpy as np
+from scipy.signal import resample_poly
+
+
+def resample_audio(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """
+    Resample float32 audio from src_rate to dst_rate using polyphase filtering.
+
+    Uses scipy.signal.resample_poly with anti-aliasing FIR filter — no aliasing,
+    no crackling.  The polyphase approach avoids materialising the full resampled
+    intermediate array, making it memory-efficient even for long utterances.
+
+    Returns the original array unchanged (zero cost) when src_rate == dst_rate.
+    Always returns float32.
+    """
+    if src_rate == dst_rate:
+        return audio
+    g    = gcd(src_rate, dst_rate)
+    up   = dst_rate // g
+    down = src_rate // g
+    return resample_poly(audio, up, down).astype(np.float32)
 
 
 def encode_pcm16(audio: np.ndarray, sample_rate: int) -> bytes:  # noqa: ARG001 (sr unused but kept for uniform signature)

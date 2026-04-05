@@ -61,11 +61,17 @@ class TTSAudioReceiver {
     src.start(this._nextStart)
     this._nextStart += audioBuf.duration
     this._nodes.push(src)
+
+    src.onended = () => {
+      this._nodes = this._nodes.filter(n => n !== src)
+      src.disconnect()
+    }
   }
 
-  /** Called when AUDIO_DONE arrives — nothing to do, drain completes naturally. */
+  /** Called when AUDIO_DONE arrives — nodes drain via onended; log remaining count. */
   onDone(): void {
     this._pending = 0
+    console.debug(`[tts] AUDIO_DONE — ${this._nodes.length} nodes still scheduled`)
   }
 
   /** Called when AUDIO_ABORT arrives — stop all queued audio immediately. */

@@ -1,4 +1,4 @@
-"""tts/config.py — TTS configuration.
+"""tts/config.py — TTS configuration (Kokoro ONNX engine).
 
 Every value has a hardcoded default that matches the original behaviour.
 All values are overridable via environment variable — useful for testing
@@ -8,25 +8,16 @@ Usage
 ─────
     from tts.config import TTS_CONFIG
 
-    voice = PiperVoice.load(TTS_CONFIG.voice_path)
-    voice.config.length_scale = TTS_CONFIG.length_scale
+    model = Kokoro(TTS_CONFIG.kokoro_model_path, TTS_CONFIG.kokoro_voices_path)
 
 Environment variables
 ─────────────────────
-    TTS_ENGINE              Which engine to use: "kokoro" (default) or "piper"
-
-    --- Kokoro (default engine) ---
+    --- Kokoro ---
     TTS_KOKORO_MODEL_PATH   Path to kokoro-v1.0.onnx (default: kokoro-models/ in project root)
     TTS_KOKORO_VOICES_PATH  Path to voices-v1.0.bin  (default: kokoro-models/ in project root)
     TTS_KOKORO_VOICE        Voice name, e.g. af_sarah, bf_emma (default: af_sarah)
     TTS_KOKORO_SPEED        Speech speed multiplier; 1.0 = normal (default: 1.1)
     TTS_SAMPLE_RATE         Native output sample rate in Hz (default: 24000 for Kokoro)
-
-    --- Piper (fallback engine, set TTS_ENGINE=piper) ---
-    PIPER_VOICE_PATH        Path to the .onnx voice model file
-    PIPER_LENGTH_SCALE      Speech speed  (<1.0 = faster, >1.0 = slower)
-    PIPER_NOISE_SCALE       Phoneme duration variability (Piper default 0.667)
-    PIPER_NOISE_W           Phoneme width variability (Piper default 0.8)
 
     --- Chunking ---
     TTS_SENTENCE_SPLIT      Regex pattern used to split LLM text into sentences
@@ -43,6 +34,19 @@ Environment variables
     TTS_SENTINEL_RETRIES    Max retries to deliver the None sentinel when queue is full
     TTS_HEARTBEAT_INTERVAL_S Seconds between "waiting for first token..." log lines
     TTS_LOG_SENTENCE_CHARS  Max characters of a sentence shown in the synth log line
+
+    --- Remote audio (WebSocket streaming) ---
+    TTS_REMOTE_AUDIO        "true" to stream audio to WS clients (default: false)
+    TTS_AUDIO_FORMAT        "pcm16" or "opus" (default: pcm16; opus requires opuslib)
+    TTS_AUDIO_CHUNK_MS      Duration per WS audio chunk in ms (default: 20)
+    TTS_MONITOR_LOCALLY     "true" to also play locally when remote_audio is on (default: false)
+
+    --- Local playback resampling ---
+    TTS_DEVICE_SAMPLE_RATE  Native sample rate of the output device (Hz).
+                            Auto-detected from sounddevice at startup.
+                            Override if auto-detection picks the wrong device
+                            (e.g. HDMI instead of built-in speakers).
+                            macOS built-in speakers are typically 44100 Hz.
 """
 import os
 from dataclasses import dataclass, field
@@ -58,19 +62,25 @@ def _env_int(name: str, default: int) -> int:
     return int(val) if val is not None else default
 
 
+def _get_device_sample_rate() -> int:
+    """Query the default output device native sample rate at import time."""
+    try:
+        import sounddevice as sd
+        dev = sd.query_devices(sd.default.device['output'])
+        return int(dev['default_samplerate'])
+    except Exception:
+        return 44100  # safe macOS fallback
+
+
 def _env_str(name: str, default: str) -> str:
     return os.getenv(name, default)
 
 
 @dataclass(frozen=True)
 class TTSConfig:
-    # ── Engine selection ──────────────────────────────────────────────────────
-    # "kokoro" (default) or "piper" for fallback to the old Piper engine.
-    engine: str = field(default_factory=lambda: _env_str("TTS_ENGINE", "kokoro"))
-
     # ── Kokoro settings ───────────────────────────────────────────────────────
     # Paths default to the kokoro-models/ directory at the project root.
-    # The _PROJ_ROOT calculation assumes this file lives at backend/tts/config.py.
+    # The path calculation assumes this file lives at backend/tts/config.py.
     kokoro_model_path: str = field(default_factory=lambda: _env_str(
         "TTS_KOKORO_MODEL_PATH",
         os.path.join(os.path.dirname(__file__), "..", "..", "kokoro-models", "kokoro-v1.0.onnx"),
@@ -87,17 +97,12 @@ class TTSConfig:
     # Native Kokoro output sample rate (do NOT change unless using a different model).
     sample_rate: int    = field(default_factory=lambda: _env_int("TTS_SAMPLE_RATE", 24000))
 
-    # ── Piper settings (used only when TTS_ENGINE=piper) ─────────────────────
-    voice_path: str = field(default_factory=lambda: _env_str(
-        "PIPER_VOICE_PATH",
-        os.path.expanduser("~/piper-voices/en_US-amy-medium.onnx"),
+    # Native sample rate of the local output device.  Kokoro audio is resampled
+    # to this rate before sd.play() to prevent CoreAudio crackling on macOS.
+    # Auto-detected from sounddevice; override via TTS_DEVICE_SAMPLE_RATE.
+    device_sample_rate: int = field(default_factory=lambda: _env_int(
+        "TTS_DEVICE_SAMPLE_RATE", _get_device_sample_rate(),
     ))
-    # length_scale < 1.0 = faster speech; > 1.0 = slower speech
-    length_scale: float = field(default_factory=lambda: _env_float("PIPER_LENGTH_SCALE", 0.7))
-    # noise_scale controls phoneme duration variance (Piper default 0.667)
-    noise_scale: float  = field(default_factory=lambda: _env_float("PIPER_NOISE_SCALE", 0.667))
-    # noise_w controls phoneme width variance (Piper default 0.8)
-    noise_w: float      = field(default_factory=lambda: _env_float("PIPER_NOISE_W", 0.8))
 
     # ── Sentence splitting ────────────────────────────────────────────────────
     # Applied to accumulated LLM tokens to find sentence boundaries.
@@ -116,13 +121,12 @@ class TTSConfig:
     ))
 
     # Minimum number of words a chunk must have before it is synthesized
-    # alone.  Chunks shorter than this are held and merged with the next
-    # chunk to avoid wasting Piper startup overhead on tiny fragments.
+    # alone.  Chunks shorter than this are held and merged with the next.
     min_chunk_words: int = field(default_factory=lambda: _env_int(
         "TTS_MIN_CHUNK_WORDS", 3,
     ))
 
-    # Seconds to wait before retrying a failed Piper synthesis call.
+    # Seconds to wait before retrying a failed synthesis call.
     synthesis_retry_delay_s: float = field(default_factory=lambda: _env_float(
         "TTS_SYNTHESIS_RETRY_DELAY", 0.05,
     ))
