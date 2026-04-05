@@ -107,7 +107,7 @@ def _banner():
     print(f"    {DIM}STT  : faster-whisper  small  int8  vad_filter=True{R}")
     print(f"    {DIM}VAD  : Silero  grace=1000ms  silence=1500ms  onset_count=2  pre_pad=1500ms  step=256  min_speech=120ms{R}")
     print(f"    {DIM}VAD  : pre-audio silence trimmed before Whisper (100ms lead-in kept){R}")
-    print(f"    {DIM}TTS  : Piper  en_US-amy-medium  length_scale=0.7{R}")
+    print(f"    {DIM}TTS  : Kokoro  af_sarah  speed=1.1  sr=24000{R}")
     print(f"    {DIM}LLM  : Ollama  phi3  (stream  connect=10s  read=90s  keep_alive=forever){R}")
     print()
     print(f"  {DIM}Log colour legend:{R}")
@@ -338,8 +338,7 @@ def _format_backend_line(line: str) -> str:
                 formatted = re.sub(r"(\d+\.?\d+)s", f"{WHT}\\1s{YLW}", stripped)
                 formatted = re.sub(r"(tokens|sentences)=(\d+)", f"\\1={WHT}\\2{YLW}", formatted)
                 return f"{indent}{DIM}{ts}{R}  {YLW}■ {formatted}{R}"
-            # Piper synth first sentence note (↳ from tracker.record)
-            if "piper synth" in ll or ("sentences)" in ll and "synth" in ll):
+            if ("sentences)" in ll and "synth" in ll):
                 formatted = re.sub(r"(\d+\.?\d+)s", f"{WHT}\\1s{YLW}", stripped)
                 formatted = re.sub(r"\((\d+)\s+sentences\)", f"({WHT}\\1{YLW} sentences)", formatted)
                 return f"{indent}{DIM}{ts}{R}  {YLW}⚙  {formatted}{R}"
@@ -536,12 +535,12 @@ def _preflight():
         print(f"       {RED}→ run:  cd frontend && npm install{R}")
         ok = False
 
-    # Piper voice model (TTS)
-    voice_path = Path.home() / "piper-voices" / "en_US-amy-medium.onnx"
-    voice_ok   = voice_path.exists()
-    sym        = f"{GRN}✓{R}" if voice_ok else f"{YLW}!{R}"
-    note       = "" if voice_ok else f"  {YLW}← TTS will fail{R}"
-    print(f"    {sym}  Piper voice  {DIM}{voice_path}{R}{note}")
+    # Kokoro TTS model
+    kokoro_model = Path(__file__).resolve().parent / "backend" / "tts" / "kokoro-models" / "kokoro-v1.0.onnx"
+    kokoro_ok    = kokoro_model.exists()
+    sym          = f"{GRN}✓{R}" if kokoro_ok else f"{YLW}!{R}"
+    note         = "" if kokoro_ok else f"  {YLW}← TTS will fail{R}"
+    print(f"    {sym}  Kokoro model  {DIM}{kokoro_model}{R}{note}")
 
     # faster-whisper base.en model cache
     whisper_cache = (Path.home() / ".cache" / "huggingface" / "hub"

@@ -89,6 +89,7 @@ from stt import transcribe, transcribe_partial, warmup as stt_warmup, StreamingT
 from vad import VADOracle
 from llm import ask_llm_stream, warmup as llm_warmup
 from tts import speak, speak_stream, warmup as tts_warmup, abort_speaking
+from tts.main_tts import register_ws_audio_sender
 from memory_system.retrieval.search import retrieve_memories
 from memory_system.core.insert_pipeline import insert_memory
 from plugins.router import PluginRouter
@@ -160,6 +161,48 @@ def _emit(event: str, data: dict):
         _clients.difference_update(dead)
 
     asyncio.run_coroutine_threadsafe(_send_all(), _loop)
+
+
+def _make_audio_sender():
+    """
+    Build the WebSocket audio sender callback for main_tts.register_ws_audio_sender().
+
+    The callback accepts two mutually exclusive call signatures:
+      fn(msg_dict, None)    → broadcast a JSON event to all clients
+      fn(None, raw_bytes)   → broadcast raw binary audio bytes to all clients
+
+    Both are scheduled via asyncio.run_coroutine_threadsafe so they are safe
+    to call from any sync thread (TTS thread, pipeline thread, etc.).
+    """
+    def _sender(msg: dict | None, audio_bytes: bytes | None) -> None:
+        if not _loop or not _clients:
+            return
+
+        if audio_bytes is not None:
+            # Binary frame — send raw bytes
+            async def _send_binary():
+                dead = set()
+                for ws in list(_clients):
+                    try:
+                        await ws.send(audio_bytes)
+                    except Exception:
+                        dead.add(ws)
+                _clients.difference_update(dead)
+            asyncio.run_coroutine_threadsafe(_send_binary(), _loop)
+        elif msg is not None:
+            # JSON frame
+            async def _send_json():
+                text = json.dumps(msg)
+                dead = set()
+                for ws in list(_clients):
+                    try:
+                        await ws.send(text)
+                    except Exception:
+                        dead.add(ws)
+                _clients.difference_update(dead)
+            asyncio.run_coroutine_threadsafe(_send_json(), _loop)
+
+    return _sender
 
 
 # ──────────────────────────────────────────────────
@@ -809,6 +852,10 @@ async def _ws_handler(ws):
 async def _main():
     global _loop
     _loop = asyncio.get_running_loop()
+
+    # Register the WS audio sender so TTS can stream audio to browser clients.
+    # Must happen after _loop is set (sender uses run_coroutine_threadsafe).
+    register_ws_audio_sender(_make_audio_sender())
 
     threading.Thread(target=_stats_loop,           daemon=True).start()
     threading.Thread(target=_audio_ingestion_loop, daemon=True).start()

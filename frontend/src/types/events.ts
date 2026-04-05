@@ -35,6 +35,13 @@ export interface STTPartial {
   hypothesis: string   // unconfirmed trailing words (faded display)
 }
 
+export interface AudioChunkMeta {
+  format:      'pcm16' | 'opus'
+  sample_rate: number
+  chunk_count: number
+  chunk_ms:    number
+}
+
 export type WSEvent =
   | { event: 'STT_RESULT';    data: STTResult }
   | { event: 'STT_PARTIAL';   data: STTPartial }
@@ -43,6 +50,9 @@ export type WSEvent =
   | { event: 'VOICE_STATE';   data: VoiceStateEvent }
   | { event: 'MEMORY_EVENT';  data: MemoryEvent }
   | { event: 'SYSTEM_STATS';  data: SystemStats }
+  | { event: 'AUDIO_CHUNK';   data: AudioChunkMeta }
+  | { event: 'AUDIO_DONE';    data: Record<string, never> }
+  | { event: 'AUDIO_ABORT';   data: Record<string, never> }
   | { event: 'pong';          data: Record<string, never> }
 
 export interface SystemStats {

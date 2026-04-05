@@ -3,6 +3,103 @@ import { useAppStore } from '../store/appStore'
 import { wsRef } from '../lib/wsRef'
 import type { WSEvent } from '../types/events'
 
+// ── TTSAudioReceiver ──────────────────────────────────────────────────────────
+// Receives chunked PCM16 or Opus audio frames from the server and plays them
+// via Web Audio API in arrival order using a sequential drain queue.
+//
+// Protocol:
+//   Server sends JSON: { event: "AUDIO_CHUNK", data: { format, sample_rate, chunk_count, chunk_ms } }
+//   Server sends N binary ArrayBuffer frames (one per chunk)
+//   Server sends JSON: { event: "AUDIO_DONE" }
+//   On barge-in: Server sends JSON: { event: "AUDIO_ABORT" } → stop immediately
+
+class TTSAudioReceiver {
+  private _ctx:         AudioContext | null = null
+  private _pending:     number  = 0    // binary frames still expected
+  private _nextStart:   number  = 0    // AudioContext time to schedule next chunk
+  private _sampleRate:  number  = 24000
+  private _format:      string  = 'pcm16'
+  private _nodes:       AudioBufferSourceNode[] = []
+
+  private _getCtx(): AudioContext {
+    if (!this._ctx || this._ctx.state === 'closed') {
+      this._ctx     = new AudioContext({ sampleRate: this._sampleRate })
+      this._nextStart = 0
+    }
+    return this._ctx
+  }
+
+  /** Called when the JSON metadata frame arrives. */
+  onMetadata(format: string, sampleRate: number, chunkCount: number): void {
+    this._format      = format
+    this._sampleRate  = sampleRate
+    this._pending     = chunkCount
+    // Re-create context if sample rate changed
+    if (this._ctx && this._ctx.sampleRate !== sampleRate) {
+      this._ctx.close().catch(() => {})
+      this._ctx = null
+    }
+    const ctx       = this._getCtx()
+    this._nextStart = Math.max(this._nextStart, ctx.currentTime)
+  }
+
+  /** Called for each binary ArrayBuffer frame. */
+  onBinaryFrame(buffer: ArrayBuffer): void {
+    if (this._pending <= 0) return
+    this._pending--
+
+    const ctx      = this._getCtx()
+    const float32  = this._decode(buffer)
+    if (float32.length === 0) return
+
+    const audioBuf = ctx.createBuffer(1, float32.length, this._sampleRate)
+    audioBuf.copyToChannel(float32, 0)
+
+    const src = ctx.createBufferSource()
+    src.buffer = audioBuf
+    src.connect(ctx.destination)
+    src.start(this._nextStart)
+    this._nextStart += audioBuf.duration
+    this._nodes.push(src)
+
+    src.onended = () => {
+      this._nodes = this._nodes.filter(n => n !== src)
+      src.disconnect()
+    }
+  }
+
+  /** Called when AUDIO_DONE arrives — nodes drain via onended; log remaining count. */
+  onDone(): void {
+    this._pending = 0
+    console.debug(`[tts] AUDIO_DONE — ${this._nodes.length} nodes still scheduled`)
+  }
+
+  /** Called when AUDIO_ABORT arrives — stop all queued audio immediately. */
+  stop(): void {
+    this._pending   = 0
+    this._nextStart = 0
+    for (const node of this._nodes) {
+      try { node.stop() } catch { /* already stopped */ }
+      node.disconnect()
+    }
+    this._nodes = []
+  }
+
+  private _decode(buffer: ArrayBuffer): Float32Array {
+    if (this._format === 'pcm16') {
+      const int16  = new Int16Array(buffer)
+      const float  = new Float32Array(int16.length)
+      for (let i = 0; i < int16.length; i++) {
+        float[i] = int16[i] / 32768
+      }
+      return float
+    }
+    // Opus: not decodable natively — log and skip
+    console.warn('[tts] opus format not supported in browser; use pcm16')
+    return new Float32Array(0)
+  }
+}
+
 const WS_URL          = 'ws://localhost:8765'
 const PING_INTERVAL   = 15_000   // send ping every 15 s
 const PONG_TIMEOUT    = 5_000    // expect pong within 5 s
@@ -14,6 +111,7 @@ export function useWebSocket() {
   const llmStartRef      = useRef<number>(0)
   const currentMsgIdRef  = useRef<string | null>(null)
   const llmTimeRef       = useRef<number>(0)
+  const audioReceiverRef = useRef<TTSAudioReceiver>(new TTSAudioReceiver())
 
   useEffect(() => {
     let retryDelay    = 1_000
@@ -86,7 +184,15 @@ export function useWebSocket() {
         retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY)  // exponential backoff
       }
 
+      ws.binaryType = 'arraybuffer'
+
       ws.onmessage = (e) => {
+        // Binary frame: raw audio chunk from TTS
+        if (e.data instanceof ArrayBuffer) {
+          audioReceiverRef.current.onBinaryFrame(e.data)
+          return
+        }
+        // JSON frame
         try {
           const msg: WSEvent = JSON.parse(e.data as string)
           handleEvent(msg)
@@ -161,6 +267,22 @@ export function useWebSocket() {
 
         case 'SYSTEM_STATS':
           store.setSystemStats(msg.data)
+          break
+
+        case 'AUDIO_CHUNK':
+          audioReceiverRef.current.onMetadata(
+            msg.data.format,
+            msg.data.sample_rate,
+            msg.data.chunk_count,
+          )
+          break
+
+        case 'AUDIO_DONE':
+          audioReceiverRef.current.onDone()
+          break
+
+        case 'AUDIO_ABORT':
+          audioReceiverRef.current.stop()
           break
 
         case 'pong':

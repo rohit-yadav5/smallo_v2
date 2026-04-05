@@ -118,6 +118,7 @@ from stt import transcribe, transcribe_partial, warmup as stt_warmup, StreamingT
 from vad import VADOracle
 from llm import ask_llm_stream, warmup as llm_warmup
 from tts import speak, speak_stream, warmup as tts_warmup, abort_speaking
+from tts.main_tts import register_ws_audio_sender
 from memory_system.retrieval.search import retrieve_memories
 from memory_system.core.insert_pipeline import insert_memory
 from plugins.router import PluginRouter
@@ -201,6 +202,48 @@ def _emit(event: str, data: dict):
         _clients.difference_update(dead)
 
     asyncio.run_coroutine_threadsafe(_send_all(), _loop)
+
+
+def _make_audio_sender():
+    """
+    Build the WebSocket audio sender callback for main_tts.register_ws_audio_sender().
+
+    Signature: fn(msg_dict | None, audio_bytes | None)
+      fn(msg_dict, None)   → broadcast JSON event to all clients
+      fn(None, raw_bytes)  → broadcast binary audio to all clients
+    """
+    def _sender(msg: dict | None, audio_bytes: bytes | None) -> None:
+        if not _loop or not _clients:
+            return
+
+        if audio_bytes is not None:
+            async def _send_binary():
+                dead = set()
+                for ws in list(_clients):
+                    try:
+                        await ws.send(audio_bytes)
+                    except Exception:
+                        dead.add(ws)
+                if dead:
+                    log.warning("_sender binary — %d dead client(s) removed", len(dead))
+                _clients.difference_update(dead)
+            asyncio.run_coroutine_threadsafe(_send_binary(), _loop)
+        elif msg is not None:
+            log.debug("_sender JSON  event=%s", msg.get("event"))
+            async def _send_json():
+                text = json.dumps(msg)
+                dead = set()
+                for ws in list(_clients):
+                    try:
+                        await ws.send(text)
+                    except Exception:
+                        dead.add(ws)
+                if dead:
+                    log.warning("_sender JSON %s — %d dead client(s) removed", msg.get("event"), len(dead))
+                _clients.difference_update(dead)
+            asyncio.run_coroutine_threadsafe(_send_json(), _loop)
+
+    return _sender
 
 
 # ──────────────────────────────────────────────────
@@ -1040,6 +1083,9 @@ async def _main():
     global _loop
     _loop = asyncio.get_running_loop()
     log.info("_main starting  loop=%s", _loop)
+
+    register_ws_audio_sender(_make_audio_sender())
+    log.info("WS audio sender registered")
 
     threading.Thread(target=_stats_loop,           daemon=True, name="stats").start()
     threading.Thread(target=_audio_ingestion_loop, daemon=True, name="audio_ingestion").start()

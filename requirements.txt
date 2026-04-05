@@ -1,6 +1,8 @@
 # ── Audio & Speech ───────────────────────────────────────────────────────────
 faster-whisper==1.2.1
-piper-tts==1.3.0
+kokoro-onnx==0.5.0
+misaki[en]==0.9.4
+huggingface-hub>=0.23.0
 sounddevice==0.5.5
 soundfile==0.13.1
 silero-vad==6.2.1
