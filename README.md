@@ -77,10 +77,10 @@ pip install -r requirements.txt
 Kokoro needs two model files placed in `kokoro-models/` at the project root:
 
 ```bash
-mkdir -p kokoro-models
-curl -L -o kokoro-models/kokoro-v1.0.onnx \
+mkdir -p backend/tts/kokoro-models
+curl -L -o backend/tts/kokoro-models/kokoro-v1.0.onnx \
   https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
-curl -L -o kokoro-models/voices-v1.0.bin \
+curl -L -o backend/tts/kokoro-models/voices-v1.0.bin \
   https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
 ```
 

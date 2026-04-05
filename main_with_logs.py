@@ -536,7 +536,7 @@ def _preflight():
         ok = False
 
     # Kokoro TTS model
-    kokoro_model = Path(__file__).resolve().parent / "kokoro-models" / "kokoro-v1.0.onnx"
+    kokoro_model = Path(__file__).resolve().parent / "backend" / "tts" / "kokoro-models" / "kokoro-v1.0.onnx"
     kokoro_ok    = kokoro_model.exists()
     sym          = f"{GRN}✓{R}" if kokoro_ok else f"{YLW}!{R}"
     note         = "" if kokoro_ok else f"  {YLW}← TTS will fail{R}"

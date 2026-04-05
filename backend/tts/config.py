@@ -83,17 +83,18 @@ class TTSConfig:
     # The path calculation assumes this file lives at backend/tts/config.py.
     kokoro_model_path: str = field(default_factory=lambda: _env_str(
         "TTS_KOKORO_MODEL_PATH",
-        os.path.join(os.path.dirname(__file__), "..", "..", "kokoro-models", "kokoro-v1.0.onnx"),
+        os.path.join(os.path.dirname(__file__), "kokoro-models", "kokoro-v1.0.onnx"),
     ))
     kokoro_voices_path: str = field(default_factory=lambda: _env_str(
         "TTS_KOKORO_VOICES_PATH",
-        os.path.join(os.path.dirname(__file__), "..", "..", "kokoro-models", "voices-v1.0.bin"),
+        os.path.join(os.path.dirname(__file__), "kokoro-models", "voices-v1.0.bin"),
     ))
     # Voice name.  af_sarah chosen as default: American female, RTF≈0.26 (2× faster
     # than af_heart RTF≈0.52) based on benchmarking against af_heart and bf_emma.
     kokoro_voice: str   = field(default_factory=lambda: _env_str("TTS_KOKORO_VOICE", "af_sarah"))
-    # Speed multiplier passed to Kokoro.create(speed=...).  1.1 = slightly faster.
-    kokoro_speed: float = field(default_factory=lambda: _env_float("TTS_KOKORO_SPEED", 1.1))
+    # Speed multiplier passed to Kokoro.create(speed=...).  1.2 = noticeably faster
+    # but still natural for af_sarah.  Do not exceed 1.4 — quality degrades.
+    kokoro_speed: float = field(default_factory=lambda: _env_float("TTS_KOKORO_SPEED", 1.2))
     # Native Kokoro output sample rate (do NOT change unless using a different model).
     sample_rate: int    = field(default_factory=lambda: _env_int("TTS_SAMPLE_RATE", 24000))
 
@@ -122,8 +123,18 @@ class TTSConfig:
 
     # Minimum number of words a chunk must have before it is synthesized
     # alone.  Chunks shorter than this are held and merged with the next.
+    # 6 words ≈ ~35 chars — keeps comma fragments ("Yes, I think,") from
+    # becoming solo Kokoro calls that cost 260ms each.
     min_chunk_words: int = field(default_factory=lambda: _env_int(
-        "TTS_MIN_CHUNK_WORDS", 3,
+        "TTS_MIN_CHUNK_WORDS", 6,
+    ))
+
+    # Minimum character length a non-sentence-final chunk must reach before
+    # it is synthesized.  Chunks under this length are held and merged even
+    # if they pass the word count guard.  Sentence-final punctuation (.!?)
+    # bypasses this check and always flushes immediately.
+    target_chunk_chars: int = field(default_factory=lambda: _env_int(
+        "TTS_TARGET_CHUNK_CHARS", 80,
     ))
 
     # Seconds to wait before retrying a failed synthesis call.

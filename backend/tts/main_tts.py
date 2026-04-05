@@ -402,13 +402,26 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
 
     def _maybe_emit(chunk: str) -> str | None:
         nonlocal _held
-        words = chunk.split()
-        if len(words) < TTS_CONFIG.min_chunk_words:
-            _held = (_held + " " + chunk).strip() if _held else chunk
+        # Combine any previously held fragment with the incoming chunk.
+        combined = (_held + " " + chunk).strip() if _held else chunk
+        words    = combined.split()
+
+        # Sentence-final punctuation (.!?) always flushes immediately —
+        # these are natural pause points where the listener expects audio.
+        # Comma/semicolon splits are NOT sentence-final and must pass both
+        # the word-count and char-length guards before being synthesized.
+        if combined.rstrip().endswith(('.', '!', '?')):
+            _held = ""
+            return combined
+
+        # Hold if the combined chunk is still too short by either measure.
+        if (len(words) < TTS_CONFIG.min_chunk_words
+                or len(combined) < TTS_CONFIG.target_chunk_chars):
+            _held = combined
             return None
-        result = (_held + " " + chunk).strip() if _held else chunk
-        _held  = ""
-        return result
+
+        _held = ""
+        return combined
 
     def _flush_held() -> str | None:
         nonlocal _held
