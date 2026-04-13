@@ -4,6 +4,7 @@ import { ConversationStream } from './components/ConversationStream'
 import { InfoDrawer } from './components/InfoDrawer'
 import { PluginNotifications } from './components/PluginNotifications'
 import { PlanProgress } from './components/PlanProgress'
+import { WebViewer } from './components/WebViewer'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useMicrophone } from './hooks/useMicrophone'
@@ -145,6 +146,7 @@ export default function App() {
           <StatusBar />
           <ConversationStream onStartMic={startMic} />
           <PlanProgress />
+          <WebViewer />
 
           {/* ── Text input bar — always visible ─────────────────────── */}
           <div

@@ -90,10 +90,21 @@ async def execute_step_with_tools(
 
     # system_suffix appends after SYSTEM_PROMPT + tool schemas — keeps the
     # executor framing without replacing the base persona.
+    #
+    # CRITICAL rules injected here because the base system prompt still
+    # includes planner-trigger instructions that the executor must override:
+    #   • <start_plan> tags are FORBIDDEN — a plan is already running.
+    #   • Only one <tool_call> block is permitted per step.
+    #   • No narration — emit the tool call block or plain text, nothing else.
     system_suffix = (
-        "You are in autonomous execution mode for a single step.  "
-        "Do NOT trigger the autonomous planner — handle this step directly.  "
-        "One tool call maximum per step."
+        "CRITICAL: You are executing a single step inside an active plan.  "
+        "NEVER emit <start_plan> tags — you are already inside a plan and emitting "
+        "one will break the execution loop.  "
+        "NEVER emit <tool_call> tags for anything other than the one tool you are "
+        "actually calling right now.  "
+        "If you need to use a tool, emit exactly one <tool_call> block and nothing else.  "
+        "If no tool is needed, answer directly in plain text.  "
+        "One tool call maximum per step.  Do NOT narrate or explain — only the result."
     )
 
     # ── Pass 1: collect full LLM response ────────────────────────────────────

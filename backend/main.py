@@ -114,6 +114,13 @@ from stt.text_input import watch_text_input
 # ── Phase 2: autonomous planner ───────────────────────────────────────────────
 from planner.planner import run_plan
 
+# ── Phase 3: web agent + deep research ───────────────────────────────────────
+import web_agent                                          # triggers tool self-registration  # noqa: F401
+from web_agent.agent import set_broadcast_fn as _set_web_broadcast
+from web_agent.monitor import web_monitor
+from web_agent.browser import BrowserManager
+import tools.research_tool                               # registers deep_research tool  # noqa: F401
+
 
 # ──────────────────────────────────────────────────
 # Shared state
@@ -668,81 +675,87 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     user_text:  str   = ""
     rec_secs:   float = 0.0
     trans_secs: float = 0.0
+    _text_input_branch = False
 
-    with tracker.step("STT"):
-        rec_start = time.perf_counter()
-        _text_input_branch = False
+    # ── Fast path: check for immediately-available text input ─────────────────
+    # Text input turns bypass the STT step entirely (source="text").
+    # This check is non-blocking; if no text is ready we fall into the voice
+    # path where STT timing is properly tracked.
+    try:
+        user_text = _text_input_queue.get_nowait()
+        _text_input_branch = True
+        print(f"  [text_input] processing: {user_text[:80]!r}", flush=True)
+    except queue.Empty:
+        # ── Voice path — track STT timing ─────────────────────────────────────
+        with tracker.step("STT"):
+            rec_start = time.perf_counter()
 
-        # Poll both text-input queue and speech-event queue.
-        # 0.5s mini-timeout on speech keeps text input <500 ms latency.
-        TIMEOUT_S = 30.0
-        while True:
-            # ── Text input has priority (zero-STT path) ────────────────
-            try:
-                user_text = _text_input_queue.get_nowait()
-                trans_secs = 0.0
-                rec_secs   = time.perf_counter() - rec_start
-                _text_input_branch = True
-                print(f"  [text_input] processing: {user_text[:80]!r}", flush=True)
-                break
-            except queue.Empty:
-                pass
+            # Still poll text queue inside the loop so text arriving AFTER we
+            # entered the voice wait is picked up within 500 ms.
+            TIMEOUT_S = 30.0
+            while True:
+                try:
+                    user_text = _text_input_queue.get_nowait()
+                    rec_secs  = time.perf_counter() - rec_start
+                    _text_input_branch = True
+                    print(f"  [text_input] processing: {user_text[:80]!r}", flush=True)
+                    tracker.note("source: text input (arrived during voice wait)")
+                    break
+                except queue.Empty:
+                    pass
 
-            # ── Speech event (normal voice path) ───────────────────────
-            try:
-                speech_start_s, speech_end_s = _speech_events.get(timeout=0.5)
-                # STT branch — extract audio & transcribe
-                audio_data = _audio_buffer.read_window(speech_start_s, speech_end_s)
+                # ── Speech event (normal voice path) ───────────────────
+                try:
+                    speech_start_s, speech_end_s = _speech_events.get(timeout=0.5)
+                    audio_data = _audio_buffer.read_window(speech_start_s, speech_end_s)
 
-                # Guard: VAD can fire on a window that maps to no buffered frames yet.
-                # Passing a zero-length array to Whisper raises:
-                #   "zero-size array to reduction operation maximum which has no identity"
-                if audio_data is None or len(audio_data) == 0:
+                    # Guard: VAD can fire on a window with no buffered frames.
+                    if audio_data is None or len(audio_data) == 0:
+                        print(
+                            f"  [stt] skipping transcription — empty audio window "
+                            f"[{speech_start_s:.3f}s → {speech_end_s:.3f}s]",
+                            flush=True,
+                        )
+                        _emit("VOICE_STATE", {"state": "idle"})
+                        return False
+
+                    dur      = len(audio_data) / 16_000
+                    rec_secs = time.perf_counter() - rec_start
+
                     print(
-                        f"  [stt] skipping transcription — empty audio window "
-                        f"[{speech_start_s:.3f}s → {speech_end_s:.3f}s]",
+                        f"  [stt] window [{speech_start_s:.3f}s → {speech_end_s:.3f}s]"
+                        f"  {dur:.2f}s audio  (waited {rec_secs:.3f}s)",
                         flush=True,
                     )
+                    tracker.note(f"utterance: {dur:.2f}s  [{speech_start_s:.3f}s → {speech_end_s:.3f}s]")
+
+                    transcriber             = _active_transcriber[0]
+                    _active_transcriber[0] = _make_transcriber()
+
+                    try:
+                        if transcriber is not None:
+                            user_text, trans_secs = transcriber.finalize(audio_data)
+                            print(f"  [stt] ✓ streaming finalize  ({trans_secs:.3f}s Whisper)", flush=True)
+                        else:
+                            user_text, trans_secs = transcribe(audio_data)
+                    except Exception as e:
+                        print(f"  [stt] transcribe failed: {e}")
+                        _emit("VOICE_STATE", {"state": "idle"})
+                        return False
+
+                    tracker.note(f"transcript: '{user_text[:70]}{'…' if len(user_text)>70 else ''}'  ({trans_secs:.3f}s)")
+                    break
+                except queue.Empty:
+                    pass
+
+                # ── Timeout guard ──────────────────────────────────────
+                if time.perf_counter() - rec_start >= TIMEOUT_S:
+                    print("  [pipeline] no input for 30 s — going idle")
                     _emit("VOICE_STATE", {"state": "idle"})
                     return False
 
-                dur      = len(audio_data) / 16_000
-                rec_secs = time.perf_counter() - rec_start
-
-                print(
-                    f"  [stt] window [{speech_start_s:.3f}s → {speech_end_s:.3f}s]"
-                    f"  {dur:.2f}s audio  (waited {rec_secs:.3f}s)",
-                    flush=True,
-                )
-                tracker.note(f"utterance: {dur:.2f}s  [{speech_start_s:.3f}s → {speech_end_s:.3f}s]")
-
-                transcriber             = _active_transcriber[0]
-                _active_transcriber[0] = _make_transcriber()
-
-                try:
-                    if transcriber is not None:
-                        user_text, trans_secs = transcriber.finalize(audio_data)
-                        print(f"  [stt] ✓ streaming finalize  ({trans_secs:.3f}s Whisper)", flush=True)
-                    else:
-                        user_text, trans_secs = transcribe(audio_data)
-                except Exception as e:
-                    print(f"  [stt] transcribe failed: {e}")
-                    _emit("VOICE_STATE", {"state": "idle"})
-                    return False
-
-                tracker.note(f"transcript: '{user_text[:70]}{'…' if len(user_text)>70 else ''}'  ({trans_secs:.3f}s)")
-                break
-            except queue.Empty:
-                pass
-
-            # ── Timeout guard ──────────────────────────────────────────
-            if time.perf_counter() - rec_start >= TIMEOUT_S:
-                print("  [pipeline] no input for 30 s — going idle")
-                _emit("VOICE_STATE", {"state": "idle"})
-                return False
-
-    if not _text_input_branch:
-        print(f"  [stt] wait={rec_secs:.3f}s  transcription={trans_secs:.3f}s")
+        if not _text_input_branch:
+            print(f"  [stt] wait={rec_secs:.3f}s  transcription={trans_secs:.3f}s")
 
     print(f"\n  {'You typed' if _text_input_branch else 'You said'}: {user_text}\n")
 
@@ -1045,6 +1058,19 @@ async def _main():
     # ── Wire reminder tool's broadcast function ───────────────────────────────
     _set_reminder_broadcast(_emit)
 
+    # ── Wire web agent broadcast + warm-up browser ────────────────────────────
+    _set_web_broadcast(_emit)
+    web_monitor.set_broadcast_fn(_emit)
+    try:
+        await BrowserManager.get()           # launch Chromium early; shows window now
+        print("  [web_agent] Chromium ready", flush=True)
+    except Exception as _exc:
+        print(f"  [web_agent] Chromium launch failed (will retry on first use): {_exc}", flush=True)
+
+    # Start background webpage-monitor loop
+    web_monitor.run_forever(_loop)
+    print("  [monitor] background loop scheduled", flush=True)
+
     # ── Text-input watcher (file + WS both feed _text_input_queue) ─────────────
     def _on_text_transcript(text: str) -> None:
         """Enqueue typed text exactly like a finished STT result."""
@@ -1066,6 +1092,12 @@ async def _main():
             await _cancel_plan()
             print("  [shutdown] cancelling pending reminders...", flush=True)
             await shutdown_all_reminders()
+            print("  [shutdown] closing browser...", flush=True)
+            try:
+                if BrowserManager._instance:
+                    await BrowserManager._instance.shutdown()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

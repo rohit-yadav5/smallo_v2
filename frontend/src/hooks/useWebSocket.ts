@@ -292,19 +292,36 @@ export function useWebSocket() {
           audioReceiverRef.current.stop()
           break
 
-        case 'PROACTIVE_EVENT':
-          // Reminder / autonomous agent notification — surface as a plugin notification
-          // so the existing toast system shows it without frontend changes.
-          store.addPluginNotification({
-            plugin: 'reminder',
-            action: msg.data.event,
-            result: msg.data.message,
-          })
-          console.info('[proactive]', msg.data.event, msg.data.message)
+        case 'PROACTIVE_EVENT': {
+          const pev = msg.data
+          if (pev.event === 'web_monitor') {
+            // Webpage change alert — show with URL context
+            store.addPluginNotification({
+              plugin: 'monitor',
+              action: `Page changed: ${pev.description ?? pev.url ?? 'unknown'}`,
+              result: pev.summary
+                ? `${pev.summary.slice(0, 200)}${pev.summary.length > 200 ? '…' : ''}`
+                : `${pev.url ?? ''}`,
+            })
+            console.info('[web_monitor] change detected', pev)
+          } else {
+            // Reminder / other proactive notification
+            store.addPluginNotification({
+              plugin: 'reminder',
+              action: pev.event,
+              result: pev.message ?? '',
+            })
+            console.info('[proactive]', pev.event, pev.message)
+          }
           break
+        }
 
         case 'PLAN_EVENT':
           store.handlePlanEvent(msg.data)
+          break
+
+        case 'WEB_SCREENSHOT':
+          store.setScreenshot(msg.data)
           break
 
         case 'pong':

@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats, PlanEvent } from '../types/events'
+import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats, PlanEvent, WebScreenshot } from '../types/events'
 
 export interface PlanStepState {
   text:    string
@@ -32,6 +32,8 @@ interface AppState {
   currentStreamId:      string | null
   activePlan:           ActivePlan | null  // running / recently finished plan
 
+  latestScreenshot:         WebScreenshot | null  // most recent browser viewport
+
   setVoiceState:            (state: VoiceState) => void
   setWsConnected:           (connected: boolean) => void
   setMicActive:             (v: boolean) => void
@@ -48,6 +50,7 @@ interface AppState {
   setSystemStats:           (stats: SystemStats) => void
   setLatency:               (ms: number) => void
   handlePlanEvent:          (ev: PlanEvent) => void
+  setScreenshot:            (shot: WebScreenshot) => void
 }
 
 // Module-level map — cancels stale glow timers when same node glows again
@@ -67,6 +70,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   latency:             0,
   currentStreamId:     null,
   activePlan:          null,
+  latestScreenshot:    null,
 
   setVoiceState:        (state)     => set({ voiceState: state }),
   setWsConnected:       (connected) => set({ wsConnected: connected }),
@@ -153,8 +157,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({ pluginNotifications: s.pluginNotifications.filter((n) => n.id !== id) }))
   },
 
-  setSystemStats: (stats) => set({ systemStats: stats }),
-  setLatency:     (ms)    => set({ latency: ms }),
+  setSystemStats:  (stats) => set({ systemStats: stats }),
+  setLatency:      (ms)    => set({ latency: ms }),
+  setScreenshot:   (shot)  => set({ latestScreenshot: shot }),
 
   handlePlanEvent: (ev) => {
     set((s) => {

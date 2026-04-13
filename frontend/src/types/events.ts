@@ -43,10 +43,25 @@ export interface AudioChunkMeta {
 }
 
 export interface ProactiveEvent {
-  /** Sub-type of proactive event, e.g. "reminder" */
+  /** Sub-type of proactive event, e.g. "reminder" | "web_monitor" */
   event: string
-  /** Human-readable message to surface to the user */
-  message: string
+  /** Human-readable message to surface to the user (reminders) */
+  message?: string
+  // web_monitor fields
+  target_id?:   string
+  description?: string
+  summary?:     string
+  url?:         string
+}
+
+/** Live browser viewport screenshot streamed from the web agent. */
+export interface WebScreenshot {
+  /** Base64-encoded JPEG image of the browser viewport */
+  image:     string
+  /** Current URL loaded in the browser */
+  url:       string
+  /** Unix epoch timestamp (seconds) */
+  timestamp: number
 }
 
 /** Sent from the frontend to inject typed text into the pipeline. */
@@ -80,6 +95,7 @@ export type WSEvent =
   | { event: 'AUDIO_ABORT';      data: Record<string, never> }
   | { event: 'PROACTIVE_EVENT';  data: ProactiveEvent }
   | { event: 'PLAN_EVENT';       data: PlanEvent }
+  | { event: 'WEB_SCREENSHOT';   data: WebScreenshot }
   | { event: 'pong';             data: Record<string, never> }
 
 export interface SystemStats {
