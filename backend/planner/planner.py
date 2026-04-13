@@ -33,77 +33,63 @@ with a sub-agent dispatcher.
 """
 
 import asyncio
-import json
 import re
 import threading
 from typing import Callable
 
-from tools.registry import registry as tool_registry
-
 # LLM calls are synchronous (requests-based); we wrap them in asyncio.to_thread.
-from llm.main_llm import ask_llm, _extract_tool_call, _run_tool_sync
+from llm.main_llm import ask_llm
+
+# Shared tool-detection + execution logic (avoids duplicating the two-pass
+# tool-call flow that also lives in main_llm.py / ask_llm_turn).
+from llm.tool_executor import execute_step_with_tools as _execute_step_with_tools
+
+# Tool registry — queried at run time (after tools are registered by main.py)
+# to give the decomposer an accurate list of available tool names.
+from tools.registry import registry as _tool_registry
 
 
 # ── Regex helpers ─────────────────────────────────────────────────────────────
 
 _NUMBERED_LINE_RE = re.compile(r"^\s*\d+[\.\)]\s+(.+)$", re.MULTILINE)
 
+# Tag fragments that must never appear in a valid step description.
+# The LLM sometimes copies planner-trigger or tool-call syntax into step text.
+_BAD_STEP_TOKENS = ("<start_plan>", "</start_plan>", "<tool_call>", "</tool_call>")
 
-def _parse_steps(text: str) -> list[str]:
-    """Extract numbered step lines from an LLM decomposition response."""
+
+def _parse_and_filter_steps(text: str) -> list[str]:
+    """
+    Extract numbered step lines from an LLM decomposition response and
+    filter out malformed entries.
+
+    Filtered (with warning log) if a step:
+      - is fewer than 10 characters (too vague to be actionable)
+      - contains a planner-trigger or tool-call tag (the LLM accidentally
+        copied format syntax into the step text)
+    """
     matches = _NUMBERED_LINE_RE.findall(text)
-    return [m.strip() for m in matches if m.strip()]
+    steps: list[str] = []
+    for m in matches:
+        step = m.strip()
+        if not step:
+            continue
+        if len(step) < 10:
+            print(f"  [planner] ⚠ filtered bad step (too short): {step!r}", flush=True)
+            continue
+        if any(tok in step for tok in _BAD_STEP_TOKENS):
+            print(f"  [planner] ⚠ filtered bad step (contains tag): {step!r}", flush=True)
+            continue
+        steps.append(step)
+    return steps
 
 
-# ── LLM helpers (all run via asyncio.to_thread) ───────────────────────────────
+# ── LLM helper (runs via asyncio.to_thread) ───────────────────────────────────
 
 async def _llm(prompt: str, system: str = "") -> str:
     """One-shot async LLM call; returns full response text."""
     full_prompt = f"{system}\n\n{prompt}" if system else prompt
     return await asyncio.to_thread(ask_llm, full_prompt)
-
-
-async def _execute_step_with_tools(step: str, context: str) -> str:
-    """
-    Ask the LLM to execute a single step, optionally using tools.
-
-    Two-pass: collect full response, detect <tool_call>, run tool if found,
-    then ask LLM to summarise the result.  Returns the final answer string.
-    """
-    system = (
-        "You are Small O's autonomous execution engine.  "
-        "Execute the given step concisely.  "
-        "Use a tool if real-world data or action is needed.  "
-        "Return only the result — no preamble, no explanation."
-    )
-    prompt = (
-        f"Step to execute: {step}\n\n"
-        f"Context from previous steps (most recent last):\n{context or 'None yet'}\n\n"
-        "Execute the step.  If you need a tool, emit the tool_call block.  "
-        "Otherwise answer directly."
-    )
-
-    raw = await asyncio.to_thread(ask_llm, f"{system}\n\n{prompt}")
-
-    # Check for tool call in response
-    tool_name, tool_args, visible = _extract_tool_call(raw)
-    if tool_name is None:
-        return raw.strip()
-
-    # Dispatch tool (already async)
-    print(f"  [planner] 🔧 tool: {tool_name}  args={tool_args}", flush=True)
-    tool_result = await tool_registry.dispatch(tool_name, tool_args or {})
-    print(f"  [planner] 🔧 result: {tool_result[:120]}", flush=True)
-
-    # Second LLM pass: summarise tool result as the step outcome
-    summary_prompt = (
-        f"{system}\n\n"
-        f"Step: {step}\n"
-        f"Tool result:\n{tool_result}\n\n"
-        "Summarise the result in one sentence as the step outcome."
-    )
-    summary = await asyncio.to_thread(ask_llm, summary_prompt)
-    return summary.strip()
 
 
 async def _check_goal_done(goal: str, results: list[str]) -> bool:
@@ -138,14 +124,40 @@ async def run_plan(
 
     try:
         # ── Phase 1: DECOMPOSE ────────────────────────────────────────────
-        decompose_prompt = (
-            "Break this goal into a numbered list of concrete steps.  "
-            "Each step should be accomplishable with one tool call or one direct answer.  "
-            "Respond ONLY with the numbered list.  No preamble, no explanation.\n\n"
-            f"Goal: {goal}"
-        )
+        tool_names = ", ".join(_tool_registry.names()) or "none"
+        decompose_prompt = "\n".join([
+            "You are a task planner. Break the following goal into a numbered list",
+            "of concrete, actionable steps.",
+            "",
+            "RULES for steps:",
+            "1. Each step must be ONE of:",
+            "   - A single tool call (write a file, fetch a URL, run a command, etc.)",
+            "   - A single question answered from previous step results",
+            "2. Each step must name the specific tool or action:",
+            '   GOOD: "Write \'hello from Small O\' to ~/Desktop/notes.txt using write_file"',
+            '   GOOD: "Fetch https://wikipedia.org text using fetch_url"',
+            '   GOOD: "Read ~/Desktop/notes.txt using read_file"',
+            '   BAD:  "Set the path"',
+            '   BAD:  "Verify the result"',
+            '   BAD:  "Notify the user"',
+            "3. Use the exact URLs, file paths, and content from the original goal.",
+            "   Do not substitute example.com or placeholder values.",
+            "4. Do NOT include steps for things you will say or narrate.",
+            "   Only include steps that require a tool call or computation.",
+            "5. Maximum 6 steps. If you need more, combine related actions.",
+            "",
+            f"Available tools: {tool_names}",
+            "",
+            f"Goal: {goal}",
+            "",
+            "Respond ONLY with the numbered list. No explanation, no preamble.",
+            "Format exactly:",
+            "1. Step one text",
+            "2. Step two text",
+            "3. Step three text",
+        ])
         decompose_resp = await _llm(decompose_prompt)
-        steps = _parse_steps(decompose_resp)
+        steps = _parse_and_filter_steps(decompose_resp)
 
         if not steps:
             # LLM didn't produce a numbered list — treat the whole goal as one step

@@ -760,12 +760,15 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         "transcription_time": round(trans_secs, 3),
     })
 
-    _emit("VOICE_STATE", {"state": "thinking"})
-
-    # ── Plan cancellation (fast path — no LLM call) ──────────────────────
-    # Check before plugin routing so "stop" always works even during planning.
+    # ── Plan cancellation (fast path — BEFORE thinking state, no LLM call) ─
+    # Handles both "stop" with an active plan and "stop" with nothing running.
+    # Checked before plugin routing and before any LLM call.
     _user_lower = user_text.lower().strip()
-    if any(_user_lower == w or _user_lower.startswith(w + " ") for w in _CANCEL_WORDS):
+    _is_cancel = (
+        any(_user_lower == w or _user_lower.startswith(w + " ") for w in _CANCEL_WORDS)
+        or any(phrase in _user_lower for phrase in ("stop the", "cancel the", "abort the"))
+    )
+    if _is_cancel:
         if _current_plan_task and not _current_plan_task.done():
             asyncio.run_coroutine_threadsafe(_cancel_plan(), _loop)
             _emit("VOICE_STATE", {"state": "speaking"})
@@ -774,9 +777,18 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
                 speak("Stopped.", _interrupt_event)
             except Exception:
                 pass
-            _emit("VOICE_STATE", {"state": "idle"})
-            tracker.summary()
-            return False
+        else:
+            _emit("VOICE_STATE", {"state": "speaking"})
+            _interrupt_event.clear()
+            try:
+                speak("Nothing is running.", _interrupt_event)
+            except Exception:
+                pass
+        _emit("VOICE_STATE", {"state": "idle"})
+        tracker.summary()
+        return False
+
+    _emit("VOICE_STATE", {"state": "thinking"})
 
     # ── Plugin routing ───────────────────────────────────────────────────
     plugin_result = None

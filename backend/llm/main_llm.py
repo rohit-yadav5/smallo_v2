@@ -96,16 +96,24 @@ def _build_tools_section() -> str:
         "- Always tell the user what you are about to do before the tool call.\n"
         "- After getting a result, summarise it naturally in your voice.\n"
         "- Never reveal internal tool names or raw JSON to the user.\n\n"
-        "## Autonomous planner\n\n"
-        "If the user's request requires MULTIPLE steps, multiple tool calls, "
-        "or sustained background work (research, file creation, multi-stage "
-        "computation), DO NOT attempt it in a single response.  Instead emit:\n\n"
+        "## Autonomous planner — MANDATORY RULE\n\n"
+        "CRITICAL: If the user's request requires MORE THAN ONE action, tool call, "
+        "or operation to complete — you MUST emit a plan trigger.  No exceptions.\n\n"
+        "Trigger conditions (emit <start_plan> if ANY apply):\n"
+        "- Request mentions 'then', 'and then', 'after that', 'next', 'finally', "
+        "'also' when describing a sequence of actions\n"
+        "- Request requires calling more than one tool\n"
+        "- Request involves creating + reading/verifying a file\n"
+        "- Request describes multi-stage research or computation\n\n"
+        "Do NOT trigger the planner for:\n"
+        "- Single questions (even with tools): 'What is X', 'Read file Y'\n"
+        "- Chitchat and opinions\n\n"
+        "When triggering the planner, emit EXACTLY this and NOTHING else:\n\n"
         "<start_plan>\n"
         "one sentence description of the goal\n"
         "</start_plan>\n\n"
-        "The autonomous planner will take over, execute every step, and report "
-        "back when done.  For simple questions and single-action requests, "
-        "respond directly as normal — do NOT trigger the planner unnecessarily."
+        "Do NOT say 'I will', 'Please wait', or narrate.  "
+        "Just emit the tag and stop.  The planner handles execution."
     )
 
 
@@ -202,6 +210,21 @@ _PLAN_TRIGGER_RE = re.compile(
     r"<start_plan>\s*(.+?)\s*</start_plan>",
     re.DOTALL | re.IGNORECASE,
 )
+
+# ── Multi-step fallback heuristics ─────────────────────────────────────────────
+# If the LLM forgets to emit <start_plan>, these patterns in the user's text are
+# a strong signal the task is multi-step.  Matching 2+ patterns forces a trigger.
+_MULTI_STEP_PATTERNS: list = [
+    re.compile(r'\bthen\b',          re.IGNORECASE),
+    re.compile(r'\band\s+then\b',    re.IGNORECASE),
+    re.compile(r'\bafter\s+that\b',  re.IGNORECASE),
+    re.compile(r'\bnext[,\s]',       re.IGNORECASE),
+    re.compile(r'\bfinally\b',       re.IGNORECASE),
+    re.compile(r'\bstep\s+\d\b',     re.IGNORECASE),
+    re.compile(r'\bfirst\b.{1,60}\bthen\b', re.IGNORECASE | re.DOTALL),
+    re.compile(r'\balso\b.{1,60}\b(create|write|fetch|read|run|open)\b',
+               re.IGNORECASE | re.DOTALL),
+]
 
 
 def _extract_tool_call(text: str) -> tuple[str | None, dict | None, str]:
@@ -444,6 +467,26 @@ def ask_llm_turn(
         goal = plan_match.group(1).strip()
         print(f"  [llm] 🗺 plan trigger: '{goal}'", flush=True)
         return {"type": "plan_trigger", "goal": goal}
+
+    # ── Fallback multi-step detection (safety net) ─────────────────────────
+    # If the LLM forgot to emit <start_plan> AND produced no tool call,
+    # check whether the user's input text strongly signals a multi-step task.
+    tool_name_check, _, _ = _extract_tool_call(full_text)
+    if tool_name_check is None:
+        match_count = sum(1 for p in _MULTI_STEP_PATTERNS if p.search(safe_text))
+        if match_count >= 2:
+            # Extract just the user utterance (strip memory-context prefix if present)
+            utterance = (
+                safe_text.split("\n\nUser: ", 1)[-1].strip()
+                if "\n\nUser: " in safe_text
+                else safe_text.strip()
+            )
+            print(
+                f"  [llm] ⚠ forced plan trigger — LLM forgot to emit one "
+                f"({match_count} multi-step patterns matched in user input)",
+                flush=True,
+            )
+            return {"type": "plan_trigger", "goal": utterance}
 
     # ── Otherwise: delegate to tool-or-plain handler (a generator) ─────────
     return _handle_tool_or_plain(full_text, tokens, safe_text, system_suffix)
