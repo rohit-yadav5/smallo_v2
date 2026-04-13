@@ -33,12 +33,18 @@ Barge-in flow
   → new _run_turn reads event → buffer.read_window() → Whisper
 
 Events emitted (JSON):
-  VOICE_STATE    {state: idle | listening | thinking | speaking}
-  STT_RESULT     {text, recording_time, transcription_time}
-  LLM_TOKEN      {token, done}
-  PLUGIN_ACTION  {plugin, action, result, direct}
-  MEMORY_EVENT   {type, importance, summary, id, retrieved?}
-  SYSTEM_STATS   {cpu, ram, battery}
+  VOICE_STATE      {state: idle | listening | thinking | speaking}
+  STT_RESULT       {text, recording_time, transcription_time}
+  LLM_TOKEN        {token, done}
+  PLUGIN_ACTION    {plugin, action, result, direct}
+  MEMORY_EVENT     {type, importance, summary, id, retrieved?}
+  SYSTEM_STATS     {cpu, ram, battery}
+  PROACTIVE_EVENT  {event: "reminder", message: str}  ← fired by reminder_tool
+
+Events received (JSON):
+  ping                  → pong
+  UPDATE_USER_CONTEXT   {key: str, value: any}  ← update persistent user model
+  TEXT_INPUT            {text: str}             ← typed message, bypasses STT
 """
 import asyncio
 import json
@@ -88,12 +94,25 @@ from audio import RollingAudioBuffer
 from stt import transcribe, transcribe_partial, warmup as stt_warmup, StreamingTranscriber
 from vad import VADOracle
 from llm import ask_llm_stream, warmup as llm_warmup
+from llm.main_llm import ask_llm_turn
 from tts import speak, speak_stream, warmup as tts_warmup, abort_speaking
 from tts.main_tts import register_ws_audio_sender
 from memory_system.retrieval.search import retrieve_memories
 from memory_system.core.insert_pipeline import insert_memory
 from plugins.router import PluginRouter
 from utils.latency import LatencyTracker
+
+# ── Jarvis upgrade: tools + user context ──────────────────────────────────────
+import backend_loop_ref                                  # loop ref for tool dispatch
+import tools                                             # triggers self-registration of all four tools  # noqa: F401
+from tools.reminder_tool import set_broadcast_fn as _set_reminder_broadcast, shutdown_all_reminders
+from user_context import load_user_context, get_context_prompt, update_user_context
+
+# ── Text input watcher ────────────────────────────────────────────────────────
+from stt.text_input import watch_text_input
+
+# ── Phase 2: autonomous planner ───────────────────────────────────────────────
+from planner.planner import run_plan
 
 
 # ──────────────────────────────────────────────────
@@ -108,6 +127,14 @@ _audio_queue: queue.Queue = queue.Queue()
 
 # Speech event timestamps (start_s, end_s) from VADOracle → pipeline
 _speech_events: queue.Queue = queue.Queue()
+
+# Text typed by the user (via WS TEXT_INPUT or file watcher) → pipeline.
+# Each item is a plain str.  Checked before speech events in _run_turn.
+_text_input_queue: queue.Queue = queue.Queue()
+
+# Active autonomous planner task.  Only one plan runs at a time;
+# starting a new one cancels the previous.
+_current_plan_task: asyncio.Task | None = None
 
 # Continuous 60-second audio buffer — mic NEVER gated; set in _audio_ingestion_loop
 _audio_buffer: RollingAudioBuffer | None = None
@@ -124,6 +151,44 @@ _interrupted_partial: str = ""
 
 # Protects _interrupted_partial across VAD callback and pipeline threads
 _barge_in_lock: threading.Lock = threading.Lock()
+
+# ── Planner management helpers ────────────────────────────────────────────────
+
+# Words/phrases that cancel the running plan — checked BEFORE LLM call (fast).
+_CANCEL_WORDS = frozenset([
+    "stop", "cancel", "abort",
+    "stop the task", "cancel the plan", "stop what you're doing",
+    "stop that", "cancel that", "never mind",
+])
+
+
+async def _launch_plan(goal: str) -> None:
+    """Start a new plan task on the main event loop, cancelling any active plan."""
+    global _current_plan_task
+    if _current_plan_task and not _current_plan_task.done():
+        _current_plan_task.cancel()
+        try:
+            await _current_plan_task
+        except asyncio.CancelledError:
+            pass
+    _current_plan_task = asyncio.create_task(
+        run_plan(goal, _emit, max_steps=20),
+        name=f"plan:{goal[:40]}",
+    )
+    print(f"  [plan] task created: {_current_plan_task.get_name()}", flush=True)
+
+
+async def _cancel_plan() -> None:
+    """Cancel the active plan task if one is running."""
+    global _current_plan_task
+    if _current_plan_task and not _current_plan_task.done():
+        _current_plan_task.cancel()
+        try:
+            await _current_plan_task
+        except asyncio.CancelledError:
+            pass
+        print("  [plan] task cancelled by user", flush=True)
+    _current_plan_task = None
 
 # Streaming STT — one StreamingTranscriber per utterance.
 # It runs Whisper every 500 ms during speech (live word-by-word display)
@@ -595,60 +660,84 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         if cleared:
             print(f"  [pipeline] cleared {cleared} stale speech event(s)")
 
-    # ── Wait for speech timestamps from VADOracle ─────────────────────────
+    # ── Wait for input: text OR speech (whichever arrives first) ─────────────
     _emit("VOICE_STATE", {"state": "listening"})
     print(f"  [pipeline] VOICE_STATE → listening")
 
+    # Variables set by whichever input branch fires
+    user_text:  str   = ""
+    rec_secs:   float = 0.0
+    trans_secs: float = 0.0
+
     with tracker.step("STT"):
         rec_start = time.perf_counter()
-        print(f"  [stt] waiting for speech event...")
-        try:
-            speech_start_s, speech_end_s = _speech_events.get(timeout=30)
-        except queue.Empty:
-            print("  [pipeline] no speech for 30 s — going idle (speak to wake)")
-            _emit("VOICE_STATE", {"state": "idle"})
-            return False
+        _text_input_branch = False
 
-        # Extract audio from rolling buffer using VAD timestamps.
-        # VADOracle already applied pre_buffer_s=2.0 and post_buffer_s=2.0,
-        # so this window is guaranteed to include audio before VAD onset
-        # (capturing the first word) and after VAD offset (last word).
-        # No pre-roll stitching needed — the buffer is the single source of truth.
-        audio_data = _audio_buffer.read_window(speech_start_s, speech_end_s)
-        dur      = len(audio_data) / 16_000
-        rec_secs = time.perf_counter() - rec_start
+        # Poll both text-input queue and speech-event queue.
+        # 0.5s mini-timeout on speech keeps text input <500 ms latency.
+        TIMEOUT_S = 30.0
+        while True:
+            # ── Text input has priority (zero-STT path) ────────────────
+            try:
+                user_text = _text_input_queue.get_nowait()
+                trans_secs = 0.0
+                rec_secs   = time.perf_counter() - rec_start
+                _text_input_branch = True
+                print(f"  [text_input] processing: {user_text[:80]!r}", flush=True)
+                break
+            except queue.Empty:
+                pass
 
-        print(
-            f"  [stt] window [{speech_start_s:.3f}s → {speech_end_s:.3f}s]"
-            f"  {dur:.2f}s audio  (waited {rec_secs:.3f}s)",
-            flush=True,
-        )
-        tracker.note(f"utterance: {dur:.2f}s  [{speech_start_s:.3f}s → {speech_end_s:.3f}s]")
+            # ── Speech event (normal voice path) ───────────────────────
+            try:
+                speech_start_s, speech_end_s = _speech_events.get(timeout=0.5)
+                # STT branch — extract audio & transcribe
+                audio_data = _audio_buffer.read_window(speech_start_s, speech_end_s)
+                dur      = len(audio_data) / 16_000
+                rec_secs = time.perf_counter() - rec_start
 
-        # Transcribe — use streaming result if ready, else batch Whisper.
-        transcriber             = _active_transcriber[0]
-        _active_transcriber[0] = _make_transcriber()   # fresh for next turn
+                print(
+                    f"  [stt] window [{speech_start_s:.3f}s → {speech_end_s:.3f}s]"
+                    f"  {dur:.2f}s audio  (waited {rec_secs:.3f}s)",
+                    flush=True,
+                )
+                tracker.note(f"utterance: {dur:.2f}s  [{speech_start_s:.3f}s → {speech_end_s:.3f}s]")
 
-        try:
-            if transcriber is not None:
-                user_text, trans_secs = transcriber.finalize(audio_data)
-                print(f"  [stt] ✓ streaming finalize  ({trans_secs:.3f}s Whisper)", flush=True)
-            else:
-                user_text, trans_secs = transcribe(audio_data)
-        except Exception as e:
-            print(f"  [stt] transcribe failed: {e}")
-            _emit("VOICE_STATE", {"state": "idle"})
-            return False
-        tracker.note(f"transcript: '{user_text[:70]}{'…' if len(user_text)>70 else ''}'  ({trans_secs:.3f}s)")
+                transcriber             = _active_transcriber[0]
+                _active_transcriber[0] = _make_transcriber()
 
-    print(f"  [stt] wait={rec_secs:.3f}s  transcription={trans_secs:.3f}s")
-    print(f"\n  You said: {user_text}\n")
+                try:
+                    if transcriber is not None:
+                        user_text, trans_secs = transcriber.finalize(audio_data)
+                        print(f"  [stt] ✓ streaming finalize  ({trans_secs:.3f}s Whisper)", flush=True)
+                    else:
+                        user_text, trans_secs = transcribe(audio_data)
+                except Exception as e:
+                    print(f"  [stt] transcribe failed: {e}")
+                    _emit("VOICE_STATE", {"state": "idle"})
+                    return False
+
+                tracker.note(f"transcript: '{user_text[:70]}{'…' if len(user_text)>70 else ''}'  ({trans_secs:.3f}s)")
+                break
+            except queue.Empty:
+                pass
+
+            # ── Timeout guard ──────────────────────────────────────────
+            if time.perf_counter() - rec_start >= TIMEOUT_S:
+                print("  [pipeline] no input for 30 s — going idle")
+                _emit("VOICE_STATE", {"state": "idle"})
+                return False
+
+    if not _text_input_branch:
+        print(f"  [stt] wait={rec_secs:.3f}s  transcription={trans_secs:.3f}s")
+
+    print(f"\n  {'You typed' if _text_input_branch else 'You said'}: {user_text}\n")
 
     if not user_text.strip():
         _emit("VOICE_STATE", {"state": "idle"})
         return False
 
-    if user_text.lower().strip() in ("exit", "quit", "stop"):
+    if user_text.lower().strip() in ("exit", "quit"):
         _emit("VOICE_STATE", {"state": "idle"})
         return False
 
@@ -659,6 +748,22 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     })
 
     _emit("VOICE_STATE", {"state": "thinking"})
+
+    # ── Plan cancellation (fast path — no LLM call) ──────────────────────
+    # Check before plugin routing so "stop" always works even during planning.
+    _user_lower = user_text.lower().strip()
+    if any(_user_lower == w or _user_lower.startswith(w + " ") for w in _CANCEL_WORDS):
+        if _current_plan_task and not _current_plan_task.done():
+            asyncio.run_coroutine_threadsafe(_cancel_plan(), _loop)
+            _emit("VOICE_STATE", {"state": "speaking"})
+            _interrupt_event.clear()
+            try:
+                speak("Stopped.", _interrupt_event)
+            except Exception:
+                pass
+            _emit("VOICE_STATE", {"state": "idle"})
+            tracker.summary()
+            return False
 
     # ── Plugin routing ───────────────────────────────────────────────────
     plugin_result = None
@@ -724,14 +829,44 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         print(f"  [pipeline] injecting interrupted context ({len(_interrupted_partial)} chars)")
         _interrupted_partial = ""
 
-    # ── LLM + TTS ────────────────────────────────────────────────────────
-    print(f"  [pipeline] VOICE_STATE → speaking  |  prompt {len(prompt):,} chars", flush=True)
+    # ── LLM (with plan-trigger and tool detection) ───────────────────────
+    # Inject user context into every LLM call as a system-prompt suffix.
+    user_ctx_suffix = get_context_prompt()
+
+    print(f"  [pipeline] calling ask_llm_turn  |  prompt {len(prompt):,} chars", flush=True)
+    try:
+        llm_result = ask_llm_turn(prompt, system_suffix=user_ctx_suffix)
+    except Exception as e:
+        print(f"  [llm] ask_llm_turn failed: {e}")
+        _emit("VOICE_STATE", {"state": "idle"})
+        tracker.summary()
+        return False
+
+    # ── Plan trigger detected — hand off to autonomous planner ───────────
+    if isinstance(llm_result, dict) and llm_result.get("type") == "plan_trigger":
+        goal = llm_result["goal"]
+        print(f"  [pipeline] 🗺 plan trigger → '{goal}'", flush=True)
+        # Launch plan on main asyncio loop (non-blocking from pipeline thread)
+        asyncio.run_coroutine_threadsafe(_launch_plan(goal), _loop)
+        # Immediately acknowledge verbally — no LLM call needed
+        _emit("VOICE_STATE", {"state": "speaking"})
+        _interrupt_event.clear()
+        try:
+            speak("On it. I'll let you know when it's done.", _interrupt_event)
+        except Exception:
+            pass
+        _emit("VOICE_STATE", {"state": "idle"})
+        tracker.summary()
+        return False
+
+    # ── Normal streaming response ────────────────────────────────────────
+    print(f"  [pipeline] VOICE_STATE → speaking", flush=True)
     _emit("VOICE_STATE", {"state": "speaking"})
     _interrupt_event.clear()   # arm: VAD can now set this on barge-in
 
     try:
         ai_text, tts_timing = speak_stream(
-            _token_broadcaster(ask_llm_stream(prompt), _interrupt_event),
+            _token_broadcaster(llm_result, _interrupt_event),
             _interrupt_event,
         )
         first_token = tts_timing.get("first_token_secs", tts_timing["first_word_secs"])
@@ -838,8 +973,27 @@ async def _ws_handler(ws):
             else:
                 try:
                     ctrl = json.loads(message)
-                    if ctrl.get("event") == "ping":
+                    ev   = ctrl.get("event", "")
+
+                    if ev == "ping":
                         await ws.send(json.dumps({"event": "pong", "data": {}}))
+
+                    elif ev == "UPDATE_USER_CONTEXT":
+                        # Frontend (or future sub-agent) can update the user model.
+                        # e.g. {"event": "UPDATE_USER_CONTEXT", "data": {"key": "name", "value": "Alice"}}
+                        key   = ctrl.get("data", {}).get("key")
+                        value = ctrl.get("data", {}).get("value")
+                        if key:
+                            update_user_context(key, value)
+                            print(f"  [ws] user_context updated: {key}={value!r}")
+
+                    elif ev == "TEXT_INPUT":
+                        # User typed a message — inject directly into pipeline.
+                        text = ctrl.get("data", {}).get("text", "").strip()
+                        if text:
+                            _text_input_queue.put_nowait(text)
+                            print(f"  [ws] TEXT_INPUT: {text[:80]!r}", flush=True)
+
                 except Exception:
                     pass
     except Exception:
@@ -853,9 +1007,25 @@ async def _main():
     global _loop
     _loop = asyncio.get_running_loop()
 
+    # ── Share the event loop with tool dispatch (reminder asyncio tasks) ──────
+    backend_loop_ref.loop = _loop
+
+    # ── Load persistent user context from disk ───────────────────────────────
+    load_user_context()
+
     # Register the WS audio sender so TTS can stream audio to browser clients.
     # Must happen after _loop is set (sender uses run_coroutine_threadsafe).
     register_ws_audio_sender(_make_audio_sender())
+
+    # ── Wire reminder tool's broadcast function ───────────────────────────────
+    _set_reminder_broadcast(_emit)
+
+    # ── Text-input watcher (file + WS both feed _text_input_queue) ─────────────
+    def _on_text_transcript(text: str) -> None:
+        """Enqueue typed text exactly like a finished STT result."""
+        _text_input_queue.put_nowait(text)
+
+    asyncio.create_task(watch_text_input(_on_text_transcript))
 
     threading.Thread(target=_stats_loop,           daemon=True).start()
     threading.Thread(target=_audio_ingestion_loop, daemon=True).start()
@@ -863,7 +1033,14 @@ async def _main():
 
     async with websockets.serve(_ws_handler, "localhost", 8765):
         print("  [ws] server listening on ws://localhost:8765")
-        await asyncio.Future()
+        try:
+            await asyncio.Future()   # blocks until cancelled (Ctrl-C)
+        finally:
+            # ── Graceful shutdown ─────────────────────────────────────────
+            print("  [shutdown] cancelling active plan...", flush=True)
+            await _cancel_plan()
+            print("  [shutdown] cancelling pending reminders...", flush=True)
+            await shutdown_all_reminders()
 
 
 if __name__ == "__main__":

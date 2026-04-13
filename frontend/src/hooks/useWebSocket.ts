@@ -113,6 +113,13 @@ export function useWebSocket() {
   const llmTimeRef       = useRef<number>(0)
   const audioReceiverRef = useRef<TTSAudioReceiver>(new TTSAudioReceiver())
 
+  /** Send a typed message over WebSocket — bypasses STT entirely. */
+  function sendTextInput(text: string) {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({ event: 'TEXT_INPUT', data: { text } }))
+  }
+
   useEffect(() => {
     let retryDelay    = 1_000
     let reconnectTimer: ReturnType<typeof setTimeout>
@@ -285,6 +292,21 @@ export function useWebSocket() {
           audioReceiverRef.current.stop()
           break
 
+        case 'PROACTIVE_EVENT':
+          // Reminder / autonomous agent notification — surface as a plugin notification
+          // so the existing toast system shows it without frontend changes.
+          store.addPluginNotification({
+            plugin: 'reminder',
+            action: msg.data.event,
+            result: msg.data.message,
+          })
+          console.info('[proactive]', msg.data.event, msg.data.message)
+          break
+
+        case 'PLAN_EVENT':
+          store.handlePlanEvent(msg.data)
+          break
+
         case 'pong':
           clearTimeout(pongTimeout)   // received pong — cancel the close-on-timeout
           break
@@ -299,4 +321,6 @@ export function useWebSocket() {
       wsRef.current = null
     }
   }, [])
+
+  return { sendTextInput }
 }

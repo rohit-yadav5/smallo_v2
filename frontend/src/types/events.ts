@@ -42,18 +42,45 @@ export interface AudioChunkMeta {
   chunk_ms:    number
 }
 
+export interface ProactiveEvent {
+  /** Sub-type of proactive event, e.g. "reminder" */
+  event: string
+  /** Human-readable message to surface to the user */
+  message: string
+}
+
+/** Sent from the frontend to inject typed text into the pipeline. */
+export interface TextInputSent {
+  text: string
+}
+
+/** Autonomous planner progress events. */
+export interface PlanEvent {
+  phase:      'decomposed' | 'step_start' | 'step_done' | 'complete' | 'failed' | 'cancelled'
+  goal?:      string
+  steps?:     string[]       // decomposed
+  step_index?: number        // step_start / step_done
+  step_text?:  string        // step_start
+  total?:      number        // step_start
+  result?:     string        // step_done
+  summary?:    string        // complete
+  reason?:     string        // failed
+}
+
 export type WSEvent =
-  | { event: 'STT_RESULT';    data: STTResult }
-  | { event: 'STT_PARTIAL';   data: STTPartial }
-  | { event: 'PLUGIN_ACTION'; data: PluginAction }
-  | { event: 'LLM_TOKEN';     data: LLMToken }
-  | { event: 'VOICE_STATE';   data: VoiceStateEvent }
-  | { event: 'MEMORY_EVENT';  data: MemoryEvent }
-  | { event: 'SYSTEM_STATS';  data: SystemStats }
-  | { event: 'AUDIO_CHUNK';   data: AudioChunkMeta }
-  | { event: 'AUDIO_DONE';    data: Record<string, never> }
-  | { event: 'AUDIO_ABORT';   data: Record<string, never> }
-  | { event: 'pong';          data: Record<string, never> }
+  | { event: 'STT_RESULT';       data: STTResult }
+  | { event: 'STT_PARTIAL';      data: STTPartial }
+  | { event: 'PLUGIN_ACTION';    data: PluginAction }
+  | { event: 'LLM_TOKEN';        data: LLMToken }
+  | { event: 'VOICE_STATE';      data: VoiceStateEvent }
+  | { event: 'MEMORY_EVENT';     data: MemoryEvent }
+  | { event: 'SYSTEM_STATS';     data: SystemStats }
+  | { event: 'AUDIO_CHUNK';      data: AudioChunkMeta }
+  | { event: 'AUDIO_DONE';       data: Record<string, never> }
+  | { event: 'AUDIO_ABORT';      data: Record<string, never> }
+  | { event: 'PROACTIVE_EVENT';  data: ProactiveEvent }
+  | { event: 'PLAN_EVENT';       data: PlanEvent }
+  | { event: 'pong';             data: Record<string, never> }
 
 export interface SystemStats {
   cpu: number

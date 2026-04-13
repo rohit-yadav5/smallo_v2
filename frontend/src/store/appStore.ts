@@ -1,5 +1,21 @@
 import { create } from 'zustand'
-import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats } from '../types/events'
+import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats, PlanEvent } from '../types/events'
+
+export interface PlanStepState {
+  text:    string
+  result?: string
+  done:    boolean
+}
+
+export interface ActivePlan {
+  goal:        string
+  steps:       PlanStepState[]
+  currentStep: number           // -1 = decomposing
+  phase:       PlanEvent['phase']
+  summary?:    string
+  reason?:     string
+  finishedAt?: number           // timestamp for auto-hide
+}
 
 interface AppState {
   voiceState:           VoiceState
@@ -14,6 +30,7 @@ interface AppState {
   memoryCount:          number
   latency:              number
   currentStreamId:      string | null
+  activePlan:           ActivePlan | null  // running / recently finished plan
 
   setVoiceState:            (state: VoiceState) => void
   setWsConnected:           (connected: boolean) => void
@@ -30,6 +47,7 @@ interface AppState {
   removePluginNotification: (id: string) => void
   setSystemStats:           (stats: SystemStats) => void
   setLatency:               (ms: number) => void
+  handlePlanEvent:          (ev: PlanEvent) => void
 }
 
 // Module-level map — cancels stale glow timers when same node glows again
@@ -48,6 +66,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   memoryCount:         0,
   latency:             0,
   currentStreamId:     null,
+  activePlan:          null,
 
   setVoiceState:        (state)     => set({ voiceState: state }),
   setWsConnected:       (connected) => set({ wsConnected: connected }),
@@ -136,4 +155,79 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setSystemStats: (stats) => set({ systemStats: stats }),
   setLatency:     (ms)    => set({ latency: ms }),
+
+  handlePlanEvent: (ev) => {
+    set((s) => {
+      switch (ev.phase) {
+        case 'decomposed': {
+          const steps: PlanStepState[] = (ev.steps ?? []).map((text) => ({
+            text, done: false,
+          }))
+          return {
+            activePlan: {
+              goal:        ev.goal ?? '',
+              steps,
+              currentStep: -1,
+              phase:       'decomposed',
+            },
+          }
+        }
+        case 'step_start': {
+          if (!s.activePlan) return {}
+          return {
+            activePlan: {
+              ...s.activePlan,
+              currentStep: ev.step_index ?? 0,
+              phase:       'step_start',
+            },
+          }
+        }
+        case 'step_done': {
+          if (!s.activePlan) return {}
+          const idx = ev.step_index ?? 0
+          const steps = s.activePlan.steps.map((step, i) =>
+            i === idx ? { ...step, done: true, result: ev.result } : step
+          )
+          return {
+            activePlan: { ...s.activePlan, steps, phase: 'step_done' },
+          }
+        }
+        case 'complete': {
+          if (!s.activePlan) return {}
+          const plan: ActivePlan = {
+            ...s.activePlan,
+            phase:       'complete',
+            summary:     ev.summary,
+            finishedAt:  Date.now(),
+          }
+          // Auto-hide after 10 s
+          setTimeout(() => {
+            const cur = get().activePlan
+            if (cur?.finishedAt === plan.finishedAt) {
+              set({ activePlan: null })
+            }
+          }, 10_000)
+          return { activePlan: plan }
+        }
+        case 'failed': {
+          const plan: ActivePlan = {
+            ...(s.activePlan ?? { goal: ev.goal ?? '', steps: [], currentStep: -1 }),
+            phase:      'failed',
+            reason:     ev.reason,
+            finishedAt: Date.now(),
+          }
+          setTimeout(() => {
+            const cur = get().activePlan
+            if (cur?.finishedAt === plan.finishedAt) set({ activePlan: null })
+          }, 10_000)
+          return { activePlan: plan }
+        }
+        case 'cancelled': {
+          return { activePlan: null }
+        }
+        default:
+          return {}
+      }
+    })
+  },
 }))
