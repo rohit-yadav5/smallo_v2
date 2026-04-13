@@ -19,6 +19,26 @@ _CONVERSATIONAL_BYPASS = re.compile(
     re.IGNORECASE,
 )
 
+# Web/browser-related inputs that should fall through to the LLM so the
+# web agent tools (web_navigate, web_search, deep_research, …) can handle them.
+# Any match → router returns None without consulting any plugin.
+_WEB_BYPASS = re.compile(
+    r"""
+    \bin\s+browser\b                    # "open X in browser"
+    | open\s+\S+\.(?:com|org|net|io|co|app|dev|ai)\b  # "open instagram.com"
+    | (?:^|\s)go\s+to\s                 # "go to ..."
+    | (?:^|\s)navigate\s+to\s          # "navigate to ..."
+    | (?:^|\s)search\s+google          # "search google for ..."
+    | (?:^|\s)fetch\s+http             # "fetch https://..."
+    | (?:^|\s)web_                     # raw tool names like "web_navigate"
+    | \bwebsite\b                      # "open the website"
+    | \bwebpage\b                      # "load the webpage"
+    | \bbrowse\s+to\b                  # "browse to ..."
+    | \burl\b                          # "open this url"
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 
 class PluginRouter:
     """
@@ -56,9 +76,18 @@ class PluginRouter:
         """
         Try each plugin in priority order.
         Returns a PluginResult on first match, else None.
-        Conversational/personal questions are bypassed immediately.
+
+        Bypass order (checked before any plugin):
+          1. Conversational/personal questions → LLM
+          2. Web/browser-related commands      → LLM → web agent tools
         """
-        if _CONVERSATIONAL_BYPASS.search(user_text.strip()):
+        text = user_text.strip()
+
+        if _CONVERSATIONAL_BYPASS.search(text):
+            return None
+
+        if _WEB_BYPASS.search(text):
+            print("  [plugin] web bypass — routing to LLM/web-agent", flush=True)
             return None
 
         for plugin in self._plugins:

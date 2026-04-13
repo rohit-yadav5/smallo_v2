@@ -85,6 +85,30 @@ class _ToolRegistry:
             for t in self._tools.values()
         ]
 
+    def get_menu(self) -> list[dict]:
+        """Return name + one-line description only (no parameter schemas).
+
+        Used for the main system-prompt tool menu.  Full parameter schemas
+        are only needed during the forced-tool-call fallback pass, which
+        calls a specific tool by name.  Keeping the menu slim reduces the
+        injected-prompt size from ~6 KB to ~0.8 KB.
+        """
+        return [
+            {"name": t.name, "description": t.description}
+            for t in self._tools.values()
+        ]
+
+    def get_schema(self, name: str) -> dict | None:
+        """Return the full schema for a single named tool, or None."""
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        return {
+            "name":        tool.name,
+            "description": tool.description,
+            "parameters":  tool.parameters,
+        }
+
     def names(self) -> list[str]:
         """Return all registered tool names."""
         return list(self._tools.keys())

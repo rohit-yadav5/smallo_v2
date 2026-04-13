@@ -55,11 +55,28 @@ class LatencyTracker:
         self._turn_start = time.perf_counter()
         self._steps      : list[tuple[str, float, list[str]]] = []
         self._current_notes: list[str] = []
+        self._header_lines : list[str] = []   # printed before steps in summary
+        self._cancel_step  : bool      = False # set inside step() to skip recording
 
     def note(self, msg: str):
         """Attach a detail annotation to the current step."""
         self._current_notes.append(msg)
         print(f"  {_DIM}       ↳ {msg}{_R}", flush=True)
+
+    def header(self, msg: str):
+        """
+        Record a turn-level note shown at the top of the summary box.
+        Use this for metadata like 'source: text input' that isn't a timed step.
+        """
+        self._header_lines.append(msg)
+
+    def cancel_current_step(self):
+        """
+        Cancel the currently-running step() so it is NOT appended to the
+        step list and does NOT appear in summary().  Must be called from
+        inside an active `with tracker.step(...)` block.
+        """
+        self._cancel_step = True
 
     def record(self, name: str, duration: float, notes: list[str] | None = None):
         """Record a pre-measured step (timing captured externally).
@@ -89,16 +106,26 @@ class LatencyTracker:
         print(f"\n  {_BLU}{_B}▶ {name}{_R}  {_DIM}({ts}){_R}", flush=True)
         t0 = time.perf_counter()
         self._current_notes = []
+        self._cancel_step   = False   # reset for each new step
         try:
             yield
         except Exception as exc:
             duration = time.perf_counter() - t0
-            self._steps.append((name, duration, list(self._current_notes)))
+            if not self._cancel_step:
+                self._steps.append((name, duration, list(self._current_notes)))
             print(f"  {_RED}{_B}✗ {name}{_R}  {_RED}{duration:.3f}s  ERROR: {exc}{_R}", flush=True)
             raise
         duration   = time.perf_counter() - t0
         cumulative = time.perf_counter() - self._turn_start
-        col        = _speed_color(duration)
+        if self._cancel_step:
+            # Step was cancelled (e.g. text input arrived during voice wait).
+            # Don't record in _steps; print a dim cancellation notice instead.
+            print(
+                f"  {_DIM}[{name} step cancelled — not counted in summary]{_R}",
+                flush=True,
+            )
+            return
+        col = _speed_color(duration)
         self._steps.append((name, duration, list(self._current_notes)))
         print(
             f"  {col}{_B}✓ {name}{_R}"
@@ -119,6 +146,8 @@ class LatencyTracker:
 
         print()
         print(f"  {_WHT}{_B}┌─ Turn {self._turn} Breakdown {'─' * 38}┐{_R}")
+        for line in self._header_lines:
+            print(f"  {_WHT}│{_R}  {_CYN}{line}{_R}")
         for name, dur, notes in self._steps:
             col    = _speed_color(dur)
             pct    = (dur / total * 100) if total > 0 else 0

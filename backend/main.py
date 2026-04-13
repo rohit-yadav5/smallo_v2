@@ -448,7 +448,7 @@ def _extract_identity_facts(user_text: str) -> list[dict]:
 
 def _build_memory_context(user_text: str) -> str:
     try:
-        memories = retrieve_memories(user_text, top_k=10)
+        memories = retrieve_memories(user_text, top_k=5)
     except Exception as e:
         print(f"    [memory] retrieval failed: {e}")
         return user_text
@@ -684,6 +684,7 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     try:
         user_text = _text_input_queue.get_nowait()
         _text_input_branch = True
+        tracker.header("source: text input")
         print(f"  [text_input] processing: {user_text[:80]!r}", flush=True)
     except queue.Empty:
         # ── Voice path — track STT timing ─────────────────────────────────────
@@ -696,10 +697,12 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
             while True:
                 try:
                     user_text = _text_input_queue.get_nowait()
-                    rec_secs  = time.perf_counter() - rec_start
                     _text_input_branch = True
+                    # Cancel the STT step so it doesn't pollute the turn summary
+                    # with misleading "STT Xs" timing (that was just idle waiting).
+                    tracker.cancel_current_step()
+                    tracker.header("source: text input")
                     print(f"  [text_input] processing: {user_text[:80]!r}", flush=True)
-                    tracker.note("source: text input (arrived during voice wait)")
                     break
                 except queue.Empty:
                     pass

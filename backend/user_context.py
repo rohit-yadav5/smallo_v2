@@ -117,26 +117,37 @@ def get_user_context() -> dict:
 
 
 def get_context_prompt() -> str:
-    """Return a compact formatted string for injection into the LLM system prompt."""
+    """
+    Return a compact formatted string for injection into the LLM system prompt.
+
+    Hard-capped at 300 characters to keep prompt context size small so the LLM
+    gives full attention to mandatory-action rules.  Facts and goals are
+    truncated to the most recent items before capping.
+    """
     with _lock:
         ctx = dict(_cache)
 
     name  = ctx.get("name") or "unknown"
-    goals = ctx.get("goals", [])
+    goals = ctx.get("goals", [])[-3:]    # at most 3 most-recent goals
     prefs = ctx.get("preferences", {})
-    facts = ctx.get("facts", [])
+    facts = ctx.get("facts", [])[-3:]    # at most 3 most-recent facts
 
-    goals_str = ", ".join(goals) if goals else "none yet"
+    goals_str = ", ".join(goals) if goals else "none"
     prefs_str = (
-        ";  ".join(f"{k}: {v}" for k, v in prefs.items())
-        if prefs else "none yet"
+        "; ".join(f"{k}: {v}" for k, v in list(prefs.items())[:3])
+        if prefs else "none"
     )
-    facts_str = ";  ".join(facts) if facts else "none yet"
+    facts_str = "; ".join(facts) if facts else "none"
 
-    return (
-        "## What I know about you\n"
-        f"Name: {name}\n"
-        f"Goals: {goals_str}\n"
-        f"Preferences: {prefs_str}\n"
-        f"Facts: {facts_str}"
+    raw = (
+        f"User: {name}. "
+        f"Goals: {goals_str}. "
+        f"Prefs: {prefs_str}. "
+        f"Facts: {facts_str}."
     )
+
+    # Hard cap — truncate with ellipsis so the LLM doesn't see a dangling sentence
+    if len(raw) > 300:
+        raw = raw[:297] + "..."
+
+    return raw

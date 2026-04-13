@@ -73,47 +73,68 @@ def _sanitize_user_text(text: str) -> str:
 # ── Tool schema injection ─────────────────────────────────────────────────────
 
 def _build_tools_section() -> str:
-    """Return the TOOLS section appended to the system prompt before each call."""
+    """
+    Return the TOOLS section appended to the system prompt before each call.
+
+    Deliberately injects only tool *names + one-line descriptions* (not full
+    parameter schemas).  Full schemas balloon the prompt by ~5 KB and reduce
+    the effective weight of the mandatory-action rules near the top.  The LLM
+    only needs to know which tools exist to pick one; parameter details are
+    provided in the forced-tool-call fallback when needed.
+    """
     reg = _get_registry()
-    schemas = reg.get_schemas()
-    if not schemas:
+    menu = reg.get_menu()
+    if not menu:
         return ""
 
-    schema_json = json.dumps(schemas, indent=2)
+    menu_lines = "\n".join(f"  {t['name']}: {t['description']}" for t in menu)
     return (
         "\n\n## Available tools\n\n"
-        "You can call tools by emitting a JSON block anywhere in your response "
-        "in this exact format:\n\n"
+        "When you need to call a tool, emit ONLY this block — no other text:\n\n"
         "<tool_call>\n"
         '{\"name\": \"tool_name\", \"args\": {\"arg1\": \"value1\"}}\n'
         "</tool_call>\n\n"
-        "You may call one tool per response. After calling a tool you will "
-        "receive the result and can continue your response.\n\n"
-        f"Available tools:\n{schema_json}\n\n"
-        "Rules:\n"
-        "- Call a tool ONLY when you genuinely need it to answer the user.\n"
-        "- Never fabricate tool results.\n"
-        "- Always tell the user what you are about to do before the tool call.\n"
-        "- After getting a result, summarise it naturally in your voice.\n"
-        "- Never reveal internal tool names or raw JSON to the user.\n\n"
+        "Do NOT put any text before or after the <tool_call> block.  "
+        "Do NOT say 'I will do X' before calling a tool.  "
+        "Just emit the block.  The tool runs and returns a result; then you can speak.\n\n"
+        f"Tools:\n{menu_lines}\n\n"
         "## Autonomous planner — MANDATORY RULE\n\n"
-        "CRITICAL: If the user's request requires MORE THAN ONE action, tool call, "
-        "or operation to complete — you MUST emit a plan trigger.  No exceptions.\n\n"
+        "If the user's request requires MORE THAN ONE tool call or action — "
+        "emit a plan trigger instead of a tool call.  No exceptions.\n\n"
         "Trigger conditions (emit <start_plan> if ANY apply):\n"
-        "- Request mentions 'then', 'and then', 'after that', 'next', 'finally', "
-        "'also' when describing a sequence of actions\n"
+        "- Request mentions 'then', 'and then', 'after that', 'next', 'finally' "
+        "when describing a sequence of actions\n"
         "- Request requires calling more than one tool\n"
-        "- Request involves creating + reading/verifying a file\n"
-        "- Request describes multi-stage research or computation\n\n"
-        "Do NOT trigger the planner for:\n"
-        "- Single questions (even with tools): 'What is X', 'Read file Y'\n"
-        "- Chitchat and opinions\n\n"
-        "When triggering the planner, emit EXACTLY this and NOTHING else:\n\n"
+        "- Request involves creating + verifying a file, or multi-stage research\n\n"
+        "Do NOT trigger the planner for single-tool requests: 'go to X', 'search for Y', "
+        "'read file Z'.\n\n"
+        "Plan trigger format (emit EXACTLY this, nothing else):\n\n"
         "<start_plan>\n"
         "one sentence description of the goal\n"
-        "</start_plan>\n\n"
-        "Do NOT say 'I will', 'Please wait', or narrate.  "
-        "Just emit the tag and stop.  The planner handles execution."
+        "</start_plan>"
+    )
+
+
+def _build_forced_tool_system() -> str:
+    """
+    Minimal system prompt for the forced-tool-call fallback pass.
+
+    Used when Pass 1 returns a conversational response despite the user
+    clearly requesting an action.  Contains only the tool menu + strict
+    instruction — no memory context, no persona, no clutter.
+    """
+    reg = _get_registry()
+    menu_lines = "\n".join(
+        f"  {t['name']}: {t['description']}" for t in reg.get_menu()
+    )
+    return (
+        "You are a tool dispatcher.  The user wants to perform an action.\n"
+        "You MUST respond with ONLY a <tool_call> block — no other text whatsoever.\n\n"
+        "Format:\n"
+        "<tool_call>\n"
+        "{\"name\": \"tool_name\", \"args\": {\"arg\": \"value\"}}\n"
+        "</tool_call>\n\n"
+        f"Available tools:\n{menu_lines}"
     )
 
 
@@ -226,6 +247,40 @@ _MULTI_STEP_PATTERNS: list = [
                re.IGNORECASE | re.DOTALL),
 ]
 
+# ── Single-action tool-required patterns ──────────────────────────────────────
+# When the LLM gives a conversational response but the user's request clearly
+# requires ONE tool call, these patterns trigger a second minimal forced-tool
+# LLM call that discards the conversational response and returns the tool result.
+# Each pattern must match the FULL user utterance (after stripping memory ctx).
+_TOOL_REQUIRED_PATTERNS: list[re.Pattern] = [
+    # Web navigation / opening
+    re.compile(
+        r'\b(go\s+to|open|navigate\s+to|visit|load)\b.*(\.com|\.org|\.net|\.io|\.co|http)',
+        re.IGNORECASE,
+    ),
+    # Web search
+    re.compile(
+        r'\b(search|look\s+up|find|google)\b.+\b(for|about|on)\b',
+        re.IGNORECASE,
+    ),
+    # Web content read / fetch
+    re.compile(
+        r'\b(read|fetch|get|scrape)\b.*(page|site|url|http|\.com)',
+        re.IGNORECASE,
+    ),
+    # Web interaction
+    re.compile(r'\b(click|type\s+in|fill\s+in|submit)\b', re.IGNORECASE),
+    # File operations
+    re.compile(
+        r'\b(create|write|save|read)\b.*(file|\.txt|\.md|\.py|\.json|\.csv)',
+        re.IGNORECASE,
+    ),
+    # Terminal / shell
+    re.compile(r'\b(run|execute|open\s+terminal)\b', re.IGNORECASE),
+    # Reminders
+    re.compile(r'\b(remind\s+me|set\s+a\s+reminder|alert\s+me)\b', re.IGNORECASE),
+]
+
 
 def _extract_tool_call(text: str) -> tuple[str | None, dict | None, str]:
     """
@@ -281,6 +336,56 @@ def _run_tool_sync(name: str, args: dict) -> str:
     else:
         # Fallback: own event loop (works for all tools except reminder asyncio tasks)
         return asyncio.run(reg.dispatch(name, args))
+
+
+# ── Forced tool-call fallback ─────────────────────────────────────────────────
+
+def _forced_tool_call_stream(
+    original_utterance: str,
+    safe_text: str,
+    system_suffix: str,
+) -> "Iterator[str] | None":
+    """
+    Make a minimal second LLM call that is almost certain to emit a tool call.
+
+    Called when Pass 1 returned a conversational response but the user's
+    request matches one of the _TOOL_REQUIRED_PATTERNS.  The prompt is stripped
+    to just system-instruction + tool menu + the raw user request — no memory
+    context, no persona padding — so the small model has no excuse to waffle.
+
+    Returns a token iterator (same type as normal response) on success,
+    or None if the focused call also fails to produce a tool call (rare —
+    caller falls back to the original conversational tokens).
+    """
+    messages = [
+        {"role": "system", "content": _build_forced_tool_system()},
+        {"role": "user",   "content": original_utterance},
+    ]
+    print(
+        f"  [llm] 🔁 forced tool-call pass  (utterance: {original_utterance[:60]!r})",
+        flush=True,
+    )
+    full_text, tokens = _collect_full_response(_stream_ollama(messages))
+
+    tool_name, tool_args, _ = _extract_tool_call(full_text)
+    if tool_name is None:
+        print(
+            f"  [llm] ⚠ forced tool-call pass produced no <tool_call>: "
+            f"{full_text[:120]!r}",
+            flush=True,
+        )
+        return None
+
+    print(
+        f"  [llm] 🔧 forced tool call: {tool_name}  args={tool_args}",
+        flush=True,
+    )
+    # Re-use the standard two-pass handler with a synthetic full_text
+    synthetic = (
+        f'<tool_call>{{"name": "{tool_name}", "args": {json.dumps(tool_args or {})}}}'
+        f"</tool_call>"
+    )
+    return _handle_tool_or_plain(synthetic, [synthetic], safe_text, system_suffix)
 
 
 # ── Public interface ──────────────────────────────────────────────────────────
@@ -383,20 +488,24 @@ def ask_llm_stream(user_text: str, system_suffix: str = "") -> Iterator[str]:
     tool_result = _run_tool_sync(tool_name, tool_args or {})
     print(f"  [llm] 🔧 tool result ({len(tool_result)} chars): {tool_result[:120]}", flush=True)
 
-    # ── Pass 2: stream final answer with tool result in history ───────────
-    # Inject: assistant message (preamble + tool call) + tool result
+    # ── Pass 2: stream brief final answer with tool result in history ─────
+    # The user can see the browser / file / terminal output directly, so the
+    # verbal response should be at most one sentence of confirmation.
     history = [
         {"role": "assistant", "content": full_text},
         {"role": "tool",      "content": f"Tool '{tool_name}' result:\n{tool_result}"},
     ]
     messages2 = _build_messages(safe_text, system_suffix=system_suffix, extra_history=history)
-    # Swap the trailing user message so it doesn't duplicate the original
-    # question — instead ask the LLM to continue naturally from the result.
     messages2[-1] = {
         "role":    "user",
-        "content": "Please summarise the tool result naturally and answer my request.",
+        "content": (
+            "The tool just executed and the user can see the result directly "
+            "(browser is visible, file was written, etc.). "
+            "Respond in ONE sentence only — briefly confirm what happened or "
+            "add one useful observation.  Do NOT repeat the user's request.  "
+            "Do NOT describe what you did step by step."
+        ),
     }
-
     print(f"  [llm] ▶ pass-2 stream after tool '{tool_name}'", flush=True)
     yield from _stream_ollama(messages2)
 
@@ -430,7 +539,13 @@ def _handle_tool_or_plain(
     messages2 = _build_messages(safe_text, system_suffix=system_suffix, extra_history=history)
     messages2[-1] = {
         "role":    "user",
-        "content": "Please summarise the tool result naturally and answer my request.",
+        "content": (
+            "The tool just executed and the user can see the result directly "
+            "(browser is visible, file was written, etc.). "
+            "Respond in ONE sentence only — briefly confirm what happened or "
+            "add one useful observation.  Do NOT repeat the user's request.  "
+            "Do NOT describe what you did step by step."
+        ),
     }
     print(f"  [llm] ▶ pass-2 stream after tool '{tool_name}'", flush=True)
     yield from _stream_ollama(messages2)
@@ -468,6 +583,13 @@ def ask_llm_turn(
         print(f"  [llm] 🗺 plan trigger: '{goal}'", flush=True)
         return {"type": "plan_trigger", "goal": goal}
 
+    # Extract the bare user utterance (strip memory-context prefix if present)
+    utterance = (
+        safe_text.split("\n\nUser: ", 1)[-1].strip()
+        if "\n\nUser: " in safe_text
+        else safe_text.strip()
+    )
+
     # ── Fallback multi-step detection (safety net) ─────────────────────────
     # If the LLM forgot to emit <start_plan> AND produced no tool call,
     # check whether the user's input text strongly signals a multi-step task.
@@ -475,18 +597,30 @@ def ask_llm_turn(
     if tool_name_check is None:
         match_count = sum(1 for p in _MULTI_STEP_PATTERNS if p.search(safe_text))
         if match_count >= 2:
-            # Extract just the user utterance (strip memory-context prefix if present)
-            utterance = (
-                safe_text.split("\n\nUser: ", 1)[-1].strip()
-                if "\n\nUser: " in safe_text
-                else safe_text.strip()
-            )
             print(
                 f"  [llm] ⚠ forced plan trigger — LLM forgot to emit one "
                 f"({match_count} multi-step patterns matched in user input)",
                 flush=True,
             )
             return {"type": "plan_trigger", "goal": utterance}
+
+    # ── Single-action tool-required fallback ───────────────────────────────
+    # If the LLM gave a conversational response AND no tool call was detected
+    # AND the user's utterance matches a tool-required pattern, force a second
+    # minimal LLM call that reliably extracts the correct tool call.
+    tool_name_check2, _, _ = _extract_tool_call(full_text)
+    if tool_name_check2 is None:
+        if any(p.search(utterance) for p in _TOOL_REQUIRED_PATTERNS):
+            print(
+                f"  [llm] ⚠ no tool call but utterance matches tool-required pattern "
+                f"— running forced tool-call pass",
+                flush=True,
+            )
+            forced = _forced_tool_call_stream(utterance, safe_text, system_suffix)
+            if forced is not None:
+                return forced
+            # Forced pass also failed — fall through to conversational response
+            print("  [llm] ⚠ forced tool-call pass failed — using conversational response", flush=True)
 
     # ── Otherwise: delegate to tool-or-plain handler (a generator) ─────────
     return _handle_tool_or_plain(full_text, tokens, safe_text, system_suffix)

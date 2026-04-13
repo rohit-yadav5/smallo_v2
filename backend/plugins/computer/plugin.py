@@ -8,6 +8,18 @@ import pyautogui
 
 from plugins.base import BasePlugin, PluginResult
 
+# If the target of an "open" command looks like a URL or web domain,
+# refuse to handle it — let it fall through to the LLM / web agent.
+_WEB_TARGET = re.compile(
+    r"https?://"                            # explicit URL
+    r"|\.(?:com|org|net|io|co|app|dev|ai)\b"  # TLD suffix
+    r"|\bin\s+browser\b"                    # "X in browser"
+    r"|\bbrowser\b"                         # bare "browser"
+    r"|\binstagram\b|\btwitter\b|\bgoogle\b"  # common sites by name
+    r"|\bfacebook\b|\byoutube\b|\btiktok\b",
+    re.IGNORECASE,
+)
+
 
 class ComputerPlugin(BasePlugin):
     NAME = "computer"
@@ -46,6 +58,31 @@ class ComputerPlugin(BasePlugin):
         (r"\b(?:run|execute)\s+(?:the\s+)?command\s+(?P<cmd>.+)", "run_shell"),
         (r"\bin\s+(?:the\s+)?terminal\s+(?P<cmd>.+)", "run_shell"),
     ]
+
+    def match(self, user_text: str) -> tuple[str, re.Match] | None:
+        """
+        Extend base matching with a web-target safety filter.
+
+        If the matched intent is open_target but the captured target looks like
+        a URL, domain, or browser reference, refuse the match so the router
+        falls through to the LLM and the web agent handles it instead.
+        """
+        result = super().match(user_text)
+        if result is None:
+            return None
+        action, m = result
+        if action == "open_target":
+            try:
+                target = m.group("target").strip()
+            except IndexError:
+                target = ""
+            if _WEB_TARGET.search(target) or _WEB_TARGET.search(user_text):
+                print(
+                    f"  [computer] open_target refused — web target: {target!r}",
+                    flush=True,
+                )
+                return None
+        return result
 
     def execute(self, user_text: str, action: str, match: re.Match) -> PluginResult:
         handler = getattr(self, f"_{action}", None)
