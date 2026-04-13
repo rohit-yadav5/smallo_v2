@@ -693,6 +693,19 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
                 speech_start_s, speech_end_s = _speech_events.get(timeout=0.5)
                 # STT branch — extract audio & transcribe
                 audio_data = _audio_buffer.read_window(speech_start_s, speech_end_s)
+
+                # Guard: VAD can fire on a window that maps to no buffered frames yet.
+                # Passing a zero-length array to Whisper raises:
+                #   "zero-size array to reduction operation maximum which has no identity"
+                if audio_data is None or len(audio_data) == 0:
+                    print(
+                        f"  [stt] skipping transcription — empty audio window "
+                        f"[{speech_start_s:.3f}s → {speech_end_s:.3f}s]",
+                        flush=True,
+                    )
+                    _emit("VOICE_STATE", {"state": "idle"})
+                    return False
+
                 dur      = len(audio_data) / 16_000
                 rec_secs = time.perf_counter() - rec_start
 
@@ -881,7 +894,7 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
             f"first token in {first_token:.3f}s  ({n_tok} tokens total)"
         ])
         tracker.record("TTS", tts_synth_s, [
-            f"Piper synth first sentence: {tts_synth_s:.3f}s  ({n_sent} sentences)"
+            f"Kokoro synth first sentence: {tts_synth_s:.3f}s  ({n_sent} sentences)"
         ])
         tracker.record("Speaking", speaking_s, [
             f"audio playback: {speaking_s:.3f}s"
