@@ -515,6 +515,35 @@ def _token_broadcaster(token_gen, interrupt_event=None):
 
 
 # ──────────────────────────────────────────────────
+# Control-tag stripping (safety net before TTS)
+# ──────────────────────────────────────────────────
+
+def strip_control_tags(text: str) -> str:
+    """
+    Remove <start_plan>…</start_plan> and <tool_call>…</tool_call> blocks
+    from any text string before it reaches TTS synthesis.
+
+    These tags should never appear in spoken output.  The system prompt and
+    summarize-specific suffix prevent them in the first place; this is the
+    last-resort safety net.
+    """
+    text = re.sub(r"<start_plan>.*?</start_plan>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<tool_call>.*?</tool_call>",   "", text, flags=re.DOTALL)
+    return text.strip()
+
+
+# System-prompt suffix injected into every plugin-summarize LLM call.
+# Prevents the LLM from emitting <start_plan> or <tool_call> tags when it
+# only needs to produce a 1-3 sentence spoken summary.
+_PLUGIN_SUMMARIZE_SUFFIX = (
+    "CRITICAL: You are summarizing a data result for the user.  "
+    "Do NOT emit <start_plan> tags.  Do NOT emit <tool_call> tags.  "
+    "Do NOT use markdown, bullet points, or lists.  "
+    "Respond in plain spoken English only — 1 to 3 sentences maximum."
+)
+
+
+# ──────────────────────────────────────────────────
 # Plugin helpers
 # ──────────────────────────────────────────────────
 
@@ -546,12 +575,19 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
         with tracker.step("LLM + TTS (plugin summarize)"):
             try:
                 ai_text, tts_timing = speak_stream(
-                    _token_broadcaster(ask_llm_stream(summary_prompt), _interrupt_event),
+                    _token_broadcaster(
+                        ask_llm_stream(summary_prompt, system_suffix=_PLUGIN_SUMMARIZE_SUFFIX),
+                        _interrupt_event,
+                    ),
                     _interrupt_event,
                 )
             except Exception as e:
                 print(f"    [tts] plugin speak_stream error: {e}")
                 return ""
+        # Safety net: strip any control tags that escaped the system-prompt guard
+        if "<start_plan>" in ai_text or "<tool_call>" in ai_text:
+            print("  [plugin] ⚠ stripping control tags that leaked into plugin summary", flush=True)
+            ai_text = strip_control_tags(ai_text)
         print(f"    [tts] first word: {tts_timing['first_word_secs']:.3f}s  |  total: {tts_timing['total_secs']:.3f}s")
         print(f"\n  Plugin summary: {ai_text}\n")
         return ai_text

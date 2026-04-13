@@ -17,7 +17,8 @@ async def navigate(page: Page, url: str) -> str:
         url = "https://" + url
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        return f"Navigated to: {page.title()} — {page.url}"
+        title = await page.title()   # page.title() is a coroutine — must await
+        return f"Navigated to: {title} — {page.url}"
     except Exception as exc:
         return f"Navigation failed: {exc}"
 
