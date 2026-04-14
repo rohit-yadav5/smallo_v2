@@ -64,13 +64,14 @@ class BrowserManager:
         self._playwright = await async_playwright().start()
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
-            headless=False,
+            headless=True,
             args=[
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-blink-features=AutomationControlled",  # reduces bot detection
+                "--disable-infobars",
             ],
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1280, "height": 800},
         )
         # Reuse an existing page if one is already open (e.g. after a reload),
         # otherwise open a fresh one.
@@ -106,17 +107,33 @@ class BrowserManager:
 
     async def screenshot_b64(self) -> str:
         """
-        Capture the current viewport as JPEG and return as a base64 string.
+        Capture the current viewport and return as a base64 string.
 
-        Uses JPEG at 75% quality to keep payloads small (~50–200 KB for a
-        1280×720 viewport).  Falls back to a lower quality if the result
-        exceeds 500 KB after encoding.
+        Waits briefly for pending renders/animations to settle before
+        capturing, so the screenshot reflects fully-rendered content.
+
+        Strategy:
+          1. Wait up to 2s for networkidle (catches late JS renders).
+          2. Extra 300ms for final animation frames.
+          3. Take a PNG screenshot clipped to the exact viewport.
+          4. If over 400 KB, re-take as JPEG at 70% quality.
         """
         pg = await self.page()
-        data = await pg.screenshot(type="jpeg", quality=75, full_page=False)
-        if len(data) > 500_000:
-            # Still too large — drop quality further
-            data = await pg.screenshot(type="jpeg", quality=40, full_page=False)
+
+        # Let any in-flight requests and render passes finish
+        try:
+            await pg.wait_for_load_state("networkidle", timeout=2_000)
+        except Exception:
+            pass   # live-updating pages never reach networkidle — that's fine
+        await asyncio.sleep(0.3)
+
+        clip = {"x": 0, "y": 0, "width": 1280, "height": 800}
+        data = await pg.screenshot(type="png", full_page=False, clip=clip)
+
+        if len(data) > 400_000:
+            # PNG too large — re-capture as JPEG
+            data = await pg.screenshot(type="jpeg", quality=70, full_page=False, clip=clip)
+
         return base64.b64encode(data).decode()
 
     async def shutdown(self) -> None:
