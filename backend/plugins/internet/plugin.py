@@ -41,6 +41,27 @@ class InternetPlugin(BasePlugin):
         (r"\bwhat\s+is\s+(?P<topic>(?!(?:your|my|his|her|our|their|its|it\b|this|that|a\b|an\b|the\b)\b).+)", "wikipedia"),
     ]
 
+    # Arithmetic operator pattern — used to guard the wikipedia intent.
+    _OPERATOR_RE = re.compile(r'[\+\*\/=]|\b\d+\s*-\s*\d+\b', re.IGNORECASE)
+
+    def match(self, user_text: str) -> tuple[str, re.Match] | None:
+        """
+        Extend BasePlugin.match with guards for the wikipedia action:
+          • Query must be ≥ 4 words (avoids swallowing "what is 2 + 2")
+          • Query must not contain arithmetic operators (+, *, /, =, N-N)
+        If the wikipedia pattern would match but the guards fail, skip it and
+        let the LLM answer directly.
+        """
+        for pattern, action in self._compiled:
+            m = pattern.search(user_text)
+            if m:
+                if action == "wikipedia":
+                    word_count = len(user_text.split())
+                    if word_count < 4 or self._OPERATOR_RE.search(user_text):
+                        continue   # guards failed — skip this match
+                return action, m
+        return None
+
     def execute(self, user_text: str, action: str, match: re.Match) -> PluginResult:
         handler = getattr(self, f"_{action}", None)
         if handler is None:

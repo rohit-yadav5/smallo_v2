@@ -84,6 +84,53 @@ def _parse_and_filter_steps(text: str) -> list[str]:
     return steps
 
 
+def _validate_steps(steps: list[str], goal: str) -> list[str]:
+    """
+    Remove steps that are irrelevant to the goal.
+
+    Filters out:
+      - monitor_add / watch steps unless the goal explicitly asks for monitoring
+      - reminder / set_reminder steps unless the goal explicitly asks for reminders
+      - read_file steps that reference a non-existent path not mentioned in the goal
+      - list_reminders, cancel_reminder, list_monitors — maintenance tools that
+        should never appear in a goal-directed plan
+
+    All filtered steps are logged at [planner] level.
+    """
+    goal_lower = goal.lower()
+    mentions_monitor  = any(w in goal_lower for w in ("monitor", "watch", "notify when", "alert when", "track changes"))
+    mentions_reminder = any(w in goal_lower for w in ("remind", "reminder", "alert me in"))
+    # A plausible file path exists if the goal mentions a specific path fragment
+    goal_has_path     = any(ind in goal_lower for ind in ("~/", "/users/", ".txt", ".md", ".py", ".json", ".csv", "desktop", "documents"))
+
+    valid: list[str] = []
+    for step in steps:
+        step_lower = step.lower()
+
+        # Maintenance-only tools that should never appear in a goal plan
+        if any(tok in step_lower for tok in ("list_reminders", "cancel_reminder", "list_monitors", "monitor_remove")):
+            print(f"  [planner] ⚠ filtered irrelevant step: {step!r}", flush=True)
+            continue
+
+        # Monitor steps only allowed when goal asks for monitoring
+        if "monitor" in step_lower and not mentions_monitor:
+            print(f"  [planner] ⚠ filtered irrelevant step: {step!r}", flush=True)
+            continue
+
+        # Reminder steps only allowed when goal asks for a reminder
+        if any(tok in step_lower for tok in ("set_reminder", "reminder")) and not mentions_reminder:
+            print(f"  [planner] ⚠ filtered irrelevant step: {step!r}", flush=True)
+            continue
+
+        # read_file steps only allowed when the goal references a real path
+        if "read_file" in step_lower and not goal_has_path:
+            print(f"  [planner] ⚠ filtered irrelevant step: {step!r}", flush=True)
+            continue
+
+        valid.append(step)
+    return valid
+
+
 # ── Stripped system prompts for planner-internal LLM calls ───────────────────
 # These calls must NOT use the orchestrator system prompt, which contains
 # <start_plan> trigger instructions.  Using a minimal system prompt here
@@ -147,41 +194,63 @@ async def run_plan(
     print(f"\n  [planner] 🗺 starting plan: '{goal}'", flush=True)
 
     try:
+        # ── Pre-plan: verify goal genuinely requires 3+ steps ─────────────
+        # Small models eagerly trigger plans for single-tool goals like
+        # "remind me in 30 seconds to drink water".  Ask the LLM once more
+        # with a stripped checker prompt.  If it says NO: execute the goal
+        # as a single step directly, skipping the full plan machinery.
+        _check_prompt = (
+            f"Does this goal require 3 or more distinct tool calls to complete?\n"
+            f"Goal: {goal}\n"
+            "Answer YES or NO only."
+        )
+        _check_ans = await _llm(_check_prompt, system=_CHECKER_SYSTEM)
+        if "no" in _check_ans.strip().lower()[:10]:
+            print(
+                f"  [plan] cancelled — single-tool goal, routing to normal turn",
+                flush=True,
+            )
+            result = await _execute_step_with_tools(goal, "")
+            # Emit the result as a normal spoken response
+            broadcast("VOICE_STATE", {"state": "speaking"})
+            words = result.split()
+            for j, word in enumerate(words):
+                token = word if j == 0 else " " + word
+                broadcast("LLM_TOKEN", {"token": token, "done": False})
+                await asyncio.sleep(0.005)
+            broadcast("LLM_TOKEN", {"token": "", "done": True, "token_count": len(words)})
+            try:
+                from tts import speak as _speak
+                stop_event = threading.Event()
+                await asyncio.to_thread(_speak, result, stop_event)
+            except Exception as exc:
+                print(f"  [planner] ⚠ TTS speak failed (single-step): {exc}", flush=True)
+            broadcast("VOICE_STATE", {"state": "idle"})
+            return
+
         # ── Phase 1: DECOMPOSE ────────────────────────────────────────────
         tool_names = ", ".join(_tool_registry.names()) or "none"
         decompose_prompt = "\n".join([
-            "You are a task planner. Break the following goal into a numbered list",
-            "of concrete, actionable steps.",
+            "Break this goal into numbered steps.",
             "",
-            "RULES for steps:",
-            "1. Each step must be ONE of:",
-            "   - A single tool call (write a file, fetch a URL, run a command, etc.)",
-            "   - A single question answered from previous step results",
-            "2. Each step must name the specific tool or action:",
-            '   GOOD: "Write \'hello from Small O\' to ~/Desktop/notes.txt using write_file"',
-            '   GOOD: "Fetch https://wikipedia.org text using fetch_url"',
-            '   GOOD: "Read ~/Desktop/notes.txt using read_file"',
-            '   BAD:  "Set the path"',
-            '   BAD:  "Verify the result"',
-            '   BAD:  "Notify the user"',
-            "3. Use the exact URLs, file paths, and content from the original goal.",
-            "   Do not substitute example.com or placeholder values.",
-            "4. Do NOT include steps for things you will say or narrate.",
-            "   Only include steps that require a tool call or computation.",
-            "5. Maximum 6 steps. If you need more, combine related actions.",
-            "",
-            f"Available tools: {tool_names}",
+            "RULES:",
+            "1. Every step must directly contribute to achieving the goal.",
+            f"2. Steps must only use tools that exist: {tool_names}",
+            "3. Do not include steps for monitoring, reminders, or file operations",
+            "   unless the goal explicitly asks for them.",
+            "4. Maximum 6 steps. If you need more, the goal is too broad.",
+            "5. Each step must be one concrete action: one tool call or one answer.",
+            "6. Do not include steps like 'verify', 'confirm', or 'check if done' —",
+            "   the planner handles that automatically.",
+            "7. Do not invent file paths, URLs, or resources that don't exist yet.",
             "",
             f"Goal: {goal}",
             "",
-            "Respond ONLY with the numbered list. No explanation, no preamble.",
-            "Format exactly:",
-            "1. Step one text",
-            "2. Step two text",
-            "3. Step three text",
+            "Respond with a numbered list only. No explanation. No preamble.",
         ])
         decompose_resp = await _llm(decompose_prompt)
         steps = _parse_and_filter_steps(decompose_resp)
+        steps = _validate_steps(steps, goal)
 
         if not steps:
             # LLM didn't produce a numbered list — treat the whole goal as one step

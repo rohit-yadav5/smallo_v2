@@ -86,6 +86,15 @@ async def _reminder_task(reminder_id: int, message: str, delay_s: int) -> None:
     else:
         print(f"  [reminder] ⚠ no broadcast_fn set — reminder '{message}' lost", flush=True)
 
+    # Speak the reminder aloud through the TTS pipeline.
+    # Lazy import avoids a circular dependency at module load time
+    # (main.py → reminder_tool → tts is fine; tts never imports reminder_tool).
+    try:
+        from tts import speak  # noqa: PLC0415
+        await asyncio.to_thread(speak, f"Reminder: {message}", None)
+    except Exception as exc:
+        print(f"  [reminder] ⚠ TTS speak failed: {exc}", flush=True)
+
 
 # ── Internal shutdown helper ──────────────────────────────────────────────────
 
@@ -108,18 +117,56 @@ async def shutdown_all_reminders() -> None:
         print(f"  [reminder] shutdown: cancelled {len(ids)} pending reminder(s)", flush=True)
 
 
+# ── Delay resolver ────────────────────────────────────────────────────────────
+
+def _resolve_delay(args: dict) -> int | str:
+    """
+    Defensively extract the delay in seconds from LLM args.
+
+    The canonical key is ``delay_seconds``.  The LLM occasionally hallucinates
+    alternative names.  We detect all known variants and normalise to seconds.
+
+    Returns:
+      int   — resolved delay in seconds (always ≥ 1)
+      str   — error message if no time argument found at all
+    """
+    # Seconds variants
+    for key in ("delay_seconds", "delay_s", "seconds"):
+        if key in args:
+            return max(1, int(args[key]))
+    # Minutes variants
+    for key in ("delay_minutes", "delay_m", "minutes", "minutes_remaining"):
+        if key in args:
+            return max(1, int(args[key]) * 60)
+    # Hours variants
+    for key in ("delay_hours", "hours"):
+        if key in args:
+            return max(1, int(args[key]) * 3600)
+    # None of the expected keys found
+    return "Error: no time argument provided. Specify delay_seconds (e.g. delay_seconds: 30)."
+
+
 # ── Tool handlers ─────────────────────────────────────────────────────────────
 
 async def _set_reminder(args: dict) -> str:
     global _next_id
 
-    message: str = args.get("message", "").strip()
-    delay_s: int = int(args.get("delay_seconds", 60))
+    # Message is optional — default to "Reminder" so a missing arg never fails.
+    message: str = (args.get("message") or "Reminder").strip()
 
-    if not message:
-        return "Error: 'message' argument is required."
-    if delay_s < 1:
-        delay_s = 1
+    delay_result = _resolve_delay(args)
+    if isinstance(delay_result, str):
+        # _resolve_delay returned an error message
+        return delay_result
+    delay_s: int = delay_result
+
+    # 24-hour safety guard — unusually far reminders are probably a unit mistake.
+    if delay_s > 86_400:
+        hours = delay_s / 3600
+        return (
+            f"That's {hours:.1f} hours away — did you mean seconds instead of minutes? "
+            f"Reply with the correct time (e.g. 'remind me in 30 seconds to ...')."
+        )
 
     reminder_id = _next_id
     _next_id   += 1
@@ -176,19 +223,27 @@ async def _cancel_reminder(args: dict) -> str:
 registry.register(ToolDefinition(
     name="set_reminder",
     description=(
-        "Schedule a reminder that will be sent to the user after a delay. "
-        "Fires a proactive notification — use for timers, countdowns, and follow-ups."
+        "Set a reminder that fires after a delay. "
+        "delay_seconds MUST be in seconds — convert any minutes or hours before calling. "
+        "Examples: '30 seconds' → delay_seconds: 30, "
+        "'2 minutes' → delay_seconds: 120, '1 hour' → delay_seconds: 3600. "
+        "The reminder will be spoken aloud and shown as a notification."
     ),
     parameters={
         "type": "object",
         "properties": {
             "message": {
                 "type": "string",
-                "description": "The reminder message to deliver to the user.",
+                "description": "What to remind the user about.",
             },
             "delay_seconds": {
                 "type": "integer",
-                "description": "How many seconds from now to fire the reminder.",
+                "description": (
+                    "How many seconds until the reminder fires. "
+                    "Convert time units: 1 minute = 60 seconds, 1 hour = 3600 seconds. "
+                    "Always use seconds. "
+                    "Examples: '30 seconds' → 30, '2 minutes' → 120, '1 hour' → 3600."
+                ),
             },
         },
         "required": ["message", "delay_seconds"],

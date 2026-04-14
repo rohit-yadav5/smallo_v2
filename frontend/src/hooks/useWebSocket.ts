@@ -209,6 +209,29 @@ export function useWebSocket() {
       }
     }
 
+    // ── Notification sound ─────────────────────────────────────────────────
+    // Two-tone descending ping via Web Audio API.  No external library, no file.
+    // Called for every PROACTIVE_EVENT (reminder or web_monitor alert).
+    function playNotificationSound() {
+      try {
+        const ctx  = new AudioContext()
+        const osc  = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.connect(gain)
+        gain.connect(ctx.destination)
+        osc.frequency.setValueAtTime(880, ctx.currentTime)
+        osc.frequency.setValueAtTime(660, ctx.currentTime + 0.1)
+        gain.gain.setValueAtTime(0.3, ctx.currentTime)
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4)
+        osc.start(ctx.currentTime)
+        osc.stop(ctx.currentTime + 0.4)
+        // Allow GC after the tone finishes
+        osc.onended = () => ctx.close().catch(() => {})
+      } catch {
+        // AudioContext not available (e.g. in tests) — silently skip
+      }
+    }
+
     // ── Event handler ──────────────────────────────────────────────────────
     function handleEvent(msg: WSEvent) {
       switch (msg.event) {
@@ -294,6 +317,8 @@ export function useWebSocket() {
 
         case 'PROACTIVE_EVENT': {
           const pev = msg.data
+          // Play a sound for every proactive event regardless of type
+          playNotificationSound()
           if (pev.event === 'web_monitor') {
             // Webpage change alert — show with URL context
             store.addPluginNotification({

@@ -56,6 +56,24 @@ def _is_web_query(text: str) -> bool:
     return any(re.search(p, tl) for p in _WEB_BYPASS_PATTERNS)
 
 
+# Math / calculation patterns — LLM can answer these inline, no plugin needed.
+# Any match → skip ALL plugins, route directly to LLM.
+_MATH_PATTERNS: list[str] = [
+    r'\d+\s*[\+\-\*\/\^%]\s*\d+',   # arithmetic: 2 + 2, 10 * 5, 50%
+    r'\bwhat\s+is\s+\d',             # "what is 2...", "what is 15%..."
+    r'\bcalculate\b',
+    r'\bconvert\b.*\bto\b',          # unit conversions: "convert 5 km to miles"
+    r'\bhow\s+much\s+is\b',
+    r'\bsquare\s+root\b',
+    r'\bpercent(?:age)?\s+of\b',     # "15 percent of 340"
+]
+
+
+def _is_math_query(text: str) -> bool:
+    """Return True if the query is a pure math/calculation question the LLM can answer inline."""
+    return any(re.search(p, text, re.IGNORECASE) for p in _MATH_PATTERNS)
+
+
 class PluginRouter:
     """
     Auto-discovers all plugins/*/plugin.py files, instantiates each plugin,
@@ -96,6 +114,7 @@ class PluginRouter:
         Bypass order (checked before any plugin):
           1. Conversational/personal questions → LLM
           2. Web/browser-related commands      → LLM → web agent tools
+          3. Math / calculation questions      → LLM (no plugin can answer these)
         """
         text = user_text.strip()
 
@@ -104,6 +123,10 @@ class PluginRouter:
 
         if _WEB_BYPASS.search(text) or _is_web_query(text):
             print("  [plugin] web bypass — routing to LLM/web-agent", flush=True)
+            return None
+
+        if _is_math_query(text):
+            print("  [plugin] math query — routing to LLM", flush=True)
             return None
 
         for plugin in self._plugins:
