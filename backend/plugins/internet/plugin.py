@@ -9,6 +9,15 @@ from plugins.base import BasePlugin, PluginResult
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SmallO/2.0)"}
 
+# Strip non-ASCII characters that TTS can't speak (emoji, ideographs, etc.).
+# Keeps standard Latin, extended Latin, and common punctuation/dashes.
+_NON_SPEAKABLE_RE = re.compile(r'[^\x00-\x7F\u00C0-\u024F\u2010-\u2027]')
+
+
+def _clean_for_tts(text: str) -> str:
+    """Remove emoji and other non-speakable Unicode before text goes to TTS."""
+    return _NON_SPEAKABLE_RE.sub('', text).strip()
+
 
 class InternetPlugin(BasePlugin):
     NAME = "internet"
@@ -101,7 +110,12 @@ class InternetPlugin(BasePlugin):
         target = quote(city) if city else ""
         url = f"https://wttr.in/{target}?format=3"
         resp = requests.get(url, headers=_HEADERS, timeout=10)
-        text = resp.text.strip()
+        # Force UTF-8 decode — requests sometimes misdetects encoding on wttr.in
+        # responses, producing mangled characters like "ð«" instead of weather emoji.
+        text = resp.content.decode("utf-8", errors="replace").strip()
+        # Strip emoji and non-speakable characters so TTS doesn't attempt to
+        # read "thunderstorm emoji" aloud, which sounds terrible.
+        text = _clean_for_tts(text)
         if not text or "Unknown location" in text:
             text = "Could not get weather. Try saying 'weather in London'."
             return {"text": text, "direct": True, "plugin": self.NAME, "action": "weather"}

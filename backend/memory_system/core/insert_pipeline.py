@@ -131,4 +131,22 @@ def insert_memory(input_data: dict):
     conn.commit()
     conn.close()
 
+    # ── Memory cap check ────────────────────────────────────────────────────
+    # After every insert, check if we've exceeded MAX_MEMORIES.
+    # If so, evict lowest-importance memories and rebuild FAISS.
+    # This keeps retrieval latency bounded and RAM usage predictable.
+    try:
+        from memory_system.embeddings.eviction import (  # noqa: PLC0415
+            MAX_MEMORIES, get_memory_count, evict_and_rebuild,
+        )
+        current_count = get_memory_count()
+        if current_count > MAX_MEMORIES:
+            print(
+                f"  [memory] cap exceeded ({current_count}/{MAX_MEMORIES}) — evicting",
+                flush=True,
+            )
+            evict_and_rebuild()
+    except Exception as _evict_exc:
+        print(f"  [memory] eviction check failed (non-fatal): {_evict_exc}", flush=True)
+
     return memory_id

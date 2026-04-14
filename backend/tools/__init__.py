@@ -18,7 +18,8 @@ Re-export the registry singleton so callers can use:
 from tools.registry import registry  # noqa: F401  (re-export)
 
 # Importing each module triggers its self-registration side-effect.
-from tools import file_tool      # noqa: F401
-from tools import browser_tool   # noqa: F401
-from tools import terminal_tool  # noqa: F401
-from tools import reminder_tool  # noqa: F401
+from tools import file_tool          # noqa: F401
+from tools import browser_tool       # noqa: F401
+from tools import terminal_tool      # noqa: F401
+from tools import reminder_tool      # noqa: F401
+from tools import close_heavy_tabs   # noqa: F401

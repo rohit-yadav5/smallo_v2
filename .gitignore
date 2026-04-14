@@ -97,3 +97,6 @@ backend/xstorage/
 *.tmp
 *.bak
 *.orig
+
+#extra
+docs/smallo_arhitecture.md

@@ -70,6 +70,16 @@ class BrowserManager:
                 "--no-default-browser-check",
                 "--disable-blink-features=AutomationControlled",  # reduces bot detection
                 "--disable-infobars",
+                # ── Memory reduction flags ────────────────────────────────
+                "--disable-extensions",
+                "--disable-plugins",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-dev-shm-usage",
+                "--js-flags=--max-old-space-size=256",    # cap JS heap to 256 MB
+                "--memory-pressure-thresholds=critical=0.9",
             ],
             viewport={"width": 1280, "height": 800},
         )
@@ -107,16 +117,16 @@ class BrowserManager:
 
     async def screenshot_b64(self) -> str:
         """
-        Capture the current viewport and return as a base64 string.
+        Capture the current viewport and return as a base64 JPEG string.
 
-        Waits briefly for pending renders/animations to settle before
-        capturing, so the screenshot reflects fully-rendered content.
+        Always uses JPEG at quality=60 — ~70% smaller than PNG with no
+        visible quality loss for the WebViewer use case.  Waits briefly
+        for pending renders to settle before capturing.
 
         Strategy:
           1. Wait up to 2s for networkidle (catches late JS renders).
           2. Extra 300ms for final animation frames.
-          3. Take a PNG screenshot clipped to the exact viewport.
-          4. If over 400 KB, re-take as JPEG at 70% quality.
+          3. Capture JPEG quality=60 clipped to 1280×800 viewport.
         """
         pg = await self.page()
 
@@ -127,13 +137,12 @@ class BrowserManager:
             pass   # live-updating pages never reach networkidle — that's fine
         await asyncio.sleep(0.3)
 
-        clip = {"x": 0, "y": 0, "width": 1280, "height": 800}
-        data = await pg.screenshot(type="png", full_page=False, clip=clip)
-
-        if len(data) > 400_000:
-            # PNG too large — re-capture as JPEG
-            data = await pg.screenshot(type="jpeg", quality=70, full_page=False, clip=clip)
-
+        data = await pg.screenshot(
+            type="jpeg",
+            quality=60,
+            full_page=False,
+            clip={"x": 0, "y": 0, "width": 1280, "height": 800},
+        )
         return base64.b64encode(data).decode()
 
     async def shutdown(self) -> None:

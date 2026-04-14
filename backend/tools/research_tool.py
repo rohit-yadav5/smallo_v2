@@ -91,10 +91,11 @@ async def _synthesize_async(topic: str, all_text: str) -> str:
             resp = await client.post(
                 LLM_CONFIG.ollama_url,
                 json={
-                    "model":    LLM_CONFIG.model,
-                    "messages": [{"role": "user", "content": synthesis_prompt}],
-                    "stream":   False,
-                    "options":  {"num_predict": 1500},
+                    "model":      LLM_CONFIG.model,
+                    "messages":   [{"role": "user", "content": synthesis_prompt}],
+                    "stream":     False,
+                    "keep_alive": 0,   # evict after synthesis — frees RAM immediately
+                    "options":    {"num_predict": 1500},
                 },
             )
             resp.raise_for_status()

@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats, PlanEvent, WebScreenshot } from '../types/events'
+import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats, PlanEvent, WebScreenshot, SystemEvent } from '../types/events'
 
 export interface PlanStepState {
   text:    string
@@ -34,6 +34,13 @@ interface AppState {
 
   latestScreenshot:         WebScreenshot | null  // most recent browser viewport
 
+  /** RAM available in GB from last ram_report event */
+  availableRamGb:           number | null
+  /** 'low' | 'medium' | 'high' — null until first ram_report */
+  ramPressure:              'low' | 'medium' | 'high' | null
+  /** Transient toast for low_memory / model_swap events */
+  systemToast:              { message: string; kind: 'warning' | 'info' } | null
+
   setVoiceState:            (state: VoiceState) => void
   setWsConnected:           (connected: boolean) => void
   setMicActive:             (v: boolean) => void
@@ -51,6 +58,8 @@ interface AppState {
   setLatency:               (ms: number) => void
   handlePlanEvent:          (ev: PlanEvent) => void
   setScreenshot:            (shot: WebScreenshot) => void
+  handleSystemEvent:        (ev: SystemEvent) => void
+  clearSystemToast:         () => void
 }
 
 // Module-level map — cancels stale glow timers when same node glows again
@@ -71,6 +80,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   currentStreamId:     null,
   activePlan:          null,
   latestScreenshot:    null,
+  availableRamGb:      null,
+  ramPressure:         null,
+  systemToast:         null,
 
   setVoiceState:        (state)     => set({ voiceState: state }),
   setWsConnected:       (connected) => set({ wsConnected: connected }),
@@ -235,4 +247,26 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     })
   },
+
+  handleSystemEvent: (ev) => {
+    if (ev.event === 'ram_report') {
+      // Derive pressure level from available_gb using the same thresholds as backend
+      const gb = ev.available_gb ?? null
+      const pressure: 'low' | 'medium' | 'high' | null =
+        gb === null ? null : gb < 1.5 ? 'high' : gb < 3.0 ? 'medium' : 'low'
+      set({ availableRamGb: gb, ramPressure: pressure })
+    } else if (ev.event === 'low_memory') {
+      const gb = ev.available_gb ?? null
+      if (gb !== null) set({ availableRamGb: gb, ramPressure: 'high' })
+      // Show a transient amber warning toast — auto-cleared after 6s
+      set({ systemToast: { message: ev.message, kind: 'warning' } })
+      setTimeout(() => set({ systemToast: null }), 6_000)
+    } else if (ev.event === 'model_swap') {
+      // Show a brief info toast (model change notification)
+      set({ systemToast: { message: ev.message, kind: 'info' } })
+      setTimeout(() => set({ systemToast: null }), 4_000)
+    }
+  },
+
+  clearSystemToast: () => set({ systemToast: null }),
 }))

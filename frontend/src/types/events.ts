@@ -82,6 +82,16 @@ export interface PlanEvent {
   reason?:     string        // failed
 }
 
+/** RAM pressure system events emitted by the backend. */
+export interface SystemEvent {
+  /** Sub-type of system event */
+  event: 'low_memory' | 'model_swap' | 'ram_report'
+  /** Human-readable message */
+  message: string
+  /** Available RAM in GB at time of event */
+  available_gb?: number
+}
+
 export type WSEvent =
   | { event: 'STT_RESULT';       data: STTResult }
   | { event: 'STT_PARTIAL';      data: STTPartial }
@@ -90,6 +100,7 @@ export type WSEvent =
   | { event: 'VOICE_STATE';      data: VoiceStateEvent }
   | { event: 'MEMORY_EVENT';     data: MemoryEvent }
   | { event: 'SYSTEM_STATS';     data: SystemStats }
+  | { event: 'SYSTEM_EVENT';     data: SystemEvent }
   | { event: 'AUDIO_CHUNK';      data: AudioChunkMeta }
   | { event: 'AUDIO_DONE';       data: Record<string, never> }
   | { event: 'AUDIO_ABORT';      data: Record<string, never> }

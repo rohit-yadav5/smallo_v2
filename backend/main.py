@@ -53,7 +53,7 @@ import re
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 
 from pathlib import Path
 
@@ -113,6 +113,9 @@ from stt.text_input import watch_text_input
 
 # ── Phase 2: autonomous planner ───────────────────────────────────────────────
 from planner.planner import run_plan
+from utils.ram_monitor import get_available_ram_gb, get_memory_pressure, can_load_7b
+from config.llm import LLM_CONFIG
+from llm.main_llm import set_conversation_active
 
 # ── Phase 3: web agent + deep research ───────────────────────────────────────
 import web_agent                                          # triggers tool self-registration  # noqa: F401
@@ -120,6 +123,9 @@ from web_agent.agent import set_broadcast_fn as _set_web_broadcast
 from web_agent.monitor import web_monitor
 from web_agent.browser import BrowserManager
 import tools.research_tool                               # registers deep_research tool  # noqa: F401
+import tools.close_heavy_tabs                            # registers close_heavy_tabs tool  # noqa: F401
+
+import httpx as _httpx
 
 
 # ──────────────────────────────────────────────────
@@ -156,6 +162,12 @@ _current_voice_state: str = "idle"
 # Injected into the next turn's LLM prompt so the bot knows where it left off.
 _interrupted_partial: str = ""
 
+# ── Conversation-active tracking (drives 3-tier keep_alive in main_llm) ──────
+# Updated to current time whenever a real turn processes user input.
+# After 90 s of silence the model switches back to KEEP_ALIVE_IDLE (0 s).
+_last_turn_time: float = 0.0
+_CONVERSATION_IDLE_S: float = 90.0
+
 # Protects _interrupted_partial across VAD callback and pipeline threads
 _barge_in_lock: threading.Lock = threading.Lock()
 
@@ -167,6 +179,25 @@ _CANCEL_WORDS = frozenset([
     "stop the task", "cancel the plan", "stop what you're doing",
     "stop that", "cancel that", "never mind",
 ])
+
+# ── Short-term recent-actions context buffer ──────────────────────────────────
+# Holds the last 5 planner completions / tool results so the LLM can answer
+# follow-up questions ("where did you save that?") without relying on semantic
+# memory retrieval which may not rank the action highly enough.
+_recent_actions: deque = deque(maxlen=5)
+
+
+def add_recent_action(action: str) -> None:
+    """Add a recent action string to the short-term buffer.  Thread-safe (GIL)."""
+    _recent_actions.append(action)
+
+
+def get_recent_actions_prompt() -> str:
+    """Return formatted recent-actions text for LLM system-prompt injection."""
+    if not _recent_actions:
+        return ""
+    lines = "\n".join(f"- {a}" for a in _recent_actions)
+    return f"## Recent actions\n{lines}"
 
 
 async def _launch_plan(goal: str) -> None:
@@ -184,6 +215,13 @@ async def _launch_plan(goal: str) -> None:
     )
     print(f"  [plan] task created: {_current_plan_task.get_name()}", flush=True)
 
+    # After the plan finishes (success or failure), pre-warm 3b model so the
+    # next conversation turn doesn't wait for a cold model load (120 s window).
+    def _on_plan_done(task: asyncio.Task) -> None:
+        asyncio.ensure_future(_preload_model(LLM_CONFIG.model, keep_alive_s=120))
+
+    _current_plan_task.add_done_callback(_on_plan_done)
+
 
 async def _cancel_plan() -> None:
     """Cancel the active plan task if one is running."""
@@ -196,6 +234,41 @@ async def _cancel_plan() -> None:
             pass
         print("  [plan] task cancelled by user", flush=True)
     _current_plan_task = None
+
+
+# ── Predictive model preloader ────────────────────────────────────────────────
+
+async def _preload_model(model: str, keep_alive_s: int = 60) -> None:
+    """
+    Warm up an Ollama model by sending a 1-token dummy request.
+
+    Uses keep_alive="{keep_alive_s}s" so the model stays warm for one
+    typical turn cycle (default 60 s) without hogging RAM indefinitely.
+
+    Called as a fire-and-forget background task at:
+      • Server startup (after warmup completes)
+      • End of each plan (pre-load 3b so next conversation turn is instant)
+      • STT start (while Whisper is running, model may warm up)
+
+    Non-blocking — failures are logged but never raised.
+    """
+    from config.llm import LLM_CONFIG as _cfg  # noqa: PLC0415
+    try:
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            await client.post(
+                _cfg.ollama_url,
+                json={
+                    "model":      model,
+                    "messages":   [{"role": "user", "content": "hi"}],
+                    "stream":     False,
+                    "keep_alive": f"{keep_alive_s}s",
+                    "options":    {"num_predict": 1},
+                },
+            )
+        print(f"  [llm] preloaded {model} (keep_alive={keep_alive_s}s)", flush=True)
+    except Exception as exc:
+        print(f"  [llm] preload {model} failed (non-fatal): {exc}", flush=True)
+
 
 # Streaming STT — one StreamingTranscriber per utterance.
 # It runs Whisper every 500 ms during speech (live word-by-word display)
@@ -291,6 +364,14 @@ def _on_speech_start(start_s: float) -> None:
         print(f"  [vad] ⚡ BARGE-IN  speech_start={start_s:.3f}s", flush=True)
         abort_speaking()
         _interrupt_event.set()
+    # Predictive preload: warm the 3b model while Whisper transcribes.
+    # By the time STT finishes (~1-2s), the model cold-load (~2-3s) may already
+    # be done — eliminating the delay on the first token of the response.
+    if _loop:
+        asyncio.run_coroutine_threadsafe(
+            _preload_model(LLM_CONFIG.model, keep_alive_s=120),
+            _loop,
+        )
 
 
 def _on_speech_end(start_s: float, end_s: float) -> None:
@@ -338,6 +419,10 @@ def _audio_ingestion_loop():
 
     _audio_buffer = RollingAudioBuffer(capacity_s=60, sample_rate=16_000)
 
+    # ── VAD model RAM note (A4) ───────────────────────────────────────────────
+    # SileroVAD (~8 MB) is loaded here and stays resident in RAM permanently.
+    # This is intentional — VAD must be always-on so we never gate the mic.
+    # 8 MB is negligible; do NOT lazy-load or unload between utterances.
     oracle = VADOracle(
         onset_threshold  = 0.50,
         offset_threshold = 0.35,
@@ -413,12 +498,14 @@ _MEMORY_TYPE_MAP = {
     "ActionMemory":       "action",
     "IdeaMemory":         "idea",
     "ConsolidatedMemory": "idea",
+    "PlannerMemory":      "action",   # planner actions surface as action-type memories
 }
 
 _MEMORY_IMPORTANCE = {
     "PersonalMemory":     8,
     "ConsolidatedMemory": 9,
     "DecisionMemory":     7,
+    "PlannerMemory":      7,   # plan completions are significant events
     "ProjectMemory":      6,
     "ArchitectureMemory": 6,
     "ActionMemory":       5,
@@ -650,6 +737,38 @@ def _pipeline_loop():
     t0 = time.perf_counter(); tts_warmup(); print(f"    TTS  ready  ({time.perf_counter()-t0:.2f}s)", flush=True)
     t0 = time.perf_counter(); llm_warmup(); print(f"    LLM  ready  ({time.perf_counter()-t0:.2f}s)", flush=True)
 
+    # ── RAM report after models load ─────────────────────────────────────────
+    _ram_available = get_available_ram_gb()
+    _ram_pressure  = get_memory_pressure()
+    print(f"  [ram] {_ram_available:.1f} GB available — pressure: {_ram_pressure}", flush=True)
+    if _ram_pressure == "high":
+        print(
+            "  [ram] ⚠ WARNING: very low RAM — 7b planner disabled, close other apps",
+            flush=True,
+        )
+    elif _ram_pressure == "medium":
+        print(
+            "  [ram] ⚡ CAUTION: limited RAM — 7b will only load if > 3 GB free at plan time",
+            flush=True,
+        )
+    else:
+        print(
+            f"  [ram] ✓ OK — qwen2.5:7b planner {'enabled' if can_load_7b() else 'unavailable'}",
+            flush=True,
+        )
+    _emit("SYSTEM_EVENT", {
+        "event":        "ram_report",
+        "message":      f"{_ram_available:.1f} GB free — {_ram_pressure} pressure",
+        "available_gb": round(_ram_available, 2),
+    })
+
+    # ── Predictive preload: warm 3b model after startup so first turn is fast ──
+    if _loop:
+        asyncio.run_coroutine_threadsafe(
+            _preload_model(LLM_CONFIG.model, keep_alive_s=120),
+            _loop,
+        )
+
     print("\n  Loading plugins...")
     try:
         router = PluginRouter()
@@ -712,6 +831,14 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     rec_secs:   float = 0.0
     trans_secs: float = 0.0
     _text_input_branch = False
+
+    # ── Conversation-active idle check ────────────────────────────────────────
+    # If the user has been silent for > 90 s, mark conversation as inactive so
+    # the next LLM call uses KEEP_ALIVE_IDLE (0 s) and frees RAM when idle.
+    global _last_turn_time
+    if _last_turn_time > 0 and (time.time() - _last_turn_time) > _CONVERSATION_IDLE_S:
+        set_conversation_active(False)
+        print("  [pipeline] conversation idle >90 s — model keep_alive → IDLE", flush=True)
 
     # ── Fast path: check for immediately-available text input ─────────────────
     # Text input turns bypass the STT step entirely (source="text").
@@ -791,12 +918,23 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
                 if time.perf_counter() - rec_start >= TIMEOUT_S:
                     print("  [pipeline] no input for 30 s — going idle")
                     _emit("VOICE_STATE", {"state": "idle"})
-                    return False
+                    return False  # caller will check 90 s idle on next turn
 
         if not _text_input_branch:
             print(f"  [stt] wait={rec_secs:.3f}s  transcription={trans_secs:.3f}s")
 
     print(f"\n  {'You typed' if _text_input_branch else 'You said'}: {user_text}\n")
+
+    # ── Mark conversation as active — model stays warm for next 120 s ─────────
+    _last_turn_time = time.time()
+    set_conversation_active(True)
+    # Preload the 3b model now so it's warm before we need it this turn.
+    # Fire-and-forget; LLM call will race against this and usually win.
+    if _loop:
+        asyncio.run_coroutine_threadsafe(
+            _preload_model(LLM_CONFIG.model, keep_alive_s=120),
+            _loop,
+        )
 
     if not user_text.strip():
         _emit("VOICE_STATE", {"state": "idle"})
@@ -907,8 +1045,11 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         _interrupted_partial = ""
 
     # ── LLM (with plan-trigger and tool detection) ───────────────────────
-    # Inject user context into every LLM call as a system-prompt suffix.
+    # Inject user context + recent planner actions into every LLM call.
     user_ctx_suffix = get_context_prompt()
+    recent_actions_ctx = get_recent_actions_prompt()
+    if recent_actions_ctx:
+        user_ctx_suffix = (user_ctx_suffix + "\n\n" + recent_actions_ctx).strip()
 
     print(f"  [pipeline] calling ask_llm_turn  |  prompt {len(prompt):,} chars", flush=True)
     try:
@@ -1038,6 +1179,10 @@ async def _ws_handler(ws):
     except Exception:
         pass
 
+    # Preload 3b model the moment a frontend connects — by the time the user
+    # types their first message the model is already warm (120 s window).
+    asyncio.ensure_future(_preload_model(LLM_CONFIG.model, keep_alive_s=120))
+
     try:
         async for message in ws:
             if isinstance(message, bytes):
@@ -1116,6 +1261,62 @@ async def _main():
         _text_input_queue.put_nowait(text)
 
     asyncio.create_task(watch_text_input(_on_text_transcript))
+
+    # ── Memory cap: startup eviction check ───────────────────────────────────
+    try:
+        from memory_system.embeddings.eviction import (  # noqa: PLC0415
+            MAX_MEMORIES, get_memory_count, evict_and_rebuild,
+        )
+        _mem_count = get_memory_count()
+        print(f"  [memory] startup count: {_mem_count}  cap: {MAX_MEMORIES}", flush=True)
+        if _mem_count > MAX_MEMORIES:
+            print(
+                f"  [memory] startup eviction: {_mem_count} > {MAX_MEMORIES} — rebuilding...",
+                flush=True,
+            )
+            await asyncio.get_running_loop().run_in_executor(None, evict_and_rebuild)
+    except Exception as _exc:
+        print(f"  [memory] startup eviction check failed (non-fatal): {_exc}", flush=True)
+
+    # ── Memory lifecycle background tasks ─────────────────────────────────────
+    # run_lifecycle_maintenance: archives stale low-importance memories every 6 h.
+    # run_weekly_consolidation:  clusters similar memories (LLM call) every 24 h.
+    # Both are synchronous; offloaded to thread pool via run_in_executor.
+    # LLM calls inside consolidation use KEEP_ALIVE_IDLE (conversation_active=False
+    # since we're in a background thread, not a user turn).
+    from memory_system.lifecycle.worker import run_lifecycle_maintenance as _run_maint  # noqa: PLC0415
+    from memory_system.lifecycle.consolidator import run_weekly_consolidation as _run_consol  # noqa: PLC0415
+
+    async def _memory_maintenance_loop():
+        """Archive stale memories every 6 hours (runs immediately on first tick)."""
+        while True:
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, _run_maint)
+                print("  [memory] lifecycle maintenance complete", flush=True)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                print(f"  [memory] lifecycle maintenance error (non-fatal): {exc}", flush=True)
+            await asyncio.sleep(6 * 3600)   # every 6 hours
+
+    async def _memory_consolidation_loop():
+        """Consolidate similar memory clusters every 24 hours."""
+        # First run after 24 h — consolidation is expensive (LLM calls).
+        # Do NOT run at startup; wait for data to accumulate.
+        await asyncio.sleep(24 * 3600)
+        while True:
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, _run_consol)
+                print("  [memory] consolidation complete", flush=True)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                print(f"  [memory] consolidation error (non-fatal): {exc}", flush=True)
+            await asyncio.sleep(24 * 3600)   # every 24 hours
+
+    asyncio.create_task(_memory_maintenance_loop(), name="memory-maintenance")
+    asyncio.create_task(_memory_consolidation_loop(), name="memory-consolidation")
+    print("  [memory] lifecycle tasks scheduled (maintenance=6h, consolidation=24h)", flush=True)
 
     threading.Thread(target=_stats_loop,           daemon=True).start()
     threading.Thread(target=_audio_ingestion_loop, daemon=True).start()

@@ -32,8 +32,20 @@ from typing import Iterator
 
 import requests
 
-from config.llm import LLM_CONFIG
+from config.llm import LLM_CONFIG, KEEP_ALIVE_IDLE, KEEP_ALIVE_ACTIVE
 from llm.SYSTEM_PROMPT import SYSTEM_PROMPT
+
+# ── Conversation-active flag ──────────────────────────────────────────────────
+# True  → model uses KEEP_ALIVE_ACTIVE (120 s) so it stays warm between turns.
+# False → model uses KEEP_ALIVE_IDLE   (0 s) and evicts after each call.
+# Set by main.py at turn start; cleared after 90 s of no input.
+_conversation_active: bool = False
+
+
+def set_conversation_active(active: bool) -> None:
+    """Called by main.py to switch keep_alive tier for the 3b model."""
+    global _conversation_active
+    _conversation_active = active
 
 
 # ── Tool registry (imported lazily to avoid circular imports at module load) ──
@@ -185,13 +197,16 @@ def _stream_ollama(messages: list[dict]) -> Iterator[str]:
     total_chars = sum(len(m["content"]) for m in messages)
     print(f"  [llm] ▶ {total_chars:,} char prompt → {LLM_CONFIG.model}", flush=True)
 
+    # Use ACTIVE keep_alive during a conversation so entity extraction and the
+    # main LLM call share a warm model; idle turns still evict immediately.
+    _keep_alive = KEEP_ALIVE_ACTIVE if _conversation_active else KEEP_ALIVE_IDLE
     response = requests.post(
         LLM_CONFIG.ollama_url,
         json={
             "model":      LLM_CONFIG.model,
             "messages":   messages,
             "stream":     True,
-            "keep_alive": -1,
+            "keep_alive": _keep_alive,
             "options": {
                 "num_predict": LLM_CONFIG.num_predict,
                 "stop":        ["User:", "Human:"],
@@ -405,7 +420,7 @@ def warmup() -> None:
                     {"role": "user",   "content": "Hi."},
                 ],
                 "stream":     False,
-                "keep_alive": -1,
+                "keep_alive": 0,   # don't hold RAM after warmup probe
                 "options":    {"num_predict": 1},
             },
             timeout=30,

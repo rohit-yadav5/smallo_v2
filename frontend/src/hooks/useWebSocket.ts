@@ -349,6 +349,10 @@ export function useWebSocket() {
           store.setScreenshot(msg.data)
           break
 
+        case 'SYSTEM_EVENT':
+          store.handleSystemEvent(msg.data)
+          break
+
         case 'pong':
           clearTimeout(pongTimeout)   // received pong — cancel the close-on-timeout
           break

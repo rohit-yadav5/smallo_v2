@@ -56,6 +56,34 @@ def _is_web_query(text: str) -> bool:
     return any(re.search(p, tl) for p in _WEB_BYPASS_PATTERNS)
 
 
+# "Close heavy tabs" — recognized phrase that maps directly to the close_heavy_tabs tool.
+# Matched before any plugin so it never reaches the computer plugin.
+_CLOSE_HEAVY_TABS_RE = re.compile(
+    r'\bclose\s+(?:heavy|memory|ram|resource)\s+tabs?\b'
+    r'|\bclose\s+(?:youtube|suno|chatgpt|netflix|twitch|spotify)\s+tabs?\b'
+    r'|\bfree\s+(?:up\s+)?(?:ram|memory)\b.*\btabs?\b',
+    re.IGNORECASE,
+)
+
+# Primary file/system creation actions — query mentions the weather (or any other
+# topic) but the *intent* is file creation/writing.  Any match → skip ALL plugins
+# and let the LLM/planner handle the full multi-step task.
+# Rule: if the sentence starts with or prominently contains a file-creation verb,
+# plugins must not intercept on incidental keywords ("weather", "news", etc.).
+_PRIMARY_FILE_ACTION_PATTERNS: list[str] = [
+    r'\b(create|make|write|save|generate)\s+a?\s*(file|document|note|txt|pdf|csv|json)\b',
+    r'\b(write|put|add)\s+.{0,40}\s+(to|into|in)\s+(a\s+)?(file|document|note)\b',
+    r'\bsave\s+.{0,40}\s+to\b.{0,20}\b(file|document|desktop|folder|directory)\b',
+    r'\bcreate\s+.{0,40}\s+on\b.{0,15}\b(desktop|disk|drive|computer)\b',
+]
+
+
+def _has_primary_file_action(text: str) -> bool:
+    """Return True if the query's primary intent is a file/system creation task."""
+    tl = text.lower()
+    return any(re.search(p, tl) for p in _PRIMARY_FILE_ACTION_PATTERNS)
+
+
 # Math / calculation patterns — LLM can answer these inline, no plugin needed.
 # Any match → skip ALL plugins, route directly to LLM.
 _MATH_PATTERNS: list[str] = [
@@ -119,6 +147,17 @@ class PluginRouter:
         text = user_text.strip()
 
         if _CONVERSATIONAL_BYPASS.search(text):
+            return None
+
+        # Intent guard: file/system creation is the primary action — bypass all
+        # plugins even if the query contains a keyword like "weather" or "news".
+        if _has_primary_file_action(text):
+            print("  [plugin] file action detected — bypassing all plugins", flush=True)
+            return None
+
+        if _CLOSE_HEAVY_TABS_RE.search(text):
+            # Route directly to close_heavy_tabs tool via LLM tool call path
+            print("  [plugin] close heavy tabs — routing to LLM/tool", flush=True)
             return None
 
         if _WEB_BYPASS.search(text) or _is_web_query(text):
