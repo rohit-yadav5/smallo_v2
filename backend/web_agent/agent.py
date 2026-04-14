@@ -151,7 +151,11 @@ async def _web_screenshot(args: dict) -> str:
 
 registry.register(ToolDefinition(
     name        = "web_navigate",
-    description = "Navigate the browser to a URL and return the page title",
+    description = (
+        "Navigate the browser to a URL. Use this as a first step only — "
+        "always follow with web_read or web_search to get actual content. "
+        "Never treat navigation alone as the final answer."
+    ),
     parameters  = {
         "type": "object",
         "properties": {

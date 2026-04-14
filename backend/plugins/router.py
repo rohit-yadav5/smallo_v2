@@ -39,6 +39,22 @@ _WEB_BYPASS = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# Supplemental patterns for named sites and domain patterns.
+# Catches "open github" (no TLD), "find the person who made Linux on github", etc.
+# Kept as a list so new entries are easy to add without modifying a complex regex.
+_WEB_BYPASS_PATTERNS: list[str] = [
+    r'https?://',                                                              # explicit URL
+    r'\b\w+\.(com|org|net|io|dev|ai|co|uk|app)\b',                           # any domain with TLD
+    r'\b(github|youtube|twitter|reddit|instagram|linkedin|google|wikipedia|'
+    r'stackoverflow|hackernews|hacker\s+news|npm|pypi|gitlab|bitbucket)\b',   # named sites
+]
+
+
+def _is_web_query(text: str) -> bool:
+    """Return True if the query references a website, URL, or well-known web service."""
+    tl = text.lower()
+    return any(re.search(p, tl) for p in _WEB_BYPASS_PATTERNS)
+
 
 class PluginRouter:
     """
@@ -86,11 +102,17 @@ class PluginRouter:
         if _CONVERSATIONAL_BYPASS.search(text):
             return None
 
-        if _WEB_BYPASS.search(text):
+        if _WEB_BYPASS.search(text) or _is_web_query(text):
             print("  [plugin] web bypass — routing to LLM/web-agent", flush=True)
             return None
 
         for plugin in self._plugins:
+            # Word-count guard: the computer plugin only handles short, specific
+            # OS-level open commands ("open Finder", "open Safari").  Queries
+            # longer than 4 words — e.g. "open github and find the person who
+            # made Linux" — must never reach computer.open_target.
+            if getattr(plugin, "NAME", "") == "computer" and len(text.split()) > 4:
+                continue
             result = plugin.match(user_text)
             if result is not None:
                 action, match_obj = result
