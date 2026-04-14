@@ -53,16 +53,36 @@ async def execute_step_with_tools(
     )
     from tools.registry import registry as _registry  # noqa: PLC0415
 
-    # Embed tool schemas + a concrete format example directly in the prompt.
-    # The LLM has been observed to produce Python-style calls (write_file(...))
-    # when it only sees the schema list without an explicit usage example.
-    # Showing one CORRECT and three WRONG examples prevents this reliably.
-    schemas_json = json.dumps(_registry.get_schemas(), indent=2)
+    # Build the tool schema list with web_* tools first.
+    # Tool order influences LLM preference — preferred tools must appear at the top.
+    all_schemas = _registry.get_schemas()
+    # Separate web tools, deep_research, and everything else
+    web_schemas   = [s for s in all_schemas if s["name"].startswith("web_")]
+    research_schemas = [s for s in all_schemas if s["name"] == "deep_research"]
+    other_schemas = [
+        s for s in all_schemas
+        if not s["name"].startswith("web_") and s["name"] != "deep_research"
+    ]
+    ordered_schemas = web_schemas + research_schemas + other_schemas
+    schemas_json = json.dumps(ordered_schemas, indent=2)
 
     user_prompt = "\n".join([
         "You are executing one step of an autonomous plan.",
         "",
-        "Available tools:",
+        "## Web browsing rules — READ CAREFULLY",
+        "When a step involves navigating to a website, searching, clicking, or reading",
+        "web content — ALWAYS use the web_* tools. NEVER use fetch_url for websites.",
+        "fetch_url is ONLY for raw file or API downloads that return plain JSON/text.",
+        "web_* tools use a real browser that handles JavaScript and dynamic content.",
+        "",
+        "Priority order for web tasks:",
+        "  1. web_search   — find pages about a topic",
+        "  2. web_navigate — visit a specific URL",
+        "  3. web_read     — get text from the current page",
+        "  4. web_click    — interact with page elements",
+        "  5. fetch_url    — ONLY for raw files/APIs, NEVER for normal websites",
+        "",
+        "Available tools (web tools listed first — prefer them for web tasks):",
         schemas_json,
         "",
         "To use a tool you MUST emit EXACTLY this format — and nothing else:",
@@ -80,6 +100,7 @@ async def execute_step_with_tools(
         '  write_file(path="notes.txt")          <- Python syntax, WRONG',
         '  {"name": "write_file"}                <- missing <tool_call> tags, WRONG',
         "  I will write the file for you.        <- narration only, WRONG",
+        '  fetch_url(url="https://google.com")   <- use web_search instead, WRONG',
         "",
         "If no tool is needed to answer this step, respond with plain text only — no tags.",
         "",

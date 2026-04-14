@@ -84,6 +84,28 @@ def _parse_and_filter_steps(text: str) -> list[str]:
     return steps
 
 
+# ── Stripped system prompts for planner-internal LLM calls ───────────────────
+# These calls must NOT use the orchestrator system prompt, which contains
+# <start_plan> trigger instructions.  Using a minimal system prompt here
+# prevents the LLM from emitting plan triggers inside an already-running plan.
+
+_SUMMARIZER_SYSTEM = (
+    "You are a summarizer. Your only job is to write a short, clear summary "
+    "of what was accomplished. "
+    "NEVER emit <start_plan> tags. "
+    "NEVER emit <tool_call> tags. "
+    "NEVER ask questions. "
+    "Write 2-3 sentences in first person, past tense, spoken directly to the user. "
+    "Example: 'I researched local LLMs and saved a report to your desktop. "
+    "The report covers the latest open-source models and their benchmarks.'"
+)
+
+_CHECKER_SYSTEM = (
+    "Answer with exactly one word: YES or NO. "
+    "Do not explain. Do not emit any tags. Just YES or NO."
+)
+
+
 # ── LLM helper (runs via asyncio.to_thread) ───────────────────────────────────
 
 async def _llm(prompt: str, system: str = "") -> str:
@@ -100,7 +122,9 @@ async def _check_goal_done(goal: str, results: list[str]) -> bool:
         f"Results so far:\n{summary}\n\n"
         "Is the goal fully achieved?  Answer YES or NO and nothing else."
     )
-    answer = await asyncio.to_thread(ask_llm, prompt)
+    # Use the stripped checker system prompt to prevent plan trigger emission
+    full_prompt = f"{_CHECKER_SYSTEM}\n\n{prompt}"
+    answer = await asyncio.to_thread(ask_llm, full_prompt)
     return "yes" in answer.strip().lower()[:10]
 
 
@@ -218,6 +242,7 @@ async def run_plan(
             f"Step {j+1}: {r}" for j, r in enumerate(results)
         )
         summary_prompt = (
+            f"{_SUMMARIZER_SYSTEM}\n\n"
             "Summarise what was accomplished for this goal in 2-3 sentences, "
             "speaking directly to the user in first person as their assistant.  "
             "Be concrete about what was done.  Voice output only — no lists or markdown.\n\n"
@@ -225,6 +250,10 @@ async def run_plan(
         )
         summary = await asyncio.to_thread(ask_llm, summary_prompt)
         summary = summary.strip()
+        # Safety net: strip any control tags that escaped the system-prompt guard
+        import re as _re
+        summary = _re.sub(r"<start_plan>.*?</start_plan>", "", summary, flags=_re.DOTALL).strip()
+        summary = _re.sub(r"<tool_call>.*?</tool_call>",   "", summary, flags=_re.DOTALL).strip()
 
         print(f"  [planner] ✅ complete.  Summary: {summary[:100]}", flush=True)
         broadcast("PLAN_EVENT", {

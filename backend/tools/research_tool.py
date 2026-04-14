@@ -1,254 +1,228 @@
 """backend/tools/research_tool.py — Deep web research tool.
 
-Performs multi-page research:
-  1. DuckDuckGo search (falls back to Google) for the query
-  2. Filter noise/social URLs, visit top N seed pages
-  3. Follow one level of relevant internal links per page (depth-2 crawl)
-  4. Synthesize everything with a local LLM call via llm.main_llm.ask_llm
-  5. Optionally save the report to a file
+Uses the Playwright-backed web_* tools via the ToolRegistry so that:
+  • All browsing is visible in the browser window
+  • JS-heavy pages render correctly
+  • Results are consistent with what the user sees
 
-The tool is registered as "deep_research" in the ToolRegistry.
+Pipeline
+────────
+  1. web_search  → get seed URLs (Playwright, real browser)
+  2. web_navigate + web_read → visit each seed page
+  3. web_links + depth-2 relevance filter → follow sub-links
+  4. Direct async Ollama call → synthesize report
+     (bypasses ask_llm_turn to avoid plan-trigger injection)
+  5. Optionally write_file to save the report
 
-Constraints
-───────────
-  • Uses the shared BrowserManager (same Playwright browser the user sees)
-  • Caps at 5 seed URLs and 3 depth-2 links per seed to keep run time < 60s
-  • Each page capped at 4 000 chars; synthesis prompt capped at 12 000 chars
-  • If save_path provided, writes a markdown report and confirms filename
+Bug-3b guard: the synthesis call uses a stripped prompt with no
+orchestrator behavior, so the LLM cannot emit <tool_call> or
+<start_plan> tags in the report.
 """
 
 import asyncio
+import json
 import re
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote as _url_quote, urlparse
 
-from web_agent.browser import BrowserManager
-from web_agent.actions import navigate, get_page_text, get_page_links
+from config.llm import LLM_CONFIG
 from tools.registry import registry, ToolDefinition
+
+import httpx
 
 
 # ── URL noise filter ──────────────────────────────────────────────────────────
 
-_NOISE_PATTERNS = (
+_NOISE_DOMAINS = (
     "youtube.com", "youtu.be",
     "google.com/products", "google.com/intl",
     "accounts.google.com", "play.google.com", "support.google.com",
     "facebook.com", "instagram.com",
-    "twitter.com", "/x.com/",
-    "tiktok.com",
+    "twitter.com", "x.com",
+    "tiktok.com", "reddit.com/r/",
 )
 
 
-def _is_noise_url(url: str) -> bool:
-    """Return True if the URL matches a known low-quality / social-media domain."""
+def _is_noise(url: str) -> bool:
     lower = url.lower()
-    return any(pat in lower for pat in _NOISE_PATTERNS)
+    return any(pat in lower for pat in _NOISE_DOMAINS)
 
 
-# ── Crawl helpers ─────────────────────────────────────────────────────────────
-
-async def _page_text(page, url: str, max_chars: int = 4_000) -> str:
-    """Navigate to url, return capped page text."""
-    result = await navigate(page, url)
-    if "failed" in result.lower():
-        return f"[failed to load {url}]"
-    return await get_page_text(page, max_chars)
-
-
-async def _seed_urls(page, query: str, n: int = 5) -> list[str]:
-    """
-    Search for query and return up to n clean seed URLs.
-
-    Primary:  DuckDuckGo HTML (no JS required, no bot detection)
-    Fallback: Google with standard query string
-    """
-    encoded = _url_quote(query)
+def _parse_search_urls(raw: str) -> list[str]:
+    """Parse URLs from web_search result ('Title — URL\\n...' format)."""
     urls: list[str] = []
-
-    # ── DuckDuckGo (primary) ──────────────────────────────────────────────
-    ddg_url = f"https://duckduckgo.com/html/?q={encoded}"
-    try:
-        await page.goto(ddg_url, wait_until="domcontentloaded", timeout=20_000)
-        urls = await page.evaluate("""
-            () => Array.from(document.querySelectorAll('.result__a'))
-                       .map(a => a.href)
-                       .filter(h => h && h.startsWith('http'))
-                       .slice(0, 15)
-        """)
-        print(f"  [research] DuckDuckGo returned {len(urls)} raw URL(s)", flush=True)
-    except Exception as exc:
-        print(f"  [research] DuckDuckGo failed ({exc}) — falling back to Google", flush=True)
-
-    # ── Google fallback ───────────────────────────────────────────────────
-    if not urls:
-        google_url = f"https://www.google.com/search?q={encoded}&num=10"
-        try:
-            await page.goto(google_url, wait_until="domcontentloaded", timeout=20_000)
-            urls = await page.evaluate("""
-                () => Array.from(document.querySelectorAll('a[href^="http"]'))
-                           .map(a => a.href)
-                           .filter(h => !h.includes('google.com'))
-                           .slice(0, 15)
-            """)
-            print(f"  [research] Google fallback returned {len(urls)} raw URL(s)", flush=True)
-        except Exception as exc:
-            print(f"  [research] Google fallback also failed: {exc}", flush=True)
-
-    # ── Filter and cap ────────────────────────────────────────────────────
-    clean = [u for u in urls if not _is_noise_url(u)]
-    # Deduplicate while preserving order
     seen: set[str] = set()
-    deduped: list[str] = []
-    for u in clean:
-        if u not in seen:
-            seen.add(u)
-            deduped.append(u)
-
-    if len(deduped) < 3:
-        print(
-            f"  [research] ⚠ only {len(deduped)} seed URL(s) after noise filtering — continuing",
-            flush=True,
-        )
-
-    return deduped[:n]
+    for line in raw.splitlines():
+        url = ""
+        if " — http" in line:
+            url = line.split(" — ", 1)[1].strip()
+        elif line.strip().startswith("http"):
+            url = line.strip()
+        if url and url not in seen and not _is_noise(url):
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
-async def _depth2_links(page, base_url: str, topic: str, max_links: int = 3) -> list[str]:
+# ── Direct async Ollama synthesis ─────────────────────────────────────────────
+
+async def _synthesize_async(topic: str, all_text: str) -> str:
     """
-    Return up to max_links relevant internal links from the current page.
+    Call Ollama directly (async, non-streaming) with a stripped system prompt.
 
-    Relevance filter: the link URL must contain at least one word from
-    the topic query — this keeps depth-2 pages on-subject.
+    Does NOT go through ask_llm_turn so there is zero chance of the LLM
+    emitting <tool_call> or <start_plan> tags inside the research report.
     """
+    if len(all_text) > 24_000:
+        all_text = all_text[:24_000] + "\n[truncated for length]"
+
+    synthesis_prompt = (
+        f"You are a research synthesizer. Write a comprehensive, "
+        f"well-structured report on: {topic}\n\n"
+        f"Base it entirely on these sources:\n\n{all_text}\n\n"
+        f"Structure your report with: Executive Summary, Key Findings, "
+        f"Detailed Analysis, Sources.\n"
+        f"Be thorough and factual. Do NOT emit XML tags, tool calls, "
+        f"or plan triggers. Write the report text directly."
+    )
+
     try:
-        raw        = await get_page_links(page)
-        base_host  = urlparse(base_url).netloc
-        topic_words = {w for w in topic.lower().split() if len(w) > 3}
-
-        links: list[str] = []
-        for line in raw.splitlines():
-            url = line.split(" | ")[0].strip()
-            if not url.startswith("http"):
-                continue
-            if _is_noise_url(url):
-                continue
-            if urlparse(url).netloc != base_host:
-                continue
-            # Relevance: at least one meaningful topic word must appear in the URL
-            if topic_words and not any(w in url.lower() for w in topic_words):
-                continue
-            links.append(url)
-            if len(links) >= max_links:
-                break
-        return links
-    except Exception:
-        return []
-
-
-# ── Synthesis ─────────────────────────────────────────────────────────────────
-
-def _synthesize(query: str, corpus: str) -> str:
-    """
-    Call the local LLM to produce a research report from the gathered corpus.
-
-    Uses the same import path as planner.py:
-        from llm.main_llm import ask_llm
-
-    The function is called via asyncio.to_thread so the blocking HTTP call
-    to Ollama does not block the event loop.
-    """
-    try:
-        from llm.main_llm import ask_llm   # same pattern as planner.py  # noqa: PLC0415
-
-        system_prompt = (
-            "You are a research synthesizer.  Write a comprehensive, "
-            "well-structured report based on the provided web content.  "
-            "Include key findings, facts, and a summary.  Be thorough.  "
-            "Do NOT emit <start_plan> or <tool_call> tags.  "
-            "Write in plain prose with clear section headings."
-        )
-        user_content = f"Topic: {query}\n\nSources:\n{corpus[:12_000]}"
-
-        result = ask_llm(user_content, system_suffix=system_prompt)
-        return result.strip() or "[Synthesis returned an empty response]"
-
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                LLM_CONFIG.ollama_url,
+                json={
+                    "model":    LLM_CONFIG.model,
+                    "messages": [{"role": "user", "content": synthesis_prompt}],
+                    "stream":   False,
+                    "options":  {"num_predict": 1500},
+                },
+            )
+            resp.raise_for_status()
+            data    = resp.json()
+            report  = data["message"]["content"]
     except Exception as exc:
         print(f"  [research] ⚠ synthesis failed: {exc}", flush=True)
-        return f"[Synthesis failed — raw research below]\n\n{corpus[:4_000]}"
+        return f"[Synthesis failed — raw research below]\n\n{all_text[:4_000]}"
+
+    # Strip any accidentally emitted control tags
+    report = re.sub(r"<start_plan>.*?</start_plan>", "", report, flags=re.DOTALL)
+    report = re.sub(r"<tool_call>.*?</tool_call>",   "", report, flags=re.DOTALL)
+    return report.strip()
 
 
-# ── Main research function ────────────────────────────────────────────────────
+# ── Main research coroutine ───────────────────────────────────────────────────
 
 async def run_deep_research(
-    query: str,
-    save_path: Optional[str] = None,
-    max_seeds: int = 5,
+    topic: str,
+    depth: int = 2,
+    max_pages: int = 8,
+    save_to: Optional[str] = None,
 ) -> str:
     """
-    Full research pipeline.  Returns a markdown report string.
-    If save_path is set the report is also written to that file.
+    Full research pipeline using Playwright web_* tools.
+
+    All browsing goes through registry.dispatch() so the real Chromium
+    window is used — pages render with JS and are visible to the user.
     """
-    manager = await BrowserManager.get()
-    page    = await manager.page()
+    depth     = min(depth, 3)
+    max_pages = min(max_pages, 15)
 
-    print(f"  [research] starting deep research: {query!r}", flush=True)
+    print(f"  [research] starting: {topic!r}  depth={depth}  max_pages={max_pages}", flush=True)
 
-    # Step 1: collect seed URLs from DuckDuckGo / Google
-    seed_urls = await _seed_urls(page, query, n=max_seeds)
+    collected: list[dict] = []   # {"url": str, "text": str}
+
+    # ── Step 1: search ────────────────────────────────────────────────────
+    print("  [research] step 1: web_search via Playwright", flush=True)
+    try:
+        search_raw = await registry.dispatch("web_search", {"query": topic})
+        seed_urls  = _parse_search_urls(search_raw)
+    except Exception as exc:
+        return f"Research failed during search: {exc}"
+
     if not seed_urls:
-        return f"No search results found for: {query}"
+        return f"No usable search results found for: {topic}"
 
-    print(f"  [research] {len(seed_urls)} seed URL(s) after filtering", flush=True)
+    seed_urls = seed_urls[:max_pages]
+    print(f"  [research] {len(seed_urls)} seed URL(s) after noise filter", flush=True)
 
-    corpus_parts: list[str] = []
-    visited: set[str] = set()
+    # ── Step 2: visit each seed page ─────────────────────────────────────
+    topic_words = {w for w in topic.lower().split() if len(w) > 3}
 
-    for seed_url in seed_urls:
-        if seed_url in visited:
+    for url in seed_urls:
+        if len(collected) >= max_pages:
+            break
+        try:
+            print(f"  [research] navigate → {url}", flush=True)
+            await registry.dispatch("web_navigate", {"url": url})
+            text = await registry.dispatch("web_read", {"max_chars": 6_000})
+            if text and not text.startswith("Error"):
+                collected.append({"url": url, "text": text})
+            else:
+                print(f"  [research]   ⚠ empty/error read: {text[:60]}", flush=True)
+        except Exception as exc:
+            print(f"  [research]   ⚠ failed to visit {url}: {exc}", flush=True)
+            collected.append({"url": url, "text": f"Failed to load: {exc}"})
             continue
-        visited.add(seed_url)
 
-        # Depth-1: visit seed page
-        print(f"  [research] visiting {seed_url}", flush=True)
-        text = await _page_text(page, seed_url)
-        if text and not text.startswith("[failed"):
-            corpus_parts.append(f"[Source: {seed_url}]\n{text}")
+        # ── Depth-2: follow relevant sub-links ────────────────────────────
+        if depth >= 2 and len(collected) < max_pages:
+            try:
+                links_raw = await registry.dispatch("web_links", {})
+                sub_candidates: list[str] = []
+                for line in links_raw.splitlines()[:80]:
+                    sub_url = line.split(" | ")[0].strip() if " | " in line else line.strip()
+                    if not sub_url.startswith("http"):
+                        continue
+                    if _is_noise(sub_url):
+                        continue
+                    # Relevance: URL must contain at least one topic word
+                    if topic_words and not any(w in sub_url.lower() for w in topic_words):
+                        continue
+                    sub_candidates.append(sub_url)
 
-        # Depth-2: follow relevant internal links
-        depth2 = await _depth2_links(page, seed_url, query, max_links=3)
-        for link in depth2:
-            if link in visited:
-                continue
-            visited.add(link)
-            print(f"  [research]   → depth-2 {link}", flush=True)
-            text2 = await _page_text(page, link, max_chars=2_000)
-            if text2 and not text2.startswith("[failed"):
-                corpus_parts.append(f"[Source: {link}]\n{text2}")
+                for sub_url in sub_candidates[:3]:
+                    if len(collected) >= max_pages:
+                        break
+                    try:
+                        print(f"  [research]   → depth-2 {sub_url}", flush=True)
+                        await registry.dispatch("web_navigate", {"url": sub_url})
+                        sub_text = await registry.dispatch("web_read", {"max_chars": 4_000})
+                        if sub_text and not sub_text.startswith("Error"):
+                            collected.append({"url": sub_url, "text": sub_text})
+                    except Exception:
+                        continue
+            except Exception as exc:
+                print(f"  [research]   ⚠ depth-2 link extraction failed: {exc}", flush=True)
 
-    if not corpus_parts:
-        return f"Could not retrieve any content for: {query}"
+    if not collected:
+        return f"Could not retrieve any page content for: {topic}"
 
-    corpus = "\n\n---\n\n".join(corpus_parts)
     print(
-        f"  [research] synthesizing from {len(corpus_parts)} page(s) "
-        f"({len(corpus):,} chars) …",
+        f"  [research] collected {len(collected)} page(s) — synthesizing …",
         flush=True,
     )
 
-    # Step 3: synthesise with LLM (blocking call via thread so event loop stays free)
-    report = await asyncio.to_thread(_synthesize, query, corpus)
+    # ── Step 3: synthesize ────────────────────────────────────────────────
+    all_text = "\n\n---\n\n".join(
+        f"Source: {c['url']}\n{c['text']}" for c in collected
+    )
+    report = await _synthesize_async(topic, all_text)
 
-    # Step 4: optionally save
-    if save_path:
+    # ── Step 4: optionally save ───────────────────────────────────────────
+    if save_to:
         try:
-            path = Path(save_path).expanduser()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(report, encoding="utf-8")
-            report += f"\n\n---\n*Report saved to `{path}`*"
-            print(f"  [research] saved to {path}", flush=True)
+            save_result = await registry.dispatch(
+                "write_file",
+                {"path": save_to, "content": report, "mode": "overwrite"},
+            )
+            print(f"  [research] saved: {save_result}", flush=True)
+            summary_preview = report[:500].replace("\n", " ")
+            return (
+                f"Research complete. Report saved to {save_to}\n\n"
+                f"Summary: {summary_preview}…"
+            )
         except Exception as exc:
-            report += f"\n\n[Warning: could not save report — {exc}]"
+            report += f"\n\n[Warning: could not save — {exc}]"
 
     return report
 
@@ -256,14 +230,21 @@ async def run_deep_research(
 # ── Tool handler ──────────────────────────────────────────────────────────────
 
 async def _deep_research(args: dict) -> str:
-    query     = args.get("query", "")
-    save_path = args.get("save_path")          # optional
-    max_seeds = int(args.get("max_seeds", 5))
+    # Accept both "query" (old) and "topic" (new canonical name)
+    topic     = args.get("topic") or args.get("query", "")
+    depth     = int(args.get("depth", 2))
+    max_pages = int(args.get("max_pages", 8))
+    save_to   = args.get("save_to") or args.get("save_path")   # support both keys
 
-    if not query:
-        return "Error: query is required."
+    if not topic:
+        return "Error: topic (or query) is required."
 
-    return await run_deep_research(query, save_path=save_path, max_seeds=max_seeds)
+    return await run_deep_research(
+        topic     = topic,
+        depth     = depth,
+        max_pages = max_pages,
+        save_to   = save_to,
+    )
 
 
 # ── Self-registration ─────────────────────────────────────────────────────────
@@ -271,29 +252,34 @@ async def _deep_research(args: dict) -> str:
 registry.register(ToolDefinition(
     name        = "deep_research",
     description = (
-        "Perform multi-page web research on a topic: searches the web, visits the top "
-        "result pages, follows relevant internal links one level deep, then synthesizes a "
-        "structured report using AI.  Use this for thorough research tasks "
-        "that require information from multiple web sources."
+        "Perform multi-page web research on a topic using a real browser: searches, "
+        "visits result pages, follows relevant sub-links, then synthesizes a structured "
+        "AI report. Use for thorough research requiring multiple web sources. "
+        "Optionally saves the report to a file."
     ),
     parameters  = {
         "type": "object",
         "properties": {
-            "query": {
+            "topic": {
                 "type":        "string",
-                "description": "The research question or topic to investigate",
+                "description": "The research topic or question to investigate",
             },
-            "save_path": {
+            "depth": {
+                "type":        "integer",
+                "description": "Link follow depth (1=seed pages only, 2=follow sub-links). Default 2.",
+                "default":     2,
+            },
+            "max_pages": {
+                "type":        "integer",
+                "description": "Maximum total pages to visit (default 8, max 15)",
+                "default":     8,
+            },
+            "save_to": {
                 "type":        "string",
                 "description": "Optional file path to save the report (e.g. ~/Desktop/report.md)",
             },
-            "max_seeds": {
-                "type":        "integer",
-                "description": "Maximum number of result pages to visit (default 5)",
-                "default":     5,
-            },
         },
-        "required": ["query"],
+        "required": ["topic"],
     },
     handler = _deep_research,
 ))
