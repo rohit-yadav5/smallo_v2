@@ -6,6 +6,12 @@ export function useMicrophone() {
   const voiceState   = useAppStore((s) => s.voiceState)
   const wsConnected  = useAppStore((s) => s.wsConnected)
   const setMicActive = useAppStore((s) => s.setMicActive)
+  const sttEnabled   = useAppStore((s) => s.sttEnabled)
+
+  // Stable ref so the AudioWorklet message handler always reads the latest value
+  // without needing to be recreated.
+  const sttEnabledRef = useRef(sttEnabled)
+  useEffect(() => { sttEnabledRef.current = sttEnabled }, [sttEnabled])
 
   // Stable ref — AudioWorklet closure always reads latest voice state
   const voiceStateRef = useRef(voiceState)
@@ -131,7 +137,10 @@ export function useMicrophone() {
 
         const state = voiceStateRef.current
 
-        // Send during listening (VAD captures speech) and speaking (VAD detects barge-in).
+        // Gate 1: STT disabled — drop frame entirely, no data to backend.
+        if (!sttEnabledRef.current) return
+
+        // Gate 2: Send during listening (VAD captures speech) and speaking (VAD detects barge-in).
         // Discard during idle/thinking to avoid queue buildup.
         if (state === 'listening' || state === 'speaking') {
           sendChunk(actualSR, chunk)
@@ -165,6 +174,26 @@ export function useMicrophone() {
   useEffect(() => {
     if (!wsConnected) teardown()
   }, [wsConnected, teardown])
+
+  // ── STT toggle: start/stop mic when sttEnabled changes ────────────────
+  // Tracks whether mic was running before being disabled so we can auto-restart.
+  const wasActiveBeforeDisableRef = useRef(false)
+  useEffect(() => {
+    if (!sttEnabled) {
+      // Remember if mic was running so we can restore when re-enabled
+      wasActiveBeforeDisableRef.current = activeRef.current
+      teardown()
+      console.log('[mic] STT disabled — worklet torn down')
+    } else if (wasActiveBeforeDisableRef.current && wsConnected) {
+      // Re-enable: auto-restart if the mic was running before.
+      // This effect fires synchronously after the toggle click (user gesture),
+      // so getUserMedia permission is available in most browsers.
+      wasActiveBeforeDisableRef.current = false
+      console.log('[mic] STT re-enabled — restarting mic')
+      startMic()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sttEnabled])
 
   // Cleanup on unmount
   useEffect(() => () => teardown(), [teardown])

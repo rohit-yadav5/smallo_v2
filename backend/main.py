@@ -124,6 +124,7 @@ from web_agent.monitor import web_monitor
 from web_agent.browser import BrowserManager
 import tools.research_tool                               # registers deep_research tool  # noqa: F401
 import tools.close_heavy_tabs                            # registers close_heavy_tabs tool  # noqa: F401
+import tools.memory_tool                                 # registers clear_memory tool     # noqa: F401
 
 import httpx as _httpx
 
@@ -145,6 +146,12 @@ _speech_events: queue.Queue = queue.Queue()
 # Each item is a plain str.  Checked before speech events in _run_turn.
 _text_input_queue: queue.Queue = queue.Queue()
 
+# Planner → pipeline signalling for plan-trigger responses.
+# Planner puts either the string "MULTI" (multi-step plan, say "On it") or
+# a result string (single-tool completed, speak the result directly).
+# The pipeline thread blocks on this queue after launching a plan.
+_plan_result_queue: queue.Queue = queue.Queue(maxsize=1)
+
 # Active autonomous planner task.  Only one plan runs at a time;
 # starting a new one cancels the previous.
 _current_plan_task: asyncio.Task | None = None
@@ -157,6 +164,10 @@ _interrupt_event: threading.Event = threading.Event()
 
 # Current voice state — cached so new WS clients get it immediately
 _current_voice_state: str = "idle"
+
+# TTS enabled flag — toggled by frontend SET_TTS_ENABLED message.
+# When False: LLM still runs and tokens stream to frontend; audio synthesis skipped.
+_tts_enabled: bool = True
 
 # Partial bot response saved when user barge-ins mid-sentence.
 # Injected into the next turn's LLM prompt so the bot knows where it left off.
@@ -558,19 +569,43 @@ def _build_memory_context(user_text: str) -> str:
           "  ".join(f"{t}:{n}" for t, n in type_counts.most_common()))
 
     consolidated, personal, strategic, reflections = [], [], [], []
+    # Identity de-duplication: track the highest-scored entry for each identity key.
+    # This prevents conflicting names from different sessions appearing simultaneously.
+    _identity_best: dict[str, tuple[float, str]] = {}  # key → (score, summary)
+
     for m in memories:
         summary = m.get("summary", "")
         mt      = m.get("memory_type", "")
+        score   = m.get("score", 0.0)
+
+        # Check for identity facts (User name, User age, etc.)
+        summary_lower = summary.lower()
+        identity_key = None
+        if summary_lower.startswith("user name"):
+            identity_key = "user_name"
+        elif summary_lower.startswith("user age"):
+            identity_key = "user_age"
+        elif summary_lower.startswith("user friend"):
+            identity_key = "user_friend"
+
+        if identity_key is not None:
+            # Keep only the highest-scored (most recent + relevant) identity entry
+            prev_score, _ = _identity_best.get(identity_key, (-1.0, ""))
+            if score > prev_score:
+                _identity_best[identity_key] = (score, summary)
+            continue  # handled separately — don't add to personal list yet
+
         if mt == "ConsolidatedMemory":
             consolidated.append(summary)
-        elif summary.lower().startswith(("user name", "user age", "user friend")):
-            personal.append(summary)
         elif mt in ("ProjectMemory", "DecisionMemory", "ArchitectureMemory", "ActionMemory"):
             strategic.append(summary)
         elif mt == "ReflectionMemory":
             reflections.append(summary)
 
-    ordered = consolidated[:2] + personal[:2] + strategic[:2] + reflections[:1]
+    # Inject exactly one winner per identity key (no conflicting names)
+    personal = [summary for _, summary in _identity_best.values()]
+
+    ordered = consolidated[:2] + personal[:3] + strategic[:2] + reflections[:1]
     if not ordered:
         return user_text
 
@@ -644,11 +679,14 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
     if result["direct"]:
         _emit("VOICE_STATE", {"state": "speaking"})
         _interrupt_event.clear()
-        with tracker.step("TTS (plugin direct)"):
-            try:
-                speak(result["text"], _interrupt_event)
-            except Exception as e:
-                print(f"    [tts] plugin speak error: {e}")
+        if _tts_enabled:
+            with tracker.step("TTS (plugin direct)"):
+                try:
+                    speak(result["text"], _interrupt_event)
+                except Exception as e:
+                    print(f"    [tts] plugin speak error: {e}")
+        else:
+            print("  [tts] disabled by user — skipping synthesis", flush=True)
         print(f"\n  Plugin: {result['text']}\n")
         return result["text"]
     else:
@@ -661,13 +699,21 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
         _interrupt_event.clear()
         with tracker.step("LLM + TTS (plugin summarize)"):
             try:
-                ai_text, tts_timing = speak_stream(
-                    _token_broadcaster(
+                if _tts_enabled:
+                    ai_text, tts_timing = speak_stream(
+                        _token_broadcaster(
+                            ask_llm_stream(summary_prompt, system_suffix=_PLUGIN_SUMMARIZE_SUFFIX),
+                            _interrupt_event,
+                        ),
+                        _interrupt_event,
+                    )
+                else:
+                    print("  [tts] disabled by user — skipping synthesis", flush=True)
+                    ai_text = "".join(_token_broadcaster(
                         ask_llm_stream(summary_prompt, system_suffix=_PLUGIN_SUMMARIZE_SUFFIX),
                         _interrupt_event,
-                    ),
-                    _interrupt_event,
-                )
+                    ))
+                    tts_timing = {"first_word_secs": 0.0, "total_secs": 0.0}
             except Exception as e:
                 print(f"    [tts] plugin speak_stream error: {e}")
                 return ""
@@ -675,7 +721,8 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
         if "<start_plan>" in ai_text or "<tool_call>" in ai_text:
             print("  [plugin] ⚠ stripping control tags that leaked into plugin summary", flush=True)
             ai_text = strip_control_tags(ai_text)
-        print(f"    [tts] first word: {tts_timing['first_word_secs']:.3f}s  |  total: {tts_timing['total_secs']:.3f}s")
+        if _tts_enabled:
+            print(f"    [tts] first word: {tts_timing['first_word_secs']:.3f}s  |  total: {tts_timing['total_secs']:.3f}s")
         print(f"\n  Plugin summary: {ai_text}\n")
         return ai_text
 
@@ -1051,6 +1098,31 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     if recent_actions_ctx:
         user_ctx_suffix = (user_ctx_suffix + "\n\n" + recent_actions_ctx).strip()
 
+    # ── Inject last plan result (one-shot, consumed once per turn) ────────
+    # If the planner completed within the last 300 s, surface what it did so
+    # the conversational LLM can answer follow-up questions like "where did
+    # you save that?" without needing a memory retrieval round-trip.
+    try:
+        import planner.planner as _planner_mod
+        import time as _time
+        plan_result = _planner_mod.get_last_plan_result()
+        if plan_result and (_time.time() - plan_result["completed_at"]) < 300:
+            tool_names = ", ".join(t["tool"] for t in plan_result["tool_calls"])
+            snippets = "; ".join(
+                t["result_snippet"] for t in plan_result["tool_calls"][:3] if t["result_snippet"]
+            )
+            plan_context = (
+                f"\n[Recent action I just completed]\n"
+                f"Goal: {plan_result['goal']}\n"
+                f"What I did: {plan_result['summary']}\n"
+                f"Tools used: {tool_names}\n"
+                f"Key results: {snippets}"
+            )
+            user_ctx_suffix = (user_ctx_suffix + plan_context).strip()
+            _planner_mod.clear_last_plan_result()
+    except Exception as _plan_ctx_exc:
+        pass  # non-fatal — plan context is best-effort
+
     print(f"  [pipeline] calling ask_llm_turn  |  prompt {len(prompt):,} chars", flush=True)
     try:
         llm_result = ask_llm_turn(prompt, system_suffix=user_ctx_suffix)
@@ -1064,15 +1136,41 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     if isinstance(llm_result, dict) and llm_result.get("type") == "plan_trigger":
         goal = llm_result["goal"]
         print(f"  [pipeline] 🗺 plan trigger → '{goal}'", flush=True)
+        # Drain any stale signal from a previous plan
+        while not _plan_result_queue.empty():
+            try:
+                _plan_result_queue.get_nowait()
+            except queue.Empty:
+                break
         # Launch plan on main asyncio loop (non-blocking from pipeline thread)
         asyncio.run_coroutine_threadsafe(_launch_plan(goal), _loop)
-        # Immediately acknowledge verbally — no LLM call needed
+        # Wait for planner to signal: "MULTI" → multi-step (say "On it"),
+        # or a result string → single-tool completed (speak result directly).
+        # Poll every 0.25 s so user barge-in or text input can still interrupt.
+        plan_signal = None
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            try:
+                plan_signal = _plan_result_queue.get(timeout=0.25)
+                break
+            except queue.Empty:
+                if not _text_input_queue.empty() or _interrupt_event.is_set():
+                    break
         _emit("VOICE_STATE", {"state": "speaking"})
         _interrupt_event.clear()
-        try:
-            speak("On it. I'll let you know when it's done.", _interrupt_event)
-        except Exception:
-            pass
+        if plan_signal and plan_signal != "MULTI":
+            # Single-tool plan completed — speak the actual result
+            print(f"  [pipeline] single-tool result received, speaking directly", flush=True)
+            try:
+                speak(plan_signal, _interrupt_event)
+            except Exception:
+                pass
+        else:
+            # Multi-step plan launched (or interrupted) — generic acknowledgement
+            try:
+                speak("On it. I'll let you know when it's done.", _interrupt_event)
+            except Exception:
+                pass
         _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
         return False
@@ -1083,27 +1181,38 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     _interrupt_event.clear()   # arm: VAD can now set this on barge-in
 
     try:
-        ai_text, tts_timing = speak_stream(
-            _token_broadcaster(llm_result, _interrupt_event),
-            _interrupt_event,
-        )
-        first_token = tts_timing.get("first_token_secs", tts_timing["first_word_secs"])
-        first_audio = tts_timing["first_word_secs"]
-        total_t     = tts_timing["total_secs"]
-        n_tok       = tts_timing.get("token_count", "?")
-        n_sent      = tts_timing.get("sentence_count", "?")
-        tts_synth_s = max(0.0, first_audio - first_token)
-        speaking_s  = max(0.0, total_t - first_audio)
+        if not _tts_enabled:
+            # TTS disabled by user — drain LLM generator to emit LLM_TOKEN events
+            # to the frontend (text still streams), but skip all audio synthesis.
+            print("  [tts] disabled by user — skipping synthesis", flush=True)
+            t0       = time.perf_counter()
+            ai_text  = "".join(_token_broadcaster(llm_result, _interrupt_event))
+            llm_secs = time.perf_counter() - t0
+            tracker.record("LLM", llm_secs, [
+                f"text-only mode — {len(ai_text)} chars in {llm_secs:.3f}s"
+            ])
+        else:
+            ai_text, tts_timing = speak_stream(
+                _token_broadcaster(llm_result, _interrupt_event),
+                _interrupt_event,
+            )
+            first_token = tts_timing.get("first_token_secs", tts_timing["first_word_secs"])
+            first_audio = tts_timing["first_word_secs"]
+            total_t     = tts_timing["total_secs"]
+            n_tok       = tts_timing.get("token_count", "?")
+            n_sent      = tts_timing.get("sentence_count", "?")
+            tts_synth_s = max(0.0, first_audio - first_token)
+            speaking_s  = max(0.0, total_t - first_audio)
 
-        tracker.record("LLM", first_token, [
-            f"first token in {first_token:.3f}s  ({n_tok} tokens total)"
-        ])
-        tracker.record("TTS", tts_synth_s, [
-            f"Kokoro synth first sentence: {tts_synth_s:.3f}s  ({n_sent} sentences)"
-        ])
-        tracker.record("Speaking", speaking_s, [
-            f"audio playback: {speaking_s:.3f}s"
-        ])
+            tracker.record("LLM", first_token, [
+                f"first token in {first_token:.3f}s  ({n_tok} tokens total)"
+            ])
+            tracker.record("TTS", tts_synth_s, [
+                f"Kokoro synth first sentence: {tts_synth_s:.3f}s  ({n_sent} sentences)"
+            ])
+            tracker.record("Speaking", speaking_s, [
+                f"audio playback: {speaking_s:.3f}s"
+            ])
         print(f"\n  AI: {ai_text}\n")
     except Exception as e:
         print(f"  [llm/tts] error: {e}")
@@ -1208,6 +1317,11 @@ async def _ws_handler(ws):
                         if key:
                             update_user_context(key, value)
                             print(f"  [ws] user_context updated: {key}={value!r}")
+
+                    elif ev == "SET_TTS_ENABLED":
+                        global _tts_enabled
+                        _tts_enabled = bool(ctrl.get("enabled", True))
+                        print(f"  [ws] SET_TTS_ENABLED → {_tts_enabled}", flush=True)
 
                     elif ev == "TEXT_INPUT":
                         # User typed a message — inject directly into pipeline.
@@ -1317,6 +1431,17 @@ async def _main():
     asyncio.create_task(_memory_maintenance_loop(), name="memory-maintenance")
     asyncio.create_task(_memory_consolidation_loop(), name="memory-consolidation")
     print("  [memory] lifecycle tasks scheduled (maintenance=6h, consolidation=24h)", flush=True)
+
+    # ── Server-ready preload: fire immediately on the event loop ─────────────
+    # This fires the LLM preload as soon as _main() completes setup, giving
+    # the model up to 10-30s of warm-up time before any client connects or
+    # types their first message.  The pipeline thread fires its own preload
+    # after warmup completes (may take 10-20s) — this fires first, in parallel.
+    asyncio.create_task(
+        _preload_model(LLM_CONFIG.model, keep_alive_s=120),
+        name="server-ready-preload",
+    )
+    print("  [llm] background preload started at server ready", flush=True)
 
     threading.Thread(target=_stats_loop,           daemon=True).start()
     threading.Thread(target=_audio_ingestion_loop, daemon=True).start()

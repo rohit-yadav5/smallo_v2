@@ -40,7 +40,8 @@ import asyncio
 import json
 import re
 import threading
-from typing import Callable
+import time
+from typing import Callable, Optional
 
 import requests
 
@@ -100,6 +101,26 @@ _plan_active: bool = False
 # Either LLM_CONFIG.planner_model (7b, preferred) or LLM_CONFIG.model (3b,
 # fallback when RAM < 3 GB).  All per-plan LLM helpers read this variable.
 _active_plan_model: str = ""
+
+# ── Last plan result (B1 — injected into next conversational turn) ─────────
+# Holds the outcome of the most recently completed plan so _run_turn() can
+# inject it as context before calling the LLM.  Cleared after one injection.
+_last_plan_result: Optional[dict] = None
+
+# Accumulates tool calls made during the current plan execution.
+# Reset at plan start; appended to inside _execute_step_planner().
+_current_plan_tool_calls: list[dict] = []
+
+
+def get_last_plan_result() -> Optional[dict]:
+    """Return the last completed plan result dict, or None if none/already consumed."""
+    return _last_plan_result
+
+
+def clear_last_plan_result() -> None:
+    """Clear the last plan result after it has been injected into one LLM turn."""
+    global _last_plan_result
+    _last_plan_result = None
 
 
 # ── Regex helpers ─────────────────────────────────────────────────────────────
@@ -460,6 +481,30 @@ async def _execute_step_planner(
     tool_result = await _registry.dispatch(tool_name, tool_args or {})
     print(f"  [executor] 🔧 result ({len(tool_result)} chars): {tool_result[:120]}", flush=True)
 
+    # ── B1: record tool call for _last_plan_result ─────────────────────────
+    _current_plan_tool_calls.append({
+        "tool":           tool_name,
+        "args":           tool_args or {},
+        "result_snippet": tool_result[:200],
+    })
+
+    # ── B3: if write_file was called, persist the path to user_context ────
+    if tool_name == "write_file":
+        _file_path = (tool_args or {}).get("path", "")
+        if _file_path:
+            try:
+                from user_context import get_user_context, save_user_context  # noqa: PLC0415
+                ctx = get_user_context()
+                facts: list = ctx.get("facts", [])
+                fact = f"Saved file: {_file_path}"
+                if fact not in facts:
+                    facts.append(fact)
+                    ctx["facts"] = facts[-20:]   # keep last 20
+                    save_user_context(ctx)
+                    print(f"  [user_ctx] recorded file: {_file_path}", flush=True)
+            except Exception as _ctx_exc:
+                print(f"  [user_ctx] failed to record file (non-fatal): {_ctx_exc}", flush=True)
+
     # Pass 2: one-sentence summary of the tool result using 7b model.
     def _pass2():
         msgs2 = [
@@ -499,7 +544,10 @@ async def run_plan(
     broadcast:  Callable matching _emit(event: str, data: dict) from main.py.
     max_steps:  Hard cap on execution steps to prevent infinite loops.
     """
-    global _plan_active, _active_plan_model
+    global _plan_active, _active_plan_model, _last_plan_result, _current_plan_tool_calls
+
+    # Reset tool-call log for this plan
+    _current_plan_tool_calls = []
 
     # ── RAM-aware model selection ─────────────────────────────────────────────
     available_gb = get_available_ram_gb()
@@ -543,21 +591,37 @@ async def run_plan(
         # Only bypass the planner if the answer is an unambiguous NO
         if _check_ans.strip().lower().startswith("no"):
             print("  [plan] cancelled — single-tool goal, routing to normal turn", flush=True)
-            # Execute the goal as a single step and stream the result.
+            # Execute the goal as a single step.
             result = await _execute_step_planner(goal, "")
-            broadcast("VOICE_STATE", {"state": "speaking"})
-            words = result.split()
-            for j, word in enumerate(words):
-                broadcast("LLM_TOKEN", {"token": word if j == 0 else " " + word, "done": False})
-                await asyncio.sleep(0.005)
-            broadcast("LLM_TOKEN", {"token": "", "done": True, "token_count": len(words)})
+            # Signal pipeline thread with the result string.
+            # Pipeline will handle TTS in its own thread (avoids audio conflicts).
             try:
-                from tts import speak as _speak  # noqa: PLC0415
-                await asyncio.to_thread(_speak, result, threading.Event())
+                from main import _plan_result_queue  # noqa: PLC0415
+                _plan_result_queue.put_nowait(result)
             except Exception as exc:
-                print(f"  [planner] ⚠ TTS speak failed (single-step): {exc}", flush=True)
-            broadcast("VOICE_STATE", {"state": "idle"})
+                print(f"  [planner] ⚠ queue signal failed: {exc} — falling back to direct TTS", flush=True)
+                # Fallback: stream tokens + direct TTS (original behaviour)
+                broadcast("VOICE_STATE", {"state": "speaking"})
+                words = result.split()
+                for j, word in enumerate(words):
+                    broadcast("LLM_TOKEN", {"token": word if j == 0 else " " + word, "done": False})
+                    await asyncio.sleep(0.005)
+                broadcast("LLM_TOKEN", {"token": "", "done": True, "token_count": len(words)})
+                try:
+                    from tts import speak as _speak  # noqa: PLC0415
+                    await asyncio.to_thread(_speak, result, threading.Event())
+                except Exception as exc2:
+                    print(f"  [planner] ⚠ TTS speak failed (single-step): {exc2}", flush=True)
+                broadcast("VOICE_STATE", {"state": "idle"})
             return
+
+        # Multi-step confirmed — signal pipeline so it stops waiting and
+        # speaks the "On it" acknowledgement immediately.
+        try:
+            from main import _plan_result_queue  # noqa: PLC0415
+            _plan_result_queue.put_nowait("MULTI")
+        except Exception:
+            pass
 
         # ── Phase 1: DECOMPOSE using 7b model ─────────────────────────────
         decompose_user = _DECOMPOSE_PROMPT_TEMPLATE.format(goal=goal)
@@ -672,6 +736,17 @@ async def run_plan(
         summary = re.sub(r"<tool_call>.*?</tool_call>",   "", summary, flags=re.DOTALL).strip()
 
         print(f"  [planner] ✅ complete. Summary: {summary[:100]}", flush=True)
+
+        # ── Persist plan result for next conversational turn (B1) ─────────
+        global _last_plan_result
+        _last_plan_result = {
+            "goal": goal,
+            "steps_taken": len(results),
+            "summary": summary,
+            "tool_calls": list(_current_plan_tool_calls),
+            "completed_at": time.time(),
+        }
+
         broadcast("PLAN_EVENT", {
             "phase":   "complete",
             "summary": summary,

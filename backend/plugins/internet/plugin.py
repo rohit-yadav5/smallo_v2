@@ -121,11 +121,64 @@ class InternetPlugin(BasePlugin):
             return {"text": text, "direct": True, "plugin": self.NAME, "action": "weather"}
         return {"text": text, "direct": False, "plugin": self.NAME, "action": "weather"}
 
+    @staticmethod
+    def _extract_wiki_topic(raw_query: str) -> str:
+        """Convert a free-form question into the best Wikipedia article title.
+
+        Strategy:
+        1. Strip leading question words and filler so we get a clean noun phrase.
+        2. Call the Wikipedia opensearch API to find the closest article title.
+        3. Fall back to the stripped noun phrase if the API call fails.
+        """
+        # Strip trailing punctuation
+        cleaned = raw_query.strip().rstrip("?.!").strip()
+
+        # Strip leading question/filler prefixes iteratively until stable
+        prefixes = [
+            r"^tell\s+me\s+(?:about|of)\s+",
+            r"^who\s+(?:is|was|are|were)\s+",
+            r"^what\s+(?:is|was|are|were)\s+",
+            r"^where\s+(?:is|was|are|were)\s+",
+            r"^when\s+(?:is|was|are|were)\s+",
+            r"^which\s+(?:is|was|are|were)\s+",
+            r"^how\s+(?:is|was|are|were)\s+",
+            r"^(?:the|a|an)\s+",  # strip leading articles last
+        ]
+        prev = None
+        while prev != cleaned:
+            prev = cleaned
+            for pat in prefixes:
+                cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE).strip()
+
+        cleaned = cleaned.strip()
+
+        # Use Wikipedia opensearch to resolve the best article title
+        try:
+            search_url = (
+                "https://en.wikipedia.org/w/api.php"
+                "?action=opensearch&namespace=0&limit=1&format=json"
+                f"&search={quote(cleaned)}"
+            )
+            resp = requests.get(search_url, headers=_HEADERS, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                # data[1] is a list of matching titles
+                if data and len(data) > 1 and data[1]:
+                    return data[1][0]  # first (best) matching article title
+        except Exception:
+            pass
+
+        return cleaned  # fallback: use cleaned noun phrase directly
+
     def _wikipedia(self, user_text: str, match: re.Match) -> PluginResult:
         try:
-            topic = match.group("topic").strip()
+            raw_topic = match.group("topic").strip()
         except IndexError:
-            topic = user_text
+            raw_topic = user_text
+
+        # Resolve the raw regex capture to a proper Wikipedia article title
+        topic = self._extract_wiki_topic(raw_topic)
+
         url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(topic)}"
         resp = requests.get(url, headers=_HEADERS, timeout=10)
         if resp.status_code != 200:

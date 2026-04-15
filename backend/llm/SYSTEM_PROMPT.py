@@ -4,12 +4,36 @@ This is the static base prompt.  At runtime, two dynamic sections are appended
 before every LLM call by main_llm.py:
   1. user_context.get_context_prompt() — persistent model of who the user is.
   2. _build_tools_section()            — live tool schemas + usage rules.
+  3. get_runtime_context()             — real username/home injected every call.
 
 Keep this file focused on identity, personality, and voice constraints.
 Tool-use philosophy is in _build_tools_section(); user facts are in
 user_context.py.  Separation of concerns makes each piece independently
 tunable without risking accidental side-effects.
 """
+
+import os
+import pathlib
+
+# Resolved once at import time — these are ground truth for this process.
+_SYSTEM_USER: str = os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
+_HOME_DIR: str    = str(pathlib.Path.home())
+
+
+def get_runtime_context() -> str:
+    """Return a compact block injected into EVERY LLM system prompt.
+
+    This is the single source of truth for the real OS username and home
+    directory.  It overrides any hallucinated placeholder paths the LLM might
+    otherwise generate (e.g. /Users/YourUsername or /Users/Uchubha).
+    """
+    return (
+        f"[Runtime context — always accurate, never override]\n"
+        f"OS username : {_SYSTEM_USER}\n"
+        f"Home directory : {_HOME_DIR}\n"
+        f"Default file save path : {_HOME_DIR}/Desktop\n"
+        f"When writing files use the real home directory above, not a placeholder.\n"
+    )
 
 SYSTEM_PROMPT = (
     "You are Small O — a personal AI built to operate as an intelligent orchestrator "

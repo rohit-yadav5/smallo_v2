@@ -113,6 +113,21 @@ export function useWebSocket() {
   const llmTimeRef       = useRef<number>(0)
   const audioReceiverRef = useRef<TTSAudioReceiver>(new TTSAudioReceiver())
 
+  // Keep a stable ref of ttsEnabled so ws.onopen can read the current value
+  // without stale-closure issues (the main useEffect runs once with [] deps).
+  const ttsEnabled    = useAppStore((s) => s.ttsEnabled)
+  const ttsEnabledRef = useRef(ttsEnabled)
+  useEffect(() => { ttsEnabledRef.current = ttsEnabled }, [ttsEnabled])
+
+  // Sync ttsEnabled changes to backend while connected
+  useEffect(() => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'SET_TTS_ENABLED', enabled: ttsEnabled }))
+      console.log(`[ws] SET_TTS_ENABLED → ${ttsEnabled}`)
+    }
+  }, [ttsEnabled])
+
   /** Send a typed message over WebSocket — bypasses STT entirely. */
   function sendTextInput(text: string) {
     const ws = wsRef.current
@@ -173,6 +188,10 @@ export function useWebSocket() {
         retryDelay = 1_000          // reset backoff on success
         store.setWsConnected(true)
         startHeartbeat(ws)
+        // Sync TTS state to backend immediately on connect / reconnect.
+        // Uses the ref so we always read the live store value, not the
+        // stale closure captured at effect creation time.
+        ws.send(JSON.stringify({ event: 'SET_TTS_ENABLED', enabled: ttsEnabledRef.current }))
       }
 
       ws.onerror = (e) => {

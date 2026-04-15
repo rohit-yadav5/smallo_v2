@@ -1,24 +1,16 @@
 /**
  * WebViewer.tsx — Live browser viewport panel for the web agent.
  *
- * Shows the most-recent WEB_SCREENSHOT frame received over WebSocket.
+ * Visibility is controlled by `browserViewerOpen` in appStore.
+ * App.tsx renders this component only when that flag is true.
+ * Screenshots still arrive and are stored in appStore regardless.
+ *
  * Includes:
- *   • LIVE badge (pulsing) when a screenshot is present
+ *   • LIVE badge (pulsing)
  *   • Current URL display (truncated)
- *   • Minimize / expand toggle (chevron button, top-right of header)
+ *   • Minimize / expand toggle (chevron button)
+ *   • × close button (sets browserViewerOpen = false)
  *   • Timestamp of last capture
- *
- * Hidden entirely when no screenshot has been received yet (activates the
- * first time the agent navigates somewhere).
- *
- * Minimized state: panel collapses to slim title bar only; screenshot,
- * URL bar, and footer are hidden but remain in the DOM so re-expanding
- * doesn't cause a layout jump.  State is local (useState) — not shared.
- *
- * Neobrutalist palette:
- *   - Panel border:  #FF6B35 (orange) — distinct from plan purple & memory teal
- *   - LIVE badge:    #FF4D6D (red) with pulse animation
- *   - URL bar:       rgba(0,0,0,0.6) dark glass
  */
 
 import { useState } from 'react'
@@ -48,20 +40,21 @@ function ChevronDown() {
 // ── Component ──────────────────────────────────────────────────────────────────
 
 export function WebViewer() {
-  const screenshot            = useAppStore((s) => s.latestScreenshot)
+  const screenshot         = useAppStore((s) => s.latestScreenshot)
+  const setBrowserViewerOpen = useAppStore((s) => s.setBrowserViewerOpen)
   const [minimized, setMinimized] = useState(false)
 
+  // No screenshot yet — render nothing but stay mounted so the store update
+  // triggers a re-render once a screenshot arrives.
   if (!screenshot) return null
 
   const ts   = new Date(screenshot.timestamp * 1000)
   const time = ts.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 
-  // Full URL truncated to 60 chars for the URL bar
   const displayUrl = screenshot.url.length > 60
     ? screenshot.url.slice(0, 57) + '…'
     : screenshot.url
 
-  // Shorter truncation for the minimized title bar (less real estate)
   const miniUrl = screenshot.url.length > 40
     ? screenshot.url.slice(0, 37) + '…'
     : screenshot.url
@@ -139,21 +132,21 @@ export function WebViewer() {
             </span>
           )}
 
-          {/* Spacer (only when expanded — minimized uses the URL span above) */}
+          {/* Spacer (only when expanded) */}
           {!minimized && <div style={{ flex: 1 }} />}
 
           {/* Timestamp — only visible when expanded */}
           {!minimized && (
             <span style={{
-              color:     'rgba(0,0,0,0.7)',
-              fontSize:  '11px',
+              color:      'rgba(0,0,0,0.7)',
+              fontSize:   '11px',
               flexShrink: 0,
             }}>
               {time}
             </span>
           )}
 
-          {/* Minimize / expand toggle button */}
+          {/* Minimize / expand toggle */}
           <button
             onClick={() => setMinimized((m) => !m)}
             aria-label={minimized ? 'Expand browser panel' : 'Minimize browser panel'}
@@ -175,10 +168,35 @@ export function WebViewer() {
           >
             {minimized ? <ChevronDown /> : <ChevronUp />}
           </button>
+
+          {/* × Close button — collapses panel back (sets browserViewerOpen=false) */}
+          <button
+            onClick={() => setBrowserViewerOpen(false)}
+            aria-label="Close browser panel"
+            style={{
+              display:        'flex',
+              alignItems:     'center',
+              justifyContent: 'center',
+              background:     'rgba(0,0,0,0.18)',
+              border:         '1.5px solid rgba(0,0,0,0.25)',
+              borderRadius:   '5px',
+              color:          '#000',
+              cursor:         'pointer',
+              padding:        '2px 6px',
+              flexShrink:     0,
+              fontSize:       '13px',
+              fontWeight:     '700',
+              lineHeight:     1,
+              transition:     'background 0.15s',
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'rgba(0,0,0,0.32)')}
+            onMouseLeave={(e) => (e.currentTarget.style.background = 'rgba(0,0,0,0.18)')}
+          >
+            ×
+          </button>
         </div>
 
-        {/* ── Collapsible body (URL bar + screenshot + footer) ───── */}
-        {/* overflow:hidden on the wrapper clips the height animation cleanly */}
+        {/* ── Collapsible body ───────────────────────────────────── */}
         <motion.div
           initial={false}
           animate={{
@@ -188,7 +206,7 @@ export function WebViewer() {
           transition={{ duration: 0.2, ease: 'easeInOut' }}
           style={{ overflow: 'hidden' }}
         >
-          {/* ── URL bar ────────────────────────────────────────────── */}
+          {/* URL bar */}
           <div style={{
             display:      'flex',
             alignItems:   'center',
@@ -211,7 +229,7 @@ export function WebViewer() {
             </span>
           </div>
 
-          {/* ── Screenshot image ────────────────────────────────────── */}
+          {/* Screenshot image */}
           <div style={{ position: 'relative' }}>
             <img
               src={`data:image/jpeg;base64,${screenshot.image}`}
@@ -225,8 +243,6 @@ export function WebViewer() {
                 objectPosition: 'top',
               }}
             />
-
-            {/* Subtle scan-line overlay for neobrutalist feel */}
             <div style={{
               position:      'absolute',
               inset:         0,
@@ -235,26 +251,19 @@ export function WebViewer() {
             }} />
           </div>
 
-          {/* ── Footer ──────────────────────────────────────────────── */}
+          {/* Footer */}
           <div style={{
-            display:         'flex',
-            alignItems:      'center',
-            justifyContent:  'space-between',
-            padding:         '6px 12px',
-            background:      'rgba(255,255,255,0.02)',
-            borderTop:       '1px solid rgba(255,107,53,0.2)',
+            display:        'flex',
+            alignItems:     'center',
+            justifyContent: 'space-between',
+            padding:        '6px 12px',
+            background:     'rgba(255,255,255,0.02)',
+            borderTop:      '1px solid rgba(255,107,53,0.2)',
           }}>
-            <span style={{
-              fontSize: '10px',
-              color:    'rgba(255,255,255,0.3)',
-            }}>
+            <span style={{ fontSize: '10px', color: 'rgba(255,255,255,0.3)' }}>
               1280 × 720 · JPEG
             </span>
-
-            <span style={{
-              fontSize: '10px',
-              color:    'rgba(255,107,53,0.7)',
-            }}>
+            <span style={{ fontSize: '10px', color: 'rgba(255,107,53,0.7)' }}>
               Small O Web Agent
             </span>
           </div>

@@ -10,6 +10,9 @@ path-allowlist check before executing.
 """
 
 import asyncio
+import os
+import pathlib
+import re
 from pathlib import Path
 
 from tools.registry import ToolDefinition, registry
@@ -17,13 +20,40 @@ from tools.registry import ToolDefinition, registry
 
 _MAX_CHARS = 50_000
 
+# Compiled once at import time — matches common LLM-hallucinated placeholders.
+_PLACEHOLDER_RE = re.compile(
+    r"(?:/Users/[Yy]our[Uu]sername"
+    r"|/Users/\[username\]"
+    r"|/home/[Yy]our[Uu]sername"
+    r"|\$HOME"
+    r"|\$\{HOME\})",
+)
+
+
+def resolve_path(path: str) -> str:
+    """Replace LLM-generated username placeholders with the real home directory.
+
+    Pure function — no side effects, no I/O.  Handles patterns such as:
+      /Users/YourUsername/…  →  /Users/rohit/…
+      /Users/yourUsername/…  →  /Users/rohit/…
+      /Users/[username]/…    →  /Users/rohit/…
+      $HOME/…                →  /Users/rohit/…
+      ${HOME}/…              →  /Users/rohit/…
+      ~/…                    →  expanded by os.path.expanduser
+
+    The result is then passed through expanduser() to handle any bare ~ prefixes.
+    """
+    home = str(pathlib.Path.home())
+    resolved = _PLACEHOLDER_RE.sub(home, path)
+    return os.path.expanduser(resolved)
+
 
 async def _read_file(args: dict) -> str:
     path_str: str = args.get("path", "").strip()
     if not path_str:
         return "Error: 'path' argument is required."
 
-    path = Path(path_str).expanduser().resolve()
+    path = Path(resolve_path(path_str)).resolve()
 
     try:
         if not path.exists():
@@ -56,7 +86,7 @@ async def _write_file(args: dict) -> str:
     if mode not in ("overwrite", "append"):
         mode = "overwrite"
 
-    path = Path(path_str).expanduser().resolve()
+    path = Path(resolve_path(path_str)).resolve()
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

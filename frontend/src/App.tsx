@@ -109,10 +109,11 @@ const STATE_FOOTER: Record<string, { emoji: string; label: string }> = {
 }
 
 export default function App() {
-  const { sendTextInput } = useWebSocket()
-  const { startMic }      = useMicrophone()
-  const voiceState        = useAppStore((s) => s.voiceState)
-  const wsConnected       = useAppStore((s) => s.wsConnected)
+  const { sendTextInput }  = useWebSocket()
+  const { startMic }       = useMicrophone()
+  const voiceState         = useAppStore((s) => s.voiceState)
+  const wsConnected        = useAppStore((s) => s.wsConnected)
+  const browserViewerOpen  = useAppStore((s) => s.browserViewerOpen)
   const [drawerOpen, setDrawerOpen]   = useState(false)
   const [inputText,  setInputText]    = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
@@ -146,7 +147,7 @@ export default function App() {
           <StatusBar />
           <ConversationStream onStartMic={startMic} />
           <PlanProgress />
-          <WebViewer />
+          {browserViewerOpen && <WebViewer />}
 
           {/* ── Text input bar — always visible ─────────────────────── */}
           <div

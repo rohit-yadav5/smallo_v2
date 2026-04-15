@@ -33,7 +33,7 @@ from typing import Iterator
 import requests
 
 from config.llm import LLM_CONFIG, KEEP_ALIVE_IDLE, KEEP_ALIVE_ACTIVE
-from llm.SYSTEM_PROMPT import SYSTEM_PROMPT
+from llm.SYSTEM_PROMPT import SYSTEM_PROMPT, get_runtime_context
 
 # ── Conversation-active flag ──────────────────────────────────────────────────
 # True  → model uses KEEP_ALIVE_ACTIVE (120 s) so it stays warm between turns.
@@ -168,7 +168,7 @@ def _build_messages(
     extra_history: Additional messages to insert between system and user
                    (used for the second-pass tool-result injection).
     """
-    system_content = SYSTEM_PROMPT + _build_tools_section()
+    system_content = SYSTEM_PROMPT + _build_tools_section() + "\n\n" + get_runtime_context()
     if system_suffix:
         system_content += "\n\n" + system_suffix
 

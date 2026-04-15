@@ -41,6 +41,13 @@ interface AppState {
   /** Transient toast for low_memory / model_swap events */
   systemToast:              { message: string; kind: 'warning' | 'info' } | null
 
+  /** STT toggle — false disables mic capture entirely */
+  sttEnabled:               boolean
+  /** TTS toggle — false skips audio synthesis; text still streams */
+  ttsEnabled:               boolean
+  /** Browser viewer panel open/closed state */
+  browserViewerOpen:        boolean
+
   setVoiceState:            (state: VoiceState) => void
   setWsConnected:           (connected: boolean) => void
   setMicActive:             (v: boolean) => void
@@ -60,6 +67,9 @@ interface AppState {
   setScreenshot:            (shot: WebScreenshot) => void
   handleSystemEvent:        (ev: SystemEvent) => void
   clearSystemToast:         () => void
+  toggleSTT:                () => void
+  toggleTTS:                () => void
+  setBrowserViewerOpen:     (v: boolean) => void
 }
 
 // Module-level map — cancels stale glow timers when same node glows again
@@ -83,6 +93,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   availableRamGb:      null,
   ramPressure:         null,
   systemToast:         null,
+  sttEnabled:          true,
+  ttsEnabled:          true,
+  browserViewerOpen:   false,
 
   setVoiceState:        (state)     => set({ voiceState: state }),
   setWsConnected:       (connected) => set({ wsConnected: connected }),
@@ -268,5 +281,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  clearSystemToast: () => set({ systemToast: null }),
+  clearSystemToast:      () => set({ systemToast: null }),
+  toggleSTT:             () => set((s) => ({ sttEnabled: !s.sttEnabled })),
+  toggleTTS:             () => set((s) => ({ ttsEnabled: !s.ttsEnabled })),
+  setBrowserViewerOpen:  (v) => set({ browserViewerOpen: v }),
 }))

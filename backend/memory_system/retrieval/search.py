@@ -1,3 +1,4 @@
+import concurrent.futures
 from datetime import datetime
 from memory_system.db.connection import get_connection
 from memory_system.entities.extractor import extract_entities
@@ -5,12 +6,44 @@ from memory_system.embeddings.embedder import generate_embedding_vector
 from memory_system.embeddings.vector_store import search_vector
 from collections import deque
 
+# ── Entity extraction fast-path helpers ──────────────────────────────────────
+# A single-worker pool used to run entity extraction with a wall-clock timeout.
+# This prevents a slow/unloaded NLP model from blocking retrieval for > 2s.
+_entity_exec = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="entity_extract"
+)
+
+# Predicates that determine whether entity extraction is worth running.
+# Short or trivially simple queries are handled by pure FAISS search.
+_SKIP_ENTITY_PREDICATES = [
+    lambda q: len(q.split()) <= 6,                                    # very short
+    lambda q: q.strip().endswith("?") and len(q.split()) <= 8,       # simple question
+]
+
+
+def should_skip_entity_extraction(query: str) -> bool:
+    """Return True if entity extraction would add no value for this query."""
+    return any(fn(query) for fn in _SKIP_ENTITY_PREDICATES)
+
+
+def _extract_entities_timed(query: str, timeout: float = 2.0) -> list[dict]:
+    """Run extract_entities with a wall-clock timeout; returns [] on timeout."""
+    future = _entity_exec.submit(extract_entities, query)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        print("[memory] entity extraction timed out — using raw query", flush=True)
+        return []
+    except Exception as exc:
+        print(f"[memory] entity extraction error — {exc}", flush=True)
+        return []
+
 
 def calculate_recency_boost(created_at_str):
+    """Return a recency multiplier (1.0 = recent, 0.4 = old) based on memory age."""
     created_at = datetime.fromisoformat(created_at_str)
     days_old = (datetime.utcnow() - created_at).days
 
-    # Simple decay formula
     if days_old < 7:
         return 1.0
     elif days_old < 30:
@@ -20,6 +53,7 @@ def calculate_recency_boost(created_at_str):
 
 
 def detect_intent(query: str) -> str:
+    """Classify query intent for score boosting during retrieval."""
     q = query.lower()
 
     # Personal memory intent
@@ -36,16 +70,25 @@ def detect_intent(query: str) -> str:
 
     return "general"
 
+
 def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
 
     conn = get_connection()
     cursor = conn.cursor()
 
     # ---------------------------
-    # 1️⃣ Extract Entities From Query
+    # 1️⃣ Extract Entities From Query (with fast-path skip + timeout)
     # ---------------------------
-    query_entities = extract_entities(query)
-    entity_names = [e["name"] for e in query_entities]
+    if should_skip_entity_extraction(query):
+        # Short / simple queries — skip entity extraction entirely.
+        # FAISS semantic search on the raw text is sufficient and saves 20-2000 ms.
+        query_entities = []
+        entity_names: list[str] = []
+        print(f"  [memory] skipped entity extraction (short query: {len(query.split())} words)", flush=True)
+    else:
+        # Longer queries — run entity extraction with a 2s timeout safety net.
+        query_entities = _extract_entities_timed(query, timeout=2.0)
+        entity_names = [e["name"] for e in query_entities]
 
     # ---------------------------
     # Expand entity graph (graph mode)
