@@ -9,9 +9,9 @@ it step by step.
 
 Configuration
 ─────────────
-browser-use uses LangChain-compatible LLMs.  We pass a ChatOpenAI instance
-pointed at the local Ollama OpenAI-compatible endpoint so that zero cloud
-calls are made.
+browser-use 0.12.6 has its own LLM class at browser_use.llm.openai.chat.
+We use that directly (not langchain_openai) so the .model and .provider
+attributes that browser-use checks internally are always present.
 
 Step callbacks
 ──────────────
@@ -22,7 +22,6 @@ a live view of what the agent is doing.
 
 import asyncio
 import base64
-import importlib
 import time
 from typing import Callable, Optional
 
@@ -47,15 +46,16 @@ def set_broadcast_fn(fn: Callable) -> None:
 # ── LLM factory ───────────────────────────────────────────────────────────────
 
 def _make_llm():
-    """Return a ChatOpenAI instance pointed at local Ollama (no cloud calls).
+    """Return a browser-use ChatOpenAI instance pointed at local Ollama (no cloud calls).
 
-    Lazy import so tests can mock langchain_openai without the module-level
-    import chain pulling in torch on first load.
+    Uses browser_use.llm.openai.chat.ChatOpenAI (not langchain_openai) so that
+    the .model and .provider attributes browser-use checks internally are present.
+    Lazy import so tests can mock the module before it is resolved.
     """
-    from langchain_openai import ChatOpenAI  # noqa: PLC0415 — intentional lazy import
-    return ChatOpenAI(
-        base_url="http://localhost:11434/v1",
+    from browser_use.llm.openai.chat import ChatOpenAI as BrowserUseChatOpenAI  # noqa: PLC0415
+    return BrowserUseChatOpenAI(
         model=LLM_CONFIG.planner_model,
+        base_url="http://localhost:11434/v1",
         api_key="ollama",
         temperature=0,
     )
@@ -122,12 +122,11 @@ async def _web_task(args: dict) -> str:
         async def _on_step_end(agent) -> None:
             await _try_broadcast_screenshot(agent)
 
-        # Defer the import so tests can patch sys.modules["browser_use"] before use
-        _browser_use = importlib.import_module("browser_use")
-        Agent = _browser_use.Agent
+        from browser_use import Agent  # noqa: PLC0415 — function-level to allow test mocking
         agent = Agent(
             task=task,
             llm=llm,
+            enable_signal_handler=False,
         )
 
         history = await agent.run(

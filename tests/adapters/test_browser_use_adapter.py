@@ -2,8 +2,8 @@
 
 TDD tests for the browser-use adapter.
 
-All tests mock the Agent class and langchain_openai so no real browser,
-Ollama, or torch imports are triggered.
+All tests mock the Agent class and browser_use.llm.openai.chat so no real
+browser, Ollama, or torch imports are triggered.
 """
 
 import os
@@ -59,23 +59,29 @@ def _make_mock_chat_openai_class():
     return MockChatOpenAI
 
 
-def _make_langchain_module(chat_openai_cls=None):
-    """Return a fake langchain_openai module."""
+def _make_llm_chat_module(chat_openai_cls=None):
+    """Return a fake browser_use.llm.openai.chat module."""
     mock_module = MagicMock()
-    if chat_openai_cls is not None:
-        mock_module.ChatOpenAI = chat_openai_cls
-    else:
-        mock_module.ChatOpenAI = _make_mock_chat_openai_class()
+    mock_module.ChatOpenAI = chat_openai_cls or _make_mock_chat_openai_class()
     return mock_module
 
 
-def _sys_modules_patch(browser_use_module=None, langchain_module=None):
-    """Build the sys.modules dict patch for both browser_use and langchain_openai."""
+def _sys_modules_patch(browser_use_module=None, llm_chat_module=None):
+    """Build the sys.modules dict patch for browser_use and its LLM sub-modules.
+
+    Args:
+        browser_use_module: fake top-level browser_use module (provides Agent)
+        llm_chat_module:    fake browser_use.llm.openai.chat module (provides ChatOpenAI)
+                            If None, a default mock is created automatically.
+    """
     patches = {}
     if browser_use_module is not None:
         patches["browser_use"] = browser_use_module
-    if langchain_module is not None:
-        patches["langchain_openai"] = langchain_module
+
+    chat_mod = llm_chat_module or _make_llm_chat_module()
+    patches["browser_use.llm"] = MagicMock()
+    patches["browser_use.llm.openai"] = MagicMock()
+    patches["browser_use.llm.openai.chat"] = chat_mod
     return patches
 
 
@@ -97,10 +103,7 @@ def flush_adapter():
 
 def test_web_task_registered_in_registry(flush_adapter):
     """After importing the adapter, 'web_task' must appear in registry.names()."""
-    mods = _sys_modules_patch(
-        browser_use_module=_make_browser_use_module(),
-        langchain_module=_make_langchain_module(),
-    )
+    mods = _sys_modules_patch(browser_use_module=_make_browser_use_module())
     with patch.dict("sys.modules", mods):
         import adapters.browser_use_adapter  # noqa: F401 — side-effect import
 
@@ -114,10 +117,7 @@ def test_web_task_registered_in_registry(flush_adapter):
 
 def test_missing_task_returns_error(flush_adapter):
     """_web_task({}) must return a string starting with 'Error:'."""
-    mods = _sys_modules_patch(
-        browser_use_module=_make_browser_use_module(),
-        langchain_module=_make_langchain_module(),
-    )
+    mods = _sys_modules_patch(browser_use_module=_make_browser_use_module())
     with patch.dict("sys.modules", mods):
         import adapters.browser_use_adapter as ada
 
@@ -127,10 +127,7 @@ def test_missing_task_returns_error(flush_adapter):
 
 def test_empty_task_returns_error(flush_adapter):
     """_web_task({'task': ''}) must return a string starting with 'Error:'."""
-    mods = _sys_modules_patch(
-        browser_use_module=_make_browser_use_module(),
-        langchain_module=_make_langchain_module(),
-    )
+    mods = _sys_modules_patch(browser_use_module=_make_browser_use_module())
     with patch.dict("sys.modules", mods):
         import adapters.browser_use_adapter as ada
 
@@ -145,10 +142,7 @@ def test_empty_task_returns_error(flush_adapter):
 def test_successful_task_returns_result(flush_adapter):
     """_web_task({'task': 'search for X'}) calls agent.run() and returns the result."""
     mock_agent, history = _make_mock_agent("Found information about X.")
-    mods = _sys_modules_patch(
-        browser_use_module=_make_browser_use_module(agent_instance=mock_agent),
-        langchain_module=_make_langchain_module(),
-    )
+    mods = _sys_modules_patch(browser_use_module=_make_browser_use_module(agent_instance=mock_agent))
     with patch.dict("sys.modules", mods):
         import adapters.browser_use_adapter as ada
 
@@ -158,14 +152,16 @@ def test_successful_task_returns_result(flush_adapter):
     assert isinstance(result, str)
     assert len(result) > 0
 
+    # on_step_end must be passed as a keyword argument to agent.run()
+    call_kwargs = mock_agent.run.call_args.kwargs
+    assert "on_step_end" in call_kwargs
+    assert callable(call_kwargs["on_step_end"])
+
 
 def test_successful_task_result_contains_final_result(flush_adapter):
     """When final_result() returns a non-None string, it appears in the handler return."""
     mock_agent, history = _make_mock_agent("Specific result string.")
-    mods = _sys_modules_patch(
-        browser_use_module=_make_browser_use_module(agent_instance=mock_agent),
-        langchain_module=_make_langchain_module(),
-    )
+    mods = _sys_modules_patch(browser_use_module=_make_browser_use_module(agent_instance=mock_agent))
     with patch.dict("sys.modules", mods):
         import adapters.browser_use_adapter as ada
 
@@ -182,10 +178,7 @@ def test_agent_run_exception_returns_failure_string(flush_adapter):
     """If agent.run() raises, _web_task should return a string containing 'failed'."""
     mock_agent = MagicMock()
     mock_agent.run = AsyncMock(side_effect=RuntimeError("browser crashed"))
-    mods = _sys_modules_patch(
-        browser_use_module=_make_browser_use_module(agent_instance=mock_agent),
-        langchain_module=_make_langchain_module(),
-    )
+    mods = _sys_modules_patch(browser_use_module=_make_browser_use_module(agent_instance=mock_agent))
     with patch.dict("sys.modules", mods):
         import adapters.browser_use_adapter as ada
 
@@ -201,12 +194,11 @@ def test_agent_run_exception_returns_failure_string(flush_adapter):
 def test_make_llm_uses_local_ollama(flush_adapter):
     """_make_llm() must create a ChatOpenAI with base_url containing 'localhost:11434'."""
     MockChatOpenAI = _make_mock_chat_openai_class()
-    mock_lc = MagicMock()
-    mock_lc.ChatOpenAI = MockChatOpenAI
+    llm_chat_mod = _make_llm_chat_module(chat_openai_cls=MockChatOpenAI)
 
     mods = _sys_modules_patch(
         browser_use_module=_make_browser_use_module(),
-        langchain_module=mock_lc,
+        llm_chat_module=llm_chat_mod,
     )
     with patch.dict("sys.modules", mods):
         import adapters.browser_use_adapter as ada
@@ -226,10 +218,7 @@ def test_make_llm_uses_local_ollama(flush_adapter):
 def test_none_final_result_returns_nonempty_string(flush_adapter):
     """When final_result() returns None, _web_task still returns a non-empty string."""
     mock_agent, history = _make_mock_agent(final_result_value=None)
-    mods = _sys_modules_patch(
-        browser_use_module=_make_browser_use_module(agent_instance=mock_agent),
-        langchain_module=_make_langchain_module(),
-    )
+    mods = _sys_modules_patch(browser_use_module=_make_browser_use_module(agent_instance=mock_agent))
     with patch.dict("sys.modules", mods):
         import adapters.browser_use_adapter as ada
 
