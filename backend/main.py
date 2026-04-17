@@ -122,11 +122,22 @@ import web_agent                                          # triggers tool self-r
 from web_agent.agent import set_broadcast_fn as _set_web_broadcast
 from web_agent.monitor import web_monitor
 from web_agent.browser import BrowserManager
-import tools.research_tool                               # registers deep_research tool  # noqa: F401
+import adapters.gpt_researcher_adapter                   # registers deep_research tool  # noqa: F401
+from adapters.gpt_researcher_adapter import set_broadcast_fn as _set_research_broadcast
+import adapters.browser_use_adapter                      # registers web_task tool  # noqa: F401
+from adapters.browser_use_adapter import set_broadcast_fn as _set_browser_use_broadcast
 import tools.close_heavy_tabs                            # registers close_heavy_tabs tool  # noqa: F401
 import tools.memory_tool                                 # registers clear_memory tool     # noqa: F401
 
 import httpx as _httpx
+import uuid as _uuid
+
+
+# ──────────────────────────────────────────────────
+# Session ID — unique per server startup
+# ──────────────────────────────────────────────────
+
+SESSION_ID: str = _uuid.uuid4().hex[:12]
 
 
 # ──────────────────────────────────────────────────
@@ -191,6 +202,13 @@ _CANCEL_WORDS = frozenset([
     "stop that", "cancel that", "never mind",
 ])
 
+# ── Turn-in-progress tracking (FIX1A / FIX1C watchdog) ───────────────────────
+# Set True/timestamp when _run_turn starts; False when it returns (any path).
+# The _pipeline_watchdog asyncio task reads these to detect stuck turns (>90s)
+# and resets VOICE_STATE to idle so the user isn't left in silence forever.
+_turn_in_progress: bool = False
+_turn_started_at: float = 0.0
+
 # ── Short-term recent-actions context buffer ──────────────────────────────────
 # Holds the last 5 planner completions / tool results so the LLM can answer
 # follow-up questions ("where did you save that?") without relying on semantic
@@ -220,8 +238,12 @@ async def _launch_plan(goal: str) -> None:
             await _current_plan_task
         except asyncio.CancelledError:
             pass
+    # Pass result_queue and action_callback directly — avoids the circular-import
+    # bug where planner's ``from main import _plan_result_queue`` imports main.py
+    # as a fresh module (not __main__), creating a different queue object that the
+    # pipeline thread never reads.  (FIX1B root cause fix)
     _current_plan_task = asyncio.create_task(
-        run_plan(goal, _emit, max_steps=20),
+        run_plan(goal, _emit, _plan_result_queue, add_recent_action, max_steps=20),
         name=f"plan:{goal[:40]}",
     )
     print(f"  [plan] task created: {_current_plan_task.get_name()}", flush=True)
@@ -834,7 +856,10 @@ def _pipeline_loop():
         print(f"{'─'*54}")
 
         # ── Top-level crash guard — one bad turn never kills the loop ──────
+        global _turn_in_progress, _turn_started_at
         try:
+            _turn_in_progress = True
+            _turn_started_at  = time.time()
             came_from_barge_in = _run_turn(turn, tracker, router, came_from_barge_in)
         except Exception as e:
             came_from_barge_in = False
@@ -842,6 +867,8 @@ def _pipeline_loop():
             import traceback; traceback.print_exc()
             _emit("VOICE_STATE", {"state": "idle"})
             time.sleep(1)   # brief pause before retrying
+        finally:
+            _turn_in_progress = False
 
 
 def _run_turn(turn: int, tracker: LatencyTracker, router,
@@ -1145,10 +1172,11 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         # Launch plan on main asyncio loop (non-blocking from pipeline thread)
         asyncio.run_coroutine_threadsafe(_launch_plan(goal), _loop)
         # Wait for planner to signal: "MULTI" → multi-step (say "On it"),
-        # or a result string → single-tool completed (speak result directly).
-        # Poll every 0.25 s so user barge-in or text input can still interrupt.
+        # or a result string → single-tool completed (generate natural response).
+        # Hard 45s deadline — no turn ever hangs forever (FIX1A).
+        # Single-tool tools should complete well within this window.
         plan_signal = None
-        deadline = time.time() + 120
+        deadline = time.time() + 45  # was 120 — hard cap prevents indefinite hangs
         while time.time() < deadline:
             try:
                 plan_signal = _plan_result_queue.get(timeout=0.25)
@@ -1158,19 +1186,39 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
                     break
         _emit("VOICE_STATE", {"state": "speaking"})
         _interrupt_event.clear()
-        if plan_signal and plan_signal != "MULTI":
-            # Single-tool plan completed — speak the actual result
-            print(f"  [pipeline] single-tool result received, speaking directly", flush=True)
-            try:
-                speak(plan_signal, _interrupt_event)
-            except Exception:
-                pass
-        else:
-            # Multi-step plan launched (or interrupted) — generic acknowledgement
+        if plan_signal is None or plan_signal in ("MULTI", "TIMEOUT"):
+            # Multi-step plan, 45s timeout, or watchdog reset — speak generic ack.
+            # The plan is either still running (MULTI) or timed out (TIMEOUT/None).
+            # In the MULTI case the planner will speak its own completion summary.
             try:
                 speak("On it. I'll let you know when it's done.", _interrupt_event)
             except Exception:
                 pass
+        else:
+            # Single-tool completed — ask LLM to produce a natural spoken response
+            # from the raw tool result instead of speaking the JSON/plain text directly.
+            # This is FIX1C: ensures something always plays even if result is terse.
+            print(f"  [pipeline] single-tool result → generating natural response", flush=True)
+            tool_suffix = (user_ctx_suffix + f"\n[Tool result]: {plan_signal}").strip()
+            try:
+                llm_resp = ask_llm_turn(prompt, system_suffix=tool_suffix)
+                if isinstance(llm_resp, dict):
+                    # plan_trigger inside plan response — shouldn't happen, speak raw
+                    speak(str(plan_signal)[:300], _interrupt_event)
+                elif _tts_enabled:
+                    speak_stream(
+                        _token_broadcaster(llm_resp, _interrupt_event),
+                        _interrupt_event,
+                    )
+                else:
+                    print("  [tts] disabled — skipping synthesis", flush=True)
+                    "".join(_token_broadcaster(llm_resp, _interrupt_event))
+            except Exception as _resp_err:
+                print(f"  [pipeline] LLM response for tool result failed: {_resp_err} — speaking raw", flush=True)
+                try:
+                    speak(str(plan_signal)[:300], _interrupt_event)
+                except Exception:
+                    pass
         _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
         return False
@@ -1330,6 +1378,34 @@ async def _ws_handler(ws):
                             _text_input_queue.put_nowait(text)
                             print(f"  [ws] TEXT_INPUT: {text[:80]!r}", flush=True)
 
+                    elif ev == "GET_SESSION_FILES":
+                        from bot_docs.store import get_session_files
+                        from dataclasses import asdict
+                        files = get_session_files(SESSION_ID)
+                        await ws.send(json.dumps({
+                            "event": "FILE_LIST",
+                            "data": {"files": [asdict(f) for f in files]},
+                        }))
+
+                    elif ev == "DOWNLOAD_FILE":
+                        uid = ctrl.get("data", {}).get("uid", "")
+                        if uid:
+                            from bot_docs.store import get_file_content, get_entry_by_uid
+                            from dataclasses import asdict
+                            content = get_file_content(uid)
+                            entry   = get_entry_by_uid(uid)
+                            if content is not None and entry:
+                                await ws.send(json.dumps({
+                                    "event": "FILE_CONTENT",
+                                    "data": {
+                                        "uid":       uid,
+                                        "title":     entry.title,
+                                        "filename":  entry.filename,
+                                        "content":   content,
+                                        "extension": entry.extension,
+                                    },
+                                }))
+
                 except Exception:
                     pass
     except Exception:
@@ -1346,8 +1422,35 @@ async def _main():
     # ── Share the event loop with tool dispatch (reminder asyncio tasks) ──────
     backend_loop_ref.loop = _loop
 
+    # ── Session-ID memory migration (FIX2A — BUG-005) ────────────────────────
+    # Adds session_id column to memories if absent and marks pre-existing rows
+    # as 'legacy' so cross-session identity contamination can be penalised in
+    # retrieval scoring.  Must run before any memory insert or retrieval.
+    try:
+        from memory_system.db.migrate_session import migrate_add_session_id  # noqa: PLC0415
+        migrate_add_session_id()
+    except Exception as _mig_exc:
+        print(f"  [memory] session migration failed (non-fatal): {_mig_exc}", flush=True)
+
+    # Publish current session_id into the shared ref so insert_pipeline and
+    # search.py can tag / penalise memories without a circular import.
+    backend_loop_ref.session_id = SESSION_ID
+    print(f"  [memory] session context: {SESSION_ID}", flush=True)
+
     # ── Load persistent user context from disk ───────────────────────────────
     load_user_context()
+
+    # ── bot-docs managed file store ───────────────────────────────────────────
+    from bot_docs.store import ensure_dirs, BOT_DOCS_DIR
+    ensure_dirs()
+    print(f"  [bot-docs] directory ready: {BOT_DOCS_DIR}", flush=True)
+    print(f"  [session] ID: {SESSION_ID}", flush=True)
+    from tools.file_tool import (
+        set_broadcast_fn as _set_file_broadcast,
+        set_session_id  as _set_file_session,
+    )
+    _set_file_broadcast(_emit)
+    _set_file_session(SESSION_ID)
 
     # Register the WS audio sender so TTS can stream audio to browser clients.
     # Must happen after _loop is set (sender uses run_coroutine_threadsafe).
@@ -1364,6 +1467,10 @@ async def _main():
         print("  [web_agent] Chromium ready", flush=True)
     except Exception as _exc:
         print(f"  [web_agent] Chromium launch failed (will retry on first use): {_exc}", flush=True)
+
+    # ── Wire adapter broadcast functions ──────────────────────────────────────
+    _set_research_broadcast(_emit)
+    _set_browser_use_broadcast(_emit)
 
     # Start background webpage-monitor loop
     web_monitor.run_forever(_loop)
@@ -1431,6 +1538,29 @@ async def _main():
     asyncio.create_task(_memory_maintenance_loop(), name="memory-maintenance")
     asyncio.create_task(_memory_consolidation_loop(), name="memory-consolidation")
     print("  [memory] lifecycle tasks scheduled (maintenance=6h, consolidation=24h)", flush=True)
+
+    # ── Pipeline watchdog (FIX1A / Part C) ──────────────────────────────────
+    # Detects turns stuck >90 s and resets VOICE_STATE to idle.
+    # 45s plan deadline prevents most hangs; this is the last-resort safety net.
+    async def _pipeline_watchdog():
+        while True:
+            await asyncio.sleep(60)
+            if _turn_in_progress and time.time() - _turn_started_at > 90:
+                print(
+                    "[watchdog] turn stuck >90s — resetting pipeline state",
+                    flush=True,
+                )
+                # Can't preempt the thread, but reset voice state so the UI
+                # doesn't stay frozen in "thinking" indefinitely.
+                _emit("VOICE_STATE", {"state": "idle"})
+                # Unblock the pipeline if it's waiting on the plan queue.
+                try:
+                    _plan_result_queue.put_nowait("TIMEOUT")
+                except Exception:
+                    pass
+
+    asyncio.create_task(_pipeline_watchdog(), name="pipeline-watchdog")
+    print("  [watchdog] pipeline watchdog scheduled (60s check, 90s threshold)", flush=True)
 
     # ── Server-ready preload: fire immediately on the event loop ─────────────
     # This fires the LLM preload as soon as _main() completes setup, giving
