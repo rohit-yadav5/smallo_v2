@@ -37,7 +37,7 @@ os.environ.setdefault("SMART_LLM",        f"openai:{LLM_CONFIG.planner_model}")
 os.environ.setdefault("STRATEGIC_LLM",    f"openai:{LLM_CONFIG.planner_model}")
 os.environ.setdefault("RETRIEVER",        "duckduckgo")
 os.environ.setdefault("DOC_PATH",         "")                 # no local doc path needed
-os.environ.setdefault("EMBEDDING",        "openai:text-embedding-3-small")
+os.environ.setdefault("EMBEDDING",        "custom:qwen2.5:3b")  # local Ollama via OpenAI-compat /v1
 
 # ── Now safe to import GPTResearcher ────────────────────────────────────────
 from gpt_researcher import GPTResearcher  # noqa: E402
@@ -99,6 +99,11 @@ async def _deep_research(args: dict) -> str:
     # ── Run GPT-Researcher ────────────────────────────────────────────────────
     try:
         await _emit("searching", "Searching and gathering sources…", topic=topic)
+
+        # Forward max_pages to GPTResearcher via its env-var config knob.
+        # Safe in a single asyncio event loop — no concurrent calls can race here.
+        per_query = str(max(2, max_pages // 2))
+        os.environ["MAX_SEARCH_RESULTS_PER_QUERY"] = per_query
 
         researcher = GPTResearcher(
             query=topic,
