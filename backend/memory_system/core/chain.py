@@ -9,31 +9,54 @@ _NEGATIVE_AFFECTS = {"negative", "frustrated"}
 
 def create_chain(cursor, source_id: str, target_id: str, relation_type: str) -> str:
     """Insert a directed memory chain link. Returns the relation id."""
-    assert relation_type in CHAIN_RELATION_TYPES, (
-        f"Unknown relation type '{relation_type}'. Must be one of {CHAIN_RELATION_TYPES}"
-    )
+    if relation_type not in CHAIN_RELATION_TYPES:
+        raise ValueError(
+            f"Unknown relation type '{relation_type}'. Must be one of {CHAIN_RELATION_TYPES}"
+        )
+    cursor.execute("""
+        SELECT id FROM memory_relations
+        WHERE source_memory_id = ? AND target_memory_id = ? AND relation_type = ?
+    """, (source_id, target_id, relation_type))
+    existing = cursor.fetchone()
+    if existing:
+        return existing["id"] if hasattr(existing, "__getitem__") else existing[0]
     rel_id = str(uuid.uuid4())
     cursor.execute("""
-        INSERT OR IGNORE INTO memory_relations
+        INSERT INTO memory_relations
         (id, source_memory_id, target_memory_id, relation_type, created_at)
         VALUES (?, ?, ?, ?, ?)
     """, (rel_id, source_id, target_id, relation_type, datetime.utcnow().isoformat()))
     return rel_id
 
 
-def get_chain_links(cursor, memory_id: str, relation_type: str = None) -> list[dict]:
-    """Return all memory_relations rows where source_memory_id = memory_id."""
-    if relation_type:
+def get_chain_links(cursor, memory_id: str, direction: str = "outgoing") -> list[dict]:
+    """Return linked memory ids based on direction.
+
+    direction="outgoing" — target_memory_id values where source_memory_id = memory_id
+    direction="incoming" — source_memory_id values where target_memory_id = memory_id
+    direction="both"     — union of outgoing + incoming (deduped)
+    """
+    if direction == "outgoing":
         cursor.execute("""
-            SELECT target_memory_id, relation_type FROM memory_relations
-            WHERE source_memory_id = ? AND relation_type = ?
-        """, (memory_id, relation_type))
-    else:
-        cursor.execute("""
-            SELECT target_memory_id, relation_type FROM memory_relations
+            SELECT target_memory_id AS memory_id FROM memory_relations
             WHERE source_memory_id = ?
         """, (memory_id,))
-    return [dict(r) for r in cursor.fetchall()]
+        return [row["memory_id"] for row in cursor.fetchall()]
+    elif direction == "incoming":
+        cursor.execute("""
+            SELECT source_memory_id AS memory_id FROM memory_relations
+            WHERE target_memory_id = ?
+        """, (memory_id,))
+        return [row["memory_id"] for row in cursor.fetchall()]
+    elif direction == "both":
+        cursor.execute("""
+            SELECT target_memory_id AS memory_id FROM memory_relations WHERE source_memory_id = ?
+            UNION
+            SELECT source_memory_id AS memory_id FROM memory_relations WHERE target_memory_id = ?
+        """, (memory_id, memory_id))
+        return [row["memory_id"] for row in cursor.fetchall()]
+    else:
+        raise ValueError(f"Unknown direction '{direction}'. Must be 'outgoing', 'incoming', or 'both'.")
 
 
 def detect_chain_type(source_affect: str, target_affect: str) -> str:

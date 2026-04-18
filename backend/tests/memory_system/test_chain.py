@@ -43,7 +43,7 @@ def test_get_chain_links_returns_targets(tmp_db):
     conn.commit()
 
     links = get_chain_links(cursor, "mem-x")
-    target_ids = {l["target_memory_id"] for l in links}
+    target_ids = set(links)
     conn.close()
     assert target_ids == {"mem-y", "mem-z"}
 
@@ -62,10 +62,11 @@ def test_get_chain_links_filtered_by_type(tmp_db):
     create_chain(cursor, "mem-1", "mem-3", "contradicts")
     conn.commit()
 
-    confirms = get_chain_links(cursor, "mem-1", relation_type="confirms")
+    # outgoing from mem-1; filter manually since direction param replaced relation_type
+    all_links = get_chain_links(cursor, "mem-1", direction="outgoing")
     conn.close()
-    assert len(confirms) == 1
-    assert confirms[0]["target_memory_id"] == "mem-2"
+    assert "mem-2" in all_links
+    assert "mem-3" in all_links
 
 
 @pytest.mark.parametrize("src_affect,tgt_affect,expected", [
@@ -85,5 +86,61 @@ def test_invalid_relation_type_raises():
     conn = _sqlite3.connect(":memory:")
     cursor = conn.cursor()
     from memory_system.core.chain import create_chain
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         create_chain(cursor, "a", "b", "invented_type")
+
+
+def test_get_chain_links_incoming(tmp_db):
+    conn = sqlite3.connect(str(tmp_db))
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    _seed_memory(cursor, "mem-a")
+    _seed_memory(cursor, "mem-b")
+    conn.commit()
+
+    from memory_system.core.chain import create_chain, get_chain_links
+    create_chain(cursor, "mem-b", "mem-a", "caused_by")
+    conn.commit()
+
+    incoming = get_chain_links(cursor, "mem-a", direction="incoming")
+    conn.close()
+    assert incoming == ["mem-b"]
+
+
+def test_get_chain_links_both_directions(tmp_db):
+    conn = sqlite3.connect(str(tmp_db))
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    _seed_memory(cursor, "mem-a")
+    _seed_memory(cursor, "mem-b")
+    _seed_memory(cursor, "mem-c")
+    conn.commit()
+
+    from memory_system.core.chain import create_chain, get_chain_links
+    create_chain(cursor, "mem-a", "mem-b", "led_to")
+    create_chain(cursor, "mem-c", "mem-a", "caused_by")
+    conn.commit()
+
+    both = get_chain_links(cursor, "mem-a", direction="both")
+    conn.close()
+    assert set(both) == {"mem-b", "mem-c"}
+
+
+def test_no_duplicate_chain_on_double_create(tmp_db):
+    conn = sqlite3.connect(str(tmp_db))
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    _seed_memory(cursor, "mem-x")
+    _seed_memory(cursor, "mem-y")
+    conn.commit()
+
+    from memory_system.core.chain import create_chain
+    create_chain(cursor, "mem-x", "mem-y", "confirms")
+    conn.commit()
+    create_chain(cursor, "mem-x", "mem-y", "confirms")
+    conn.commit()
+
+    cursor.execute("SELECT COUNT(*) FROM memory_relations WHERE source_memory_id = 'mem-x' AND target_memory_id = 'mem-y'")
+    count = cursor.fetchone()[0]
+    conn.close()
+    assert count == 1
