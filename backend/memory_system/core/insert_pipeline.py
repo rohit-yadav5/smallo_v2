@@ -5,6 +5,7 @@ from datetime import datetime
 from memory_system.db.connection import get_connection
 from memory_system.core.importance import calculate_importance
 from memory_system.core.affect import detect_affect
+from memory_system.core.chain import create_chain, detect_chain_type
 from memory_system.entities.extractor import extract_entities
 from memory_system.entities.service import get_or_create_entity
 from memory_system.embeddings.embedder import generate_embedding_vector
@@ -112,7 +113,6 @@ def insert_memory(input_data: dict) -> str:
             """, (memory_id, entity_id))
 
         # ── Step 4b: Chain links for near-duplicates ──────────────────────────
-        from memory_system.core.chain import create_chain, detect_chain_type
         for existing_id, existing_affect in near_duplicates:
             chain_type = detect_chain_type(affect, existing_affect)
             create_chain(cursor, memory_id, existing_id, chain_type)
@@ -120,7 +120,7 @@ def insert_memory(input_data: dict) -> str:
             if chain_type == "contradicts":
                 cursor.execute("""
                     UPDATE memories
-                    SET confidence_score = MAX(confidence_score - 0.2, 0.0)
+                    SET confidence_score = MAX(COALESCE(confidence_score, 1.0) - 0.2, 0.0)
                     WHERE id = ?
                 """, (existing_id,))
 
@@ -135,14 +135,18 @@ def insert_memory(input_data: dict) -> str:
     # ── Step 5: FAISS insert ──────────────────────────────────────────────────
     numeric_id = add_vector(memory_id, new_vector)
 
-    conn   = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO memory_embeddings (memory_id, vector_id, model_name)
-        VALUES (?, ?, ?)
-    """, (memory_id, str(numeric_id), "all-MiniLM-L6-v2"))
-    conn.commit()
-    conn.close()
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO memory_embeddings (memory_id, vector_id, model_name)
+            VALUES (?, ?, ?)
+        """, (memory_id, str(numeric_id), "all-MiniLM-L6-v2"))
+        conn.commit()
+    except Exception as exc:
+        print(f"[memory] failed to record embedding for {memory_id}: {exc}", flush=True)
+    finally:
+        conn.close()
 
     # ── Step 6: Async summary generation (fire-and-forget) ───────────────────
     try:
@@ -153,8 +157,8 @@ def insert_memory(input_data: dict) -> str:
         except RuntimeError:
             # No running event loop (e.g. called from a sync thread outside asyncio)
             pass
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[memory] async_summary unavailable: {exc}", flush=True)
 
     # ── Step 7: Memory cap check ──────────────────────────────────────────────
     try:
