@@ -1,7 +1,6 @@
 import sys
 import os
 import sqlite3
-import tempfile
 import pytest
 
 # Make backend/ importable from tests
@@ -16,10 +15,6 @@ def tmp_db(tmp_path, monkeypatch):
 
     db_file = tmp_path / "test_memory.db"
     monkeypatch.setattr(conn_module, "DB_PATH", db_file)
-    monkeypatch.setattr(
-        conn_module, "get_connection",
-        lambda: _row_factory_conn(str(db_file))
-    )
     initialize_database(reset=False)
     return db_file
 
@@ -27,6 +22,7 @@ def tmp_db(tmp_path, monkeypatch):
 def _row_factory_conn(path: str):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 
