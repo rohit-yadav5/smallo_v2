@@ -49,3 +49,21 @@ LLM_CONFIG = LLMConfig(
     stream_timeout_connect_s = float(os.getenv("LLM_TIMEOUT_CONNECT",    "10")),
     stream_timeout_read_s    = float(os.getenv("LLM_TIMEOUT_READ",      "120")),
 )
+
+# ── Memory system constants ───────────────────────────────────────────────────
+# Importance decay half-lives in days (None = never decays).
+DECAY_HALF_LIFE: dict[str, int | None] = {
+    "PersonalMemory":    180,
+    "DecisionMemory":     90,
+    "ActionMemory":       30,
+    "PlannerMemory":      14,
+    "ConsolidatedMemory": None,
+}
+DECAY_HALF_LIFE_DEFAULT = 60  # fallback for unlisted memory types
+
+# Consolidation thresholds
+CONSOLIDATION_SIMILARITY_THRESHOLD    = 0.75   # min similarity to cluster memories
+META_CONSOLIDATION_SIMILARITY_THRESHOLD = 0.80  # min similarity to merge ConsolidatedMemorys
+CONSOLIDATION_VALIDATION_THRESHOLD    = 0.60   # min sim between LLM summary and cluster centroid
+CONSOLIDATED_MEMORY_EXPIRY_DAYS       = 90
+CONSOLIDATED_MEMORY_EXPIRY_MIN_IMPORTANCE = 6.0

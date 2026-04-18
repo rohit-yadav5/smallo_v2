@@ -28,6 +28,24 @@ def initialize_database(reset: bool = False):
     conn.close()
 
     print("Database initialized.")
+    migrate_database()
+
+
+def migrate_database():
+    """Apply incremental migrations to existing databases."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Check if affect column exists (SQLite has no IF NOT EXISTS for ALTER TABLE)
+    cursor.execute("PRAGMA table_info(memories)")
+    columns = {row["name"] for row in cursor.fetchall()}
+
+    if "affect" not in columns:
+        cursor.execute("ALTER TABLE memories ADD COLUMN affect TEXT DEFAULT 'neutral'")
+        conn.commit()
+        print("Migration: added 'affect' column to memories.")
+
+    conn.close()
 
 
 if __name__ == "__main__":

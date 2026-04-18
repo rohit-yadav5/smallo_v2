@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS memories (
     project_reference TEXT,
     status TEXT DEFAULT 'active',
     session_id TEXT DEFAULT 'legacy',
+    affect TEXT DEFAULT 'neutral',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
