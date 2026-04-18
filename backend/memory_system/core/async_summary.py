@@ -11,6 +11,22 @@ _HIGH_SIGNAL_PHRASES = [
 ]
 
 
+def _do_db_write(summary: str, bump: float, memory_id: str) -> None:
+    """Blocking DB write — run via asyncio.to_thread, never call from event loop directly."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE memories
+            SET summary = ?,
+                importance_score = MIN(importance_score + ?, 10.0)
+            WHERE id = ?
+        """, (summary, bump, memory_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 async def generate_and_store_summary(memory_id: str, raw_text: str, memory_type: str) -> None:
     """Fire-and-forget async task: generates LLM summary and updates the DB record.
 
@@ -25,16 +41,7 @@ async def generate_and_store_summary(memory_id: str, raw_text: str, memory_type:
         )
         bump = _compute_importance_bump(summary)
 
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE memories
-            SET summary = ?,
-                importance_score = MIN(importance_score + ?, 10.0)
-            WHERE id = ?
-        """, (summary, bump, memory_id))
-        conn.commit()
-        conn.close()
+        await asyncio.to_thread(_do_db_write, summary, bump, memory_id)
     except Exception as exc:
         print(f"[memory] async summary failed for {memory_id}: {exc}", flush=True)
 
