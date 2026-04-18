@@ -3,6 +3,28 @@ import { useAppStore } from '../store/appStore'
 import { wsRef } from '../lib/wsRef'
 import type { WSEvent } from '../types/events'
 
+// ── _triggerDownload ──────────────────────────────────────────────────────────
+// Triggers a browser Save As dialog for a file received over WebSocket.
+// Uses the Blob API — no server-side file serving needed.
+function _triggerDownload(content: string, filename: string, extension: string) {
+  const mimeTypes: Record<string, string> = {
+    '.txt':  'text/plain',
+    '.md':   'text/markdown',
+    '.py':   'text/x-python',
+    '.json': 'application/json',
+    '.html': 'text/html',
+    '.csv':  'text/csv',
+  }
+  const mime = mimeTypes[extension] ?? 'text/plain'
+  const blob = new Blob([content], { type: mime })
+  const url  = URL.createObjectURL(blob)
+  const a    = document.createElement('a')
+  a.href     = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 // ── TTSAudioReceiver ──────────────────────────────────────────────────────────
 // Receives chunked PCM16 or Opus audio frames from the server and plays them
 // via Web Audio API in arrival order using a sequential drain queue.
@@ -192,6 +214,8 @@ export function useWebSocket() {
         // Uses the ref so we always read the live store value, not the
         // stale closure captured at effect creation time.
         ws.send(JSON.stringify({ event: 'SET_TTS_ENABLED', enabled: ttsEnabledRef.current }))
+        // Request any files already saved this session (handles page refresh)
+        ws.send(JSON.stringify({ event: 'GET_SESSION_FILES' }))
       }
 
       ws.onerror = (e) => {
@@ -370,6 +394,18 @@ export function useWebSocket() {
 
         case 'SYSTEM_EVENT':
           store.handleSystemEvent(msg.data)
+          break
+
+        case 'FILE_CREATED':
+          store.addSessionFile(msg.data)
+          break
+
+        case 'FILE_LIST':
+          store.setSessionFiles(msg.data.files)
+          break
+
+        case 'FILE_CONTENT':
+          _triggerDownload(msg.data.content, msg.data.filename, msg.data.extension)
           break
 
         case 'pong':

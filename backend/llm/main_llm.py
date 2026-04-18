@@ -242,6 +242,45 @@ _TOOL_CALL_RE = re.compile(
     re.DOTALL,
 )
 
+# ── Tool-syntax leak detection / stripping (FIX3B) ───────────────────────────
+# Catches cases where the 3b model writes tool syntax in plain text rather than
+# inside <tool_call> tags — e.g. wrapped in backticks or as narration.
+# These are applied ONLY to plain-text responses (no tool call detected).
+
+_TOOL_LEAK_RES = [
+    re.compile(r"`<tool_call>.*?</tool_call>`", re.DOTALL),   # backtick-wrapped tags
+    re.compile(r"`\{\"name\".*?\}`", re.DOTALL),              # backtick-wrapped JSON
+    re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),     # bare tags not caught earlier
+]
+
+# Narration pattern: "I will call web_navigate", "let me run run_terminal", etc.
+_TOOL_NARRATION_RE = re.compile(
+    r"\b(I will|I'll|let me|going to|I am going to|now)\s+"
+    r"(call|run|use|execute)\s+"
+    r"(the\s+)?"
+    r"(web_\w+|run_\w+|write_\w+|read_\w+|set_\w+|list_\w+|cancel_\w+)",
+    re.IGNORECASE,
+)
+
+
+def _has_tool_leak(text: str) -> bool:
+    """Return True if text contains leaked tool-call syntax that should be stripped."""
+    return any(p.search(text) for p in _TOOL_LEAK_RES) or bool(
+        _TOOL_NARRATION_RE.search(text)
+    )
+
+
+def _strip_tool_leaks(text: str) -> str:
+    """
+    Strip leaked tool-call syntax from plain text before it reaches TTS.
+
+    Only removes syntax artifacts — never strips valid user-facing content.
+    Returns the cleaned string; caller logs if anything changed.
+    """
+    for p in _TOOL_LEAK_RES:
+        text = p.sub("", text)
+    return text.strip()
+
 _PLAN_TRIGGER_RE = re.compile(
     r"<start_plan>\s*(.+?)\s*</start_plan>",
     re.DOTALL | re.IGNORECASE,
@@ -297,6 +336,39 @@ _TOOL_REQUIRED_PATTERNS: list[re.Pattern] = [
 ]
 
 
+def _repair_json(raw: str) -> dict | None:
+    """Best-effort JSON repair for common qwen2.5 output quirks."""
+    # 1. Direct parse
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    # 2. Extract innermost {...} and retry
+    inner = re.search(r"\{.*\}", raw, re.DOTALL)
+    if inner:
+        try:
+            return json.loads(inner.group(0))
+        except json.JSONDecodeError:
+            pass
+    # 3. Single-quote → double-quote swap
+    try:
+        return json.loads(raw.replace("'", '"'))
+    except json.JSONDecodeError:
+        pass
+    # 4. Regex extraction of name + args as last resort
+    name_m = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
+    args_m = re.search(r'"args"\s*:\s*(\{.*?\})', raw, re.DOTALL)
+    if name_m:
+        args = {}
+        if args_m:
+            try:
+                args = json.loads(args_m.group(1))
+            except json.JSONDecodeError:
+                pass
+        return {"name": name_m.group(1), "args": args}
+    return None
+
+
 def _extract_tool_call(text: str) -> tuple[str | None, dict | None, str]:
     """
     Scan text for a <tool_call>...</tool_call> block.
@@ -308,13 +380,17 @@ def _extract_tool_call(text: str) -> tuple[str | None, dict | None, str]:
     if not m:
         return None, None, text
 
-    try:
-        payload = json.loads(m.group(1))
-        name: str   = payload["name"]
-        args: dict  = payload.get("args", {})
-    except (json.JSONDecodeError, KeyError):
-        # Malformed block — treat as plain text
+    raw_json = m.group(1)
+    payload = _repair_json(raw_json)
+    if payload is None or "name" not in payload:
+        print(
+            f"  [llm] ⚠ malformed tool_call JSON (could not repair): {raw_json[:120]!r}",
+            flush=True,
+        )
         return None, None, text
+
+    name: str  = payload["name"]
+    args: dict = payload.get("args", {})
 
     # Strip the block from the visible portion
     visible = _TOOL_CALL_RE.sub("", text).strip()
@@ -537,7 +613,30 @@ def _handle_tool_or_plain(
     tool_name, tool_args, visible_text = _extract_tool_call(full_text)
 
     if tool_name is None:
-        yield from tokens
+        # No tool call — scan for leaked tool syntax before yielding to TTS.
+        joined = "".join(tokens)
+        cleaned = _strip_tool_leaks(joined)
+        if cleaned != joined:
+            print(
+                f"  [llm] tool leak detected and stripped "
+                f"({len(joined) - len(cleaned)} chars removed)",
+                flush=True,
+            )
+            # Re-run tool detection on cleaned text in case a valid call was hiding
+            tool_name2, tool_args2, _ = _extract_tool_call(cleaned)
+            if tool_name2:
+                print(f"  [llm] tool call found after leak strip: {tool_name2}", flush=True)
+                synthetic = (
+                    f'<tool_call>{{"name": "{tool_name2}", '
+                    f'"args": {json.dumps(tool_args2 or {})}}}</tool_call>'
+                )
+                yield from _handle_tool_or_plain(
+                    synthetic, [synthetic], safe_text, system_suffix
+                )
+                return
+            yield cleaned
+        else:
+            yield from tokens
         return
 
     print(f"  [llm] 🔧 tool call detected: {tool_name}  args={tool_args}", flush=True)
@@ -598,12 +697,17 @@ def ask_llm_turn(
         print(f"  [llm] 🗺 plan trigger: '{goal}'", flush=True)
         return {"type": "plan_trigger", "goal": goal}
 
-    # Extract the bare user utterance (strip memory-context prefix if present)
-    utterance = (
-        safe_text.split("\n\nUser: ", 1)[-1].strip()
-        if "\n\nUser: " in safe_text
-        else safe_text.strip()
+    # Extract the bare user utterance (strip memory-context prefix if present).
+    # IMPORTANT: use original user_text (before sanitization), because
+    # _sanitize_user_text() joins lines with " ".join() which destroys the
+    # "\n\nUser: " newline separator — causing the full memory context to leak
+    # into the utterance and trigger false-positive forced tool-call passes.
+    raw_utterance = (
+        user_text.split("\n\nUser: ", 1)[-1].strip()
+        if "\n\nUser: " in user_text
+        else user_text.strip()
     )
+    utterance = _sanitize_user_text(raw_utterance)
 
     # ── Fallback multi-step detection (safety net) ─────────────────────────
     # If the LLM forgot to emit <start_plan> AND produced no tool call,

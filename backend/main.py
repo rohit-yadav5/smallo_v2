@@ -1471,6 +1471,7 @@ async def _main():
     # ── Wire adapter broadcast functions ──────────────────────────────────────
     _set_research_broadcast(_emit)
     _set_browser_use_broadcast(_emit)
+    print("  [adapters] research + browser-use broadcast wired", flush=True)
 
     # Start background webpage-monitor loop
     web_monitor.run_forever(_loop)

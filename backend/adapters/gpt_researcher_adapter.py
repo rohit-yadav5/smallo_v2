@@ -79,21 +79,25 @@ async def _deep_research(args: dict) -> str:
     """Async handler registered in ToolRegistry for the 'deep_research' tool.
 
     Accepts:
-        topic    (str, required) — the research question / topic
-        query    (str)           — alias for topic (backward compat)
-        max_pages (int)          — passed to GPTResearcher as MAX_SEARCH_RESULTS_PER_QUERY
-                                   (default 8, capped at 15)
-        save_to  (str)           — optional file path; if set, also dispatches write_file
+        topic       (str, required) — the research question / topic
+        query       (str)           — alias for topic (backward compat)
+        max_pages   (int)           — max search results per query (default 10, cap 15)
+        report_type (str)           — "detailed_report" (default) or "research_report"
+        save_to     (str)           — extra file path to also copy the report to
+
+    The report is ALWAYS auto-saved to bot-docs (DocPanel) so the user can
+    download the full document.  The voice response is a brief summary.
     """
     # ── Arg extraction ────────────────────────────────────────────────────────
     topic: str = args.get("topic") or args.get("query", "")
     if not topic:
         return "Error: topic (or query) is required."
 
-    max_pages: int = min(int(args.get("max_pages", 8)), 15)
+    max_pages: int = min(int(args.get("max_pages", 10)), 15)
+    report_type: str = args.get("report_type", "detailed_report")
     save_to: Optional[str] = args.get("save_to") or args.get("save_path")
 
-    print(f"  [gpt_researcher] starting research: {topic!r}  max_pages={max_pages}", flush=True)
+    print(f"  [gpt_researcher] starting research: {topic!r}  max_pages={max_pages}  type={report_type}", flush=True)
     await _emit("start", f"Starting research on: {topic}", topic=topic)
 
     # ── Run GPT-Researcher ────────────────────────────────────────────────────
@@ -107,14 +111,14 @@ async def _deep_research(args: dict) -> str:
 
         researcher = GPTResearcher(
             query=topic,
-            report_type="research_report",
+            report_type=report_type,
             report_source="web",
             verbose=False,
         )
 
         await researcher.conduct_research()
 
-        await _emit("writing", "Writing report…", topic=topic)
+        await _emit("writing", "Writing detailed report…", topic=topic)
         report: str = await researcher.write_report()
 
     except Exception as exc:
@@ -123,25 +127,43 @@ async def _deep_research(args: dict) -> str:
         await _emit("error", err_msg, topic=topic)
         return err_msg
 
-    # ── Optional file save ───────────────────────────────────────────────────
+    # ── Always auto-save to bot-docs (DocPanel) ───────────────────────────────
+    # A detailed research report is too long for voice. Save it so the user
+    # can download it from DocPanel, and return a short spoken summary.
+    doc_title = f"Research: {topic[:60]}"
+    try:
+        await registry.dispatch(
+            "write_file",
+            {"title": doc_title, "content": report, "extension": ".md"},
+        )
+        print(f"  [gpt_researcher] auto-saved report to bot-docs", flush=True)
+    except Exception as exc:
+        print(f"  [gpt_researcher] auto-save failed: {exc}", flush=True)
+
+    # ── Optional extra save to user-specified path ────────────────────────────
     if save_to:
         try:
-            save_result = await registry.dispatch(
+            await registry.dispatch(
                 "write_file",
                 {"path": save_to, "content": report, "mode": "overwrite"},
             )
-            print(f"  [gpt_researcher] saved: {save_result}", flush=True)
-            await _emit("done", f"Research complete. Report saved to {save_to}", topic=topic)
-            summary_preview = report[:500].replace("\n", " ")
-            return (
-                f"Research complete. Report saved to {save_to}\n\n"
-                f"Summary: {summary_preview}…"
-            )
         except Exception as exc:
-            report += f"\n\n[Warning: could not save report — {exc}]"
+            print(f"  [gpt_researcher] save_to failed: {exc}", flush=True)
 
-    await _emit("done", "Research complete.", topic=topic)
-    return report
+    await _emit("done", "Research complete. Report saved to DocPanel.", topic=topic)
+
+    # Return an excerpt so the second-pass LLM has real content to summarise.
+    # The full report is always in DocPanel; here we give the first 800 words
+    # so the spoken + text response has actual findings, not just a file pointer.
+    word_count = len(report.split())
+    sources = report.count("http")
+    words = report.split()
+    excerpt = " ".join(words[:800]) + ("…" if len(words) > 800 else "")
+
+    return (
+        f"[Research complete — full {word_count}-word report saved to DocPanel ({sources} sources cited)]\n\n"
+        f"{excerpt}"
+    )
 
 
 # ── Self-registration ─────────────────────────────────────────────────────────
@@ -149,9 +171,10 @@ async def _deep_research(args: dict) -> str:
 registry.register(ToolDefinition(
     name="deep_research",
     description=(
-        "Perform in-depth web research on a topic using GPT-Researcher (local Ollama, "
-        "no cloud calls): searches the web, scrapes sources, and synthesizes a structured "
-        "Markdown report. Use for thorough research requiring multiple web sources. "
+        "CALL THIS DIRECTLY — do NOT use the planner for research tasks. "
+        "Performs deep multi-source web research: searches the web, scrapes pages, "
+        "and synthesises a structured Markdown report using GPT-Researcher. "
+        "Always prefer this tool over manual web_navigate+web_search loops for research. "
         "Optionally saves the report to a file."
     ),
     parameters={
@@ -163,12 +186,17 @@ registry.register(ToolDefinition(
             },
             "max_pages": {
                 "type": "integer",
-                "description": "Maximum search results to use (default 8, max 15)",
-                "default": 8,
+                "description": "Maximum search results to use (default 10, max 15)",
+                "default": 10,
+            },
+            "report_type": {
+                "type": "string",
+                "description": "Report depth: 'detailed_report' (default, comprehensive) or 'research_report' (shorter summary)",
+                "default": "detailed_report",
             },
             "save_to": {
                 "type": "string",
-                "description": "Optional file path to save the report (e.g. ~/Desktop/report.md)",
+                "description": "Optional extra file path to also copy the report to (e.g. ~/Desktop/report.md)",
             },
         },
         "required": ["topic"],

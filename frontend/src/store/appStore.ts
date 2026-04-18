@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats, PlanEvent, WebScreenshot, SystemEvent } from '../types/events'
+import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats, PlanEvent, WebScreenshot, SystemEvent, FileCreatedEvent } from '../types/events'
 
 export interface PlanStepState {
   text:    string
@@ -47,6 +47,11 @@ interface AppState {
   ttsEnabled:               boolean
   /** Browser viewer panel open/closed state */
   browserViewerOpen:        boolean
+
+  /** Files created this session, newest first */
+  sessionFiles:             FileCreatedEvent[]
+  addSessionFile:           (f: FileCreatedEvent) => void
+  setSessionFiles:          (files: FileCreatedEvent[]) => void
 
   setVoiceState:            (state: VoiceState) => void
   setWsConnected:           (connected: boolean) => void
@@ -96,6 +101,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   sttEnabled:          true,
   ttsEnabled:          true,
   browserViewerOpen:   false,
+  sessionFiles:        [],
+
+  addSessionFile:  (f) => set((s) => ({ sessionFiles: [f, ...s.sessionFiles] })),
+  setSessionFiles: (files) => set({ sessionFiles: files }),
 
   setVoiceState:        (state)     => set({ voiceState: state }),
   setWsConnected:       (connected) => set({ wsConnected: connected }),

@@ -5,6 +5,7 @@ import { InfoDrawer } from './components/InfoDrawer'
 import { PluginNotifications } from './components/PluginNotifications'
 import { PlanProgress } from './components/PlanProgress'
 import { WebViewer } from './components/WebViewer'
+import { DocPanel } from './components/DocPanel'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useMicrophone } from './hooks/useMicrophone'
@@ -148,6 +149,7 @@ export default function App() {
           <ConversationStream onStartMic={startMic} />
           <PlanProgress />
           {browserViewerOpen && <WebViewer />}
+          <DocPanel />
 
           {/* ── Text input bar — always visible ─────────────────────── */}
           <div

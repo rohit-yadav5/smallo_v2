@@ -6,6 +6,15 @@ from memory_system.embeddings.embedder import generate_embedding_vector
 from memory_system.embeddings.vector_store import search_vector
 from collections import deque
 
+
+def _get_current_session_id() -> str:
+    """Read current session_id from backend_loop_ref (avoids circular import)."""
+    try:
+        import backend_loop_ref as _ref  # noqa: PLC0415
+        return _ref.session_id or "unknown"
+    except Exception:
+        return "unknown"
+
 # ── Entity extraction fast-path helpers ──────────────────────────────────────
 # A single-worker pool used to run entity extraction with a wall-clock timeout.
 # This prevents a slow/unloaded NLP model from blocking retrieval for > 2s.
@@ -72,6 +81,8 @@ def detect_intent(query: str) -> str:
 
 
 def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
+    # Resolve current session once per retrieval call (FIX2A — BUG-005).
+    current_session_id = _get_current_session_id()
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -181,7 +192,7 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
             continue
 
         cursor.execute("""
-            SELECT id, summary, importance_score, created_at, memory_type
+            SELECT id, summary, importance_score, created_at, memory_type, session_id
             FROM memories
             WHERE id = ?
         """, (memory_id,))
@@ -204,6 +215,24 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
             recency_score * 0.1 +
             consolidation_boost
         )
+
+        # ── Session isolation penalty (FIX2A — BUG-005) ──────────────────────
+        # Memories from other sessions (e.g., stale "Uchubha" identity entries)
+        # are heavily down-ranked so the current session's facts always win.
+        try:
+            mem_session = memory["session_id"] or "legacy"
+        except Exception:
+            mem_session = "legacy"
+        if current_session_id not in ("unknown", "") and mem_session != current_session_id:
+            # Cross-session penalty: 0.2× base score (80% reduction)
+            final_score *= 0.2
+            # Additional penalty for stale cross-session memories (>30 days old)
+            try:
+                age_days = (datetime.utcnow() - datetime.fromisoformat(memory["created_at"])).days
+                if age_days > 30:
+                    final_score *= 0.1
+            except Exception:
+                pass
 
         # -----------------------------
         # 🎯 Intent-Based Adjustments

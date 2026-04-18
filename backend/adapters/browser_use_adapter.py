@@ -107,9 +107,9 @@ async def _web_task(args: dict) -> str:
         task      (str, required) — plain-English description of the browser goal
         max_steps (int, optional) — max number of agent steps (default 20)
     """
-    task: str = args.get("task", "")
+    task: str = args.get("task") or args.get("goal", "")
     if not task:
-        return "Error: task is required."
+        return "Error: task (or goal) is required."
 
     max_steps: int = int(args.get("max_steps", 20))
 
@@ -152,10 +152,11 @@ async def _web_task(args: dict) -> str:
 registry.register(ToolDefinition(
     name="web_task",
     description=(
-        "Autonomously complete a browser-based task using browser-use (local Ollama, "
-        "no cloud calls): navigates, clicks, types, and reads web pages to achieve the "
-        "described goal. Use for multi-step browser tasks that require real interaction "
-        "with web pages (e.g. filling forms, scraping dynamic content, web automation)."
+        "CALL THIS DIRECTLY — do NOT use the planner. "
+        "Autonomously drives a real browser to complete a plain-English goal: "
+        "navigates pages, clicks buttons, fills forms, extracts content. "
+        "Use when the task needs real browser interaction (prices, logins, dynamic pages). "
+        "Accepts 'task' or 'goal' as the parameter name."
     ),
     parameters={
         "type": "object",

@@ -52,6 +52,30 @@ from tools.registry import registry as _tool_registry
 from utils.ram_monitor import can_load_7b, get_available_ram_gb
 
 
+# ── Direct tool goal patterns (FIX3C + FIX1B) ────────────────────────────────
+# When the goal matches these patterns, skip the LLM single/multi check entirely
+# and execute the named tool directly. Prevents the 7b model from incorrectly
+# classifying simple one-tool tasks as multi-step (e.g. set_reminder → calendar).
+# This dict is module-level so operators can extend it without code changes.
+
+DIRECT_TOOL_GOALS: dict[str, str] = {
+    r"\bremind\b.*\bin\b": "set_reminder",
+    r"\blist\b.*\breminder": "list_reminders",
+    r"\bcancel\b.*\breminder": "cancel_reminder",
+    r"\brun\b.*\bcommand\b": "run_terminal",
+    r"\becho\b": "run_terminal",
+    r"\blist\b.*\bmonitor": "monitor_list",
+}
+
+
+def _get_direct_tool(goal: str) -> Optional[str]:
+    """Return tool name if the goal maps to a single direct tool, else None."""
+    for pattern, tool in DIRECT_TOOL_GOALS.items():
+        if re.search(pattern, goal, re.IGNORECASE):
+            return tool
+    return None
+
+
 # ── Plan memory storage ───────────────────────────────────────────────────────
 
 async def _store_plan_memory(
@@ -98,8 +122,8 @@ async def _store_plan_memory(
 _plan_active: bool = False
 
 # ── Active plan model (set at run_plan() start based on RAM) ─────────────────
-# Either LLM_CONFIG.planner_model (7b, preferred) or LLM_CONFIG.model (3b,
-# fallback when RAM < 3 GB).  All per-plan LLM helpers read this variable.
+# LLM_CONFIG.planner_model (7b) for all cases; LLM_CONFIG.model is also 7b.
+# All per-plan LLM helpers read this variable.
 _active_plan_model: str = ""
 
 # ── Last plan result (B1 — injected into next conversational turn) ─────────
@@ -533,6 +557,8 @@ async def _execute_step_planner(
 async def run_plan(
     goal: str,
     broadcast: Callable,
+    result_queue=None,      # queue.Queue passed from main.py — avoids circular import
+    action_callback=None,   # add_recent_action fn passed from main.py — avoids circular import
     max_steps: int = 20,
 ) -> None:
     """
@@ -540,9 +566,14 @@ async def run_plan(
 
     Parameters
     ----------
-    goal:       One-sentence description of what to accomplish.
-    broadcast:  Callable matching _emit(event: str, data: dict) from main.py.
-    max_steps:  Hard cap on execution steps to prevent infinite loops.
+    goal:            One-sentence description of what to accomplish.
+    broadcast:       Callable matching _emit(event: str, data: dict) from main.py.
+    result_queue:    queue.Queue for signalling the pipeline thread with the result.
+                     Passed directly from main.py to avoid the circular-import bug
+                     where ``from main import _plan_result_queue`` creates a fresh
+                     module import (main vs __main__) and a different queue object.
+    action_callback: Callable for add_recent_action — same reason as result_queue.
+    max_steps:       Hard cap on execution steps to prevent infinite loops.
     """
     global _plan_active, _active_plan_model, _last_plan_result, _current_plan_tool_calls
 
@@ -573,7 +604,33 @@ async def run_plan(
 
     _plan_active = True   # keep model warm across all plan steps (keep_alive=300s)
 
+    # Initialize results before the try block so CancelledError handler can
+    # reference it even if cancellation fires during the pre-plan check phase.
+    results: list[str] = []
+
+    def _signal_queue(value: str) -> None:
+        """Put a value in result_queue; falls back to direct TTS if queue unavailable."""
+        if result_queue is not None:
+            try:
+                result_queue.put_nowait(value)
+                return
+            except Exception as exc:
+                print(f"  [planner] ⚠ queue signal failed: {exc}", flush=True)
+        # result_queue not provided or full — the pipeline will hit its 45s deadline
+        # and recover.  Log so it's visible in diagnostics.
+        print(f"  [planner] ⚠ no result_queue — pipeline will timeout and recover", flush=True)
+
     try:
+        # ── Direct tool short-circuit (FIX3C) ────────────────────────────────
+        # Check well-known single-tool patterns BEFORE asking the 7b LLM.
+        # This prevents "remind me in 30s" → 6-step Google Calendar hallucination.
+        direct_tool = _get_direct_tool(goal)
+        if direct_tool:
+            print(f"  [plan] direct tool match → {direct_tool} (skipping decomposition)", flush=True)
+            result = await _execute_step_planner(goal, "")
+            _signal_queue(result)
+            return
+
         # ── Pre-plan: guard against trivially single-step goals ──────────
         # Only cancels if the goal is clearly one-shot (e.g. a reminder,
         # a single write, a single search).  Multi-step web tasks that
@@ -591,37 +648,14 @@ async def run_plan(
         # Only bypass the planner if the answer is an unambiguous NO
         if _check_ans.strip().lower().startswith("no"):
             print("  [plan] cancelled — single-tool goal, routing to normal turn", flush=True)
-            # Execute the goal as a single step.
+            # Execute as single step; signal pipeline thread with result.
             result = await _execute_step_planner(goal, "")
-            # Signal pipeline thread with the result string.
-            # Pipeline will handle TTS in its own thread (avoids audio conflicts).
-            try:
-                from main import _plan_result_queue  # noqa: PLC0415
-                _plan_result_queue.put_nowait(result)
-            except Exception as exc:
-                print(f"  [planner] ⚠ queue signal failed: {exc} — falling back to direct TTS", flush=True)
-                # Fallback: stream tokens + direct TTS (original behaviour)
-                broadcast("VOICE_STATE", {"state": "speaking"})
-                words = result.split()
-                for j, word in enumerate(words):
-                    broadcast("LLM_TOKEN", {"token": word if j == 0 else " " + word, "done": False})
-                    await asyncio.sleep(0.005)
-                broadcast("LLM_TOKEN", {"token": "", "done": True, "token_count": len(words)})
-                try:
-                    from tts import speak as _speak  # noqa: PLC0415
-                    await asyncio.to_thread(_speak, result, threading.Event())
-                except Exception as exc2:
-                    print(f"  [planner] ⚠ TTS speak failed (single-step): {exc2}", flush=True)
-                broadcast("VOICE_STATE", {"state": "idle"})
+            _signal_queue(result)
             return
 
         # Multi-step confirmed — signal pipeline so it stops waiting and
         # speaks the "On it" acknowledgement immediately.
-        try:
-            from main import _plan_result_queue  # noqa: PLC0415
-            _plan_result_queue.put_nowait("MULTI")
-        except Exception:
-            pass
+        _signal_queue("MULTI")
 
         # ── Phase 1: DECOMPOSE using 7b model ─────────────────────────────
         decompose_user = _DECOMPOSE_PROMPT_TEMPLATE.format(goal=goal)
@@ -762,11 +796,11 @@ async def run_plan(
 
         # ── Add to short-term context buffer ──────────────────────────────
         # Immediately visible in the NEXT turn's LLM prompt via recent_actions.
-        try:
-            from main import add_recent_action  # noqa: PLC0415
-            add_recent_action(f"Completed: {goal} → {summary[:200]}")
-        except Exception:
-            pass   # main.py import may not be available in test contexts
+        if action_callback is not None:
+            try:
+                action_callback(f"Completed: {goal} → {summary[:200]}")
+            except Exception:
+                pass
 
         # Stream summary as word-level LLM_TOKEN events for the UI.
         broadcast("VOICE_STATE", {"state": "speaking"})
@@ -797,11 +831,11 @@ async def run_plan(
             asyncio.ensure_future(
                 _store_plan_memory(goal, results, partial_summary, importance=4.0)
             )
-            try:
-                from main import add_recent_action  # noqa: PLC0415
-                add_recent_action(f"Cancelled (partial): {goal} — {len(results)} steps done")
-            except Exception:
-                pass
+            if action_callback is not None:
+                try:
+                    action_callback(f"Cancelled (partial): {goal} — {len(results)} steps done")
+                except Exception:
+                    pass
         raise
 
     except Exception as exc:

@@ -92,6 +92,27 @@ export interface SystemEvent {
   available_gb?: number
 }
 
+export interface FileCreatedEvent {
+  uid:        string
+  title:      string
+  filename:   string
+  extension:  string
+  size_bytes: number
+  created_at: number
+}
+
+export interface FileListEvent {
+  files: FileCreatedEvent[]
+}
+
+export interface FileContentEvent {
+  uid:       string
+  title:     string
+  filename:  string
+  content:   string
+  extension: string
+}
+
 export type WSEvent =
   | { event: 'STT_RESULT';       data: STTResult }
   | { event: 'STT_PARTIAL';      data: STTPartial }
@@ -107,6 +128,9 @@ export type WSEvent =
   | { event: 'PROACTIVE_EVENT';  data: ProactiveEvent }
   | { event: 'PLAN_EVENT';       data: PlanEvent }
   | { event: 'WEB_SCREENSHOT';   data: WebScreenshot }
+  | { event: 'FILE_CREATED';     data: FileCreatedEvent }
+  | { event: 'FILE_LIST';        data: FileListEvent }
+  | { event: 'FILE_CONTENT';     data: FileContentEvent }
   | { event: 'pong';             data: Record<string, never> }
 
 export interface SystemStats {
