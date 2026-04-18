@@ -192,10 +192,17 @@ def _build_messages(
 
 # ── Raw streaming call ────────────────────────────────────────────────────────
 
-def _stream_ollama(messages: list[dict]) -> Iterator[str]:
-    """Yield response tokens one by one from Ollama (blocking generator)."""
+def _stream_ollama(messages: list[dict], model: str | None = None) -> Iterator[str]:
+    """Yield response tokens one by one from Ollama (blocking generator).
+
+    Parameters
+    ----------
+    messages: The message list to send to Ollama.
+    model:    Optional model override. Defaults to LLM_CONFIG.model when None.
+    """
+    effective_model = model if model is not None else LLM_CONFIG.model
     total_chars = sum(len(m["content"]) for m in messages)
-    print(f"  [llm] ▶ {total_chars:,} char prompt → {LLM_CONFIG.model}", flush=True)
+    print(f"  [llm] ▶ {total_chars:,} char prompt → {effective_model}", flush=True)
 
     # Use ACTIVE keep_alive during a conversation so entity extraction and the
     # main LLM call share a warm model; idle turns still evict immediately.
@@ -203,7 +210,7 @@ def _stream_ollama(messages: list[dict]) -> Iterator[str]:
     response = requests.post(
         LLM_CONFIG.ollama_url,
         json={
-            "model":      LLM_CONFIG.model,
+            "model":      effective_model,
             "messages":   messages,
             "stream":     True,
             "keep_alive": _keep_alive,
@@ -534,11 +541,19 @@ def check_ollama() -> bool:
         return False
 
 
-def ask_llm(user_text: str, system_suffix: str = "") -> str:
-    """Single-shot (non-streaming) LLM call.  Returns full response string."""
+def ask_llm(user_text: str, system_suffix: str = "", model: str | None = None) -> str:
+    """Single-shot (non-streaming) LLM call.  Returns full response string.
+
+    Parameters
+    ----------
+    user_text:     The user utterance or raw prompt text.
+    system_suffix: Additional text appended to the system prompt.
+    model:         Optional model override (e.g. LLM_CONFIG.planner_model).
+                   Defaults to LLM_CONFIG.model when None.
+    """
     safe_text = _sanitize_user_text(user_text)
     messages  = _build_messages(safe_text, system_suffix=system_suffix)
-    full, _   = _collect_full_response(_stream_ollama(messages))
+    full, _   = _collect_full_response(_stream_ollama(messages, model=model))
     return full.strip()
 
 

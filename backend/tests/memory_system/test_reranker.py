@@ -55,3 +55,22 @@ def test_rerank_empty_candidates_returns_empty(monkeypatch):
     monkeypatch.setattr("memory_system.retrieval.reranker.can_load_7b", lambda: False)
     from memory_system.retrieval.reranker import rerank_memories
     assert rerank_memories("query", []) == []
+
+
+def test_rerank_uses_7b_when_ram_available(monkeypatch):
+    """When can_load_7b() returns True, _call_llm_for_ranking should use planner_model."""
+    from config.llm import LLM_CONFIG
+    used_models = []
+
+    def _mock_ask_llm(prompt, model=None):
+        used_models.append(model)
+        return json.dumps([0, 1, 2, 3, 4])
+
+    monkeypatch.setattr("memory_system.retrieval.reranker.can_load_7b", lambda: True)
+    import llm as llm_module
+    monkeypatch.setattr(llm_module, "ask_llm", _mock_ask_llm)
+
+    from memory_system.retrieval.reranker import rerank_memories
+    rerank_memories("query", _CANDIDATES[:10])
+
+    assert all(m == LLM_CONFIG.planner_model for m in used_models)

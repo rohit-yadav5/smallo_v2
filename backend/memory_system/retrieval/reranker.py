@@ -115,5 +115,7 @@ def _call_llm_for_ranking(prompt: str) -> str:
     Returns:
         The LLM's response (expected to be JSON, but may be invalid).
     """
-    from llm import ask_llm
-    return ask_llm(prompt)
+    import llm as llm_module
+    from config.llm import LLM_CONFIG
+    model = LLM_CONFIG.planner_model if can_load_7b() else LLM_CONFIG.model
+    return llm_module.ask_llm(prompt, model=model)
