@@ -20,7 +20,7 @@ def _write_entity_relation(cursor, child_id: str, parent_name: str) -> None:
     if not row:
         return
     parent_id = row["id"]
-    rel_id = f"rel-{child_id[:8]}-{parent_id[:8]}"
+    rel_id = str(uuid.uuid4())
     cursor.execute("""
         INSERT OR IGNORE INTO entity_relations
         (id, source_entity_id, target_entity_id, relation_type, created_at)
