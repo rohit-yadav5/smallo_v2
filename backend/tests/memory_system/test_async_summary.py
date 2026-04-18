@@ -14,8 +14,9 @@ def test_decision_phrase_gives_bump():
 
 
 def test_call_llm_for_summary_returns_string(monkeypatch):
-    monkeypatch.setattr("memory_system.core.async_summary._call_llm_for_summary",
-                        lambda text, memory_type: "Test summary sentence.")
+    """_call_llm_for_summary returns a non-empty string when LLM responds."""
+    import llm as llm_module
+    monkeypatch.setattr(llm_module, "ask_llm", lambda prompt: "One concise summary sentence.")
     from memory_system.core.async_summary import _call_llm_for_summary
     result = _call_llm_for_summary("some long text here", "IdeaMemory")
     assert isinstance(result, str)
@@ -23,9 +24,9 @@ def test_call_llm_for_summary_returns_string(monkeypatch):
 
 
 def test_call_llm_for_summary_truncates_long_result(monkeypatch):
-    long_result = "x" * 500
-    monkeypatch.setattr("memory_system.core.async_summary._call_llm_for_summary",
-                        lambda text, memory_type: long_result[:300])
+    """_call_llm_for_summary truncates LLM output to 300 chars."""
+    import llm as llm_module
+    monkeypatch.setattr(llm_module, "ask_llm", lambda prompt: "x" * 500)
     from memory_system.core.async_summary import _call_llm_for_summary
     result = _call_llm_for_summary("text", "IdeaMemory")
     assert len(result) <= 300
