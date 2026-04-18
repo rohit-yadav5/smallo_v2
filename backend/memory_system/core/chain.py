@@ -29,7 +29,7 @@ def create_chain(cursor, source_id: str, target_id: str, relation_type: str) -> 
     return rel_id
 
 
-def get_chain_links(cursor, memory_id: str, direction: str = "outgoing") -> list[dict]:
+def get_chain_links(cursor, memory_id: str, direction: str = "outgoing") -> list[str]:
     """Return linked memory ids based on direction.
 
     direction="outgoing" — target_memory_id values where source_memory_id = memory_id
