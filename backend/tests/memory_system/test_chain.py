@@ -48,7 +48,8 @@ def test_get_chain_links_returns_targets(tmp_db):
     assert target_ids == {"mem-y", "mem-z"}
 
 
-def test_get_chain_links_filtered_by_type(tmp_db):
+def test_get_chain_links_outgoing_default(tmp_db):
+    """Verify that get_chain_links defaults to direction='outgoing'."""
     conn = sqlite3.connect(str(tmp_db))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -60,13 +61,31 @@ def test_get_chain_links_filtered_by_type(tmp_db):
     from memory_system.core.chain import create_chain, get_chain_links
     create_chain(cursor, "mem-1", "mem-2", "confirms")
     create_chain(cursor, "mem-1", "mem-3", "contradicts")
+    # mem-1 is the *target* in this link; should NOT appear in default outgoing
+    create_chain(cursor, "mem-3", "mem-1", "caused_by")
     conn.commit()
 
-    # outgoing from mem-1; filter manually since direction param replaced relation_type
-    all_links = get_chain_links(cursor, "mem-1", direction="outgoing")
+    # Default call (no direction kwarg) must equal direction="outgoing"
+    default_links = get_chain_links(cursor, "mem-1")
+    explicit_links = get_chain_links(cursor, "mem-1", direction="outgoing")
     conn.close()
-    assert "mem-2" in all_links
-    assert "mem-3" in all_links
+    assert set(default_links) == set(explicit_links)
+    # Outgoing from mem-1: mem-2 and mem-3 only; mem-3 (incoming source) excluded
+    assert set(default_links) == {"mem-2", "mem-3"}
+
+
+def test_get_chain_links_invalid_direction(tmp_db):
+    """Verify that an unrecognised direction raises ValueError."""
+    conn = sqlite3.connect(str(tmp_db))
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    _seed_memory(cursor, "mem-a")
+    conn.commit()
+
+    from memory_system.core.chain import get_chain_links
+    with pytest.raises(ValueError):
+        get_chain_links(cursor, "mem-a", direction="invalid")
+    conn.close()
 
 
 @pytest.mark.parametrize("src_affect,tgt_affect,expected", [

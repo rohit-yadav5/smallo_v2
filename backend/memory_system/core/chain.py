@@ -3,6 +3,9 @@ from datetime import datetime
 
 CHAIN_RELATION_TYPES = {"caused_by", "led_to", "contradicts", "confirms", "summarized_by"}
 
+# Deliberately duplicate affect.py's polarity sets here to keep chain.py
+# self-contained — importing from affect.py would create a circular import
+# between core modules.
 _POSITIVE_AFFECTS = {"positive", "excited"}
 _NEGATIVE_AFFECTS = {"negative", "frustrated"}
 
@@ -19,7 +22,7 @@ def create_chain(cursor, source_id: str, target_id: str, relation_type: str) -> 
     """, (source_id, target_id, relation_type))
     existing = cursor.fetchone()
     if existing:
-        return existing["id"] if hasattr(existing, "__getitem__") else existing[0]
+        return existing["id"]  # sqlite3.Row supports dict-style access
     rel_id = str(uuid.uuid4())
     cursor.execute("""
         INSERT INTO memory_relations
