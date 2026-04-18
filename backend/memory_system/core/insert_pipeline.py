@@ -1,122 +1,128 @@
+import asyncio
 import uuid
 from datetime import datetime
 
 from memory_system.db.connection import get_connection
 from memory_system.core.importance import calculate_importance
+from memory_system.core.affect import detect_affect
 from memory_system.entities.extractor import extract_entities
 from memory_system.entities.service import get_or_create_entity
 from memory_system.embeddings.embedder import generate_embedding_vector
 from memory_system.embeddings.vector_store import add_vector
 from memory_system.embeddings.vector_store import search_vector
 
+DEDUP_THRESHOLD = 0.90
+NEAR_DEDUP_THRESHOLD = 0.75   # below this: unrelated; above but <0.90: near-duplicate
 
-def insert_memory(input_data: dict):
 
-    memory_id = str(uuid.uuid4())
-    created_at = datetime.utcnow().isoformat()
+def _get_session_id() -> str:
+    try:
+        import backend_loop_ref as _ref
+        return _ref.session_id or "unknown"
+    except Exception:
+        return "unknown"
 
-    raw_text = input_data["text"]
-    source = input_data.get("source", "manual")
 
-    # Step 1: classify type (temporary default)
+def insert_memory(input_data: dict) -> str:
+    memory_id   = str(uuid.uuid4())
+    created_at  = datetime.utcnow().isoformat()
+    raw_text    = input_data["text"]
+    source      = input_data.get("source", "manual")
     memory_type = input_data.get("memory_type", "IdeaMemory")
+    summary     = raw_text[:300]
+    session_id  = _get_session_id()
 
-    # Step 2: summary (temporary = raw_text)
-    summary = raw_text[:300]
+    # ── Step 1: Affect tagging ────────────────────────────────────────────────
+    affect = detect_affect(raw_text)
 
-    # -----------------------------
-    # 🔎 Pre-insert Deduplication
-    # -----------------------------
-    DEDUP_THRESHOLD = 0.90
-
+    # ── Step 2: Pre-insert deduplication + near-duplicate chain detection ─────
     embedding_input = f"{memory_type} | {summary}"
     new_vector = generate_embedding_vector(embedding_input)
-    distances, indices = search_vector(new_vector, top_k=3)
+    distances, indices = search_vector(new_vector, top_k=5)
+
+    near_duplicates: list[tuple[str, str]] = []   # (existing_memory_id, existing_affect)
 
     conn = get_connection()
     cursor = conn.cursor()
 
     for distance, idx in zip(distances, indices):
-
         if idx == -1:
             continue
-
-        # Using inner product (cosine similarity) from FAISS IndexFlatIP
         similarity = float(distance)
 
         if similarity >= DEDUP_THRESHOLD:
-
             cursor.execute("""
-                SELECT memory_id FROM memory_embeddings
-                WHERE vector_id = ?
+                SELECT memory_id FROM memory_embeddings WHERE vector_id = ?
             """, (str(idx),))
-
             row = cursor.fetchone()
-
             if row:
-                existing_memory_id = row["memory_id"]
-                print(f"[Dedup] Skipping insert. Similar memory exists: {existing_memory_id}")
-                # FIX2A: re-claim this memory for the current session so it scores
-                # full weight in retrieval (avoids cross-session penalty on reconfirmed
-                # facts like "my name is Rohit" that dedup against a legacy entry).
-                if _session_id and _session_id not in ("unknown", "legacy"):
+                existing_id = row["memory_id"]
+                if session_id and session_id not in ("unknown", "legacy"):
                     cursor.execute(
                         "UPDATE memories SET session_id = ? WHERE id = ?",
-                        (_session_id, existing_memory_id),
+                        (session_id, existing_id),
                     )
                     conn.commit()
                 conn.close()
-                return existing_memory_id
+                return existing_id
+
+        elif similarity >= NEAR_DEDUP_THRESHOLD:
+            cursor.execute("""
+                SELECT me.memory_id, m.affect
+                FROM memory_embeddings me
+                JOIN memories m ON m.id = me.memory_id
+                WHERE me.vector_id = ?
+            """, (str(idx),))
+            row = cursor.fetchone()
+            if row:
+                near_duplicates.append((row["memory_id"], row["affect"] or "neutral"))
 
     conn.close()
 
-    # Step 3: extract entities
-    entities = extract_entities(raw_text)
-
-    # Step 4: importance score
+    # ── Step 3: Entity extraction + importance ────────────────────────────────
+    entities   = extract_entities(raw_text)
     importance = calculate_importance(memory_type, raw_text)
 
-    # Resolve current session_id from shared ref (avoids circular import back to main).
-    try:
-        import backend_loop_ref as _loop_ref  # noqa: PLC0415
-        _session_id = _loop_ref.session_id or "unknown"
-    except Exception:
-        _session_id = "unknown"
-
-    conn = get_connection()
+    # ── Step 4: Insert into SQLite ────────────────────────────────────────────
+    conn   = get_connection()
     cursor = conn.cursor()
 
     try:
-        # Insert memory
         cursor.execute("""
             INSERT INTO memories
-            (id, memory_type, raw_text, summary, importance_score, source, session_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (id, memory_type, raw_text, summary, importance_score, source,
+             session_id, affect, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            memory_id,
-            memory_type,
-            raw_text,
-            summary,
-            importance,
-            source,
-            _session_id,
-            created_at
+            memory_id, memory_type, raw_text, summary,
+            importance, source, session_id, affect, created_at,
         ))
 
-        # ENTITY LINKING (transaction-safe)
         for entity in entities:
             entity_id = get_or_create_entity(
                 cursor,
                 name=entity["name"],
                 domain=entity["domain"],
                 category=entity["category"],
-                entity_type=entity["entity_type"]
+                entity_type=entity["entity_type"],
             )
-
             cursor.execute("""
                 INSERT OR IGNORE INTO memory_entities (memory_id, entity_id)
                 VALUES (?, ?)
             """, (memory_id, entity_id))
+
+        # ── Step 4b: Chain links for near-duplicates ──────────────────────────
+        from memory_system.core.chain import create_chain, detect_chain_type
+        for existing_id, existing_affect in near_duplicates:
+            chain_type = detect_chain_type(affect, existing_affect)
+            create_chain(cursor, memory_id, existing_id, chain_type)
+            # Update confidence of older memory if contradicted
+            if chain_type == "contradicts":
+                cursor.execute("""
+                    UPDATE memories
+                    SET confidence_score = MAX(confidence_score - 0.2, 0.0)
+                    WHERE id = ?
+                """, (existing_id,))
 
         conn.commit()
 
@@ -126,44 +132,38 @@ def insert_memory(input_data: dict):
     finally:
         conn.close()
 
-    # Step 5: reuse precomputed embedding vector
-    vector = new_vector
+    # ── Step 5: FAISS insert ──────────────────────────────────────────────────
+    numeric_id = add_vector(memory_id, new_vector)
 
-    # Step 6: store in FAISS using stable memory_id mapping (IDMap)
-    numeric_id = add_vector(memory_id, vector)
-
-    # Step 7: store embedding reference in SQL
-    conn = get_connection()
+    conn   = get_connection()
     cursor = conn.cursor()
-
     cursor.execute("""
         INSERT INTO memory_embeddings (memory_id, vector_id, model_name)
         VALUES (?, ?, ?)
-    """, (
-        memory_id,
-        str(numeric_id),
-        "all-MiniLM-L6-v2"
-    ))
-
+    """, (memory_id, str(numeric_id), "all-MiniLM-L6-v2"))
     conn.commit()
     conn.close()
 
-    # ── Memory cap check ────────────────────────────────────────────────────
-    # After every insert, check if we've exceeded MAX_MEMORIES.
-    # If so, evict lowest-importance memories and rebuild FAISS.
-    # This keeps retrieval latency bounded and RAM usage predictable.
+    # ── Step 6: Async summary generation (fire-and-forget) ───────────────────
     try:
-        from memory_system.embeddings.eviction import (  # noqa: PLC0415
+        from memory_system.core.async_summary import generate_and_store_summary
+        try:
+            loop = asyncio.get_running_loop()
+            asyncio.create_task(generate_and_store_summary(memory_id, raw_text, memory_type))
+        except RuntimeError:
+            # No running event loop (e.g. called from a sync thread outside asyncio)
+            pass
+    except Exception:
+        pass
+
+    # ── Step 7: Memory cap check ──────────────────────────────────────────────
+    try:
+        from memory_system.embeddings.eviction import (
             MAX_MEMORIES, get_memory_count, evict_and_rebuild,
         )
-        current_count = get_memory_count()
-        if current_count > MAX_MEMORIES:
-            print(
-                f"  [memory] cap exceeded ({current_count}/{MAX_MEMORIES}) — evicting",
-                flush=True,
-            )
+        if get_memory_count() > MAX_MEMORIES:
             evict_and_rebuild()
-    except Exception as _evict_exc:
-        print(f"  [memory] eviction check failed (non-fatal): {_evict_exc}", flush=True)
+    except Exception as exc:
+        print(f"  [memory] eviction check failed (non-fatal): {exc}", flush=True)
 
     return memory_id
