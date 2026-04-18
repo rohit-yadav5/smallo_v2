@@ -13,6 +13,21 @@ AUTO_PARENT_RULES = {
 }
 
 
+def _write_entity_relation(cursor, child_id: str, parent_name: str) -> None:
+    """Write a parent is_a relation if the parent entity already exists."""
+    cursor.execute("SELECT id FROM entities WHERE name = ?", (parent_name,))
+    row = cursor.fetchone()
+    if not row:
+        return
+    parent_id = row["id"]
+    rel_id = f"rel-{child_id[:8]}-{parent_id[:8]}"
+    cursor.execute("""
+        INSERT OR IGNORE INTO entity_relations
+        (id, source_entity_id, target_entity_id, relation_type, created_at)
+        VALUES (?, ?, ?, 'is_a', ?)
+    """, (rel_id, child_id, parent_id, datetime.utcnow().isoformat()))
+
+
 def get_or_create_entity(cursor, name: str, domain: str, category: str, entity_type: str):
 
     normalized = name.strip().lower()
@@ -24,8 +39,6 @@ def get_or_create_entity(cursor, name: str, domain: str, category: str, entity_t
 
     if row:
         entity_id = row["id"]
-
-        # Increment usage_count
         cursor.execute("""
             UPDATE entities
             SET usage_count = usage_count + 1,
@@ -35,10 +48,8 @@ def get_or_create_entity(cursor, name: str, domain: str, category: str, entity_t
             datetime.utcnow().isoformat(),
             entity_id
         ))
-
         return entity_id
 
-    # Create new entity
     entity_id = str(uuid.uuid4())
 
     cursor.execute("""
@@ -51,14 +62,13 @@ def get_or_create_entity(cursor, name: str, domain: str, category: str, entity_t
         domain,
         category,
         entity_type,
-        1,              # first usage
-        1.0,            # base importance
+        1,
+        1.0,
         datetime.utcnow().isoformat()
     ))
 
-    # NOTE: entity_relations (parent links) are intentionally NOT written here.
-    # The audit (memory_audit.md §10) found that entity_relations is never read
-    # during retrieval — writing to it was wasted I/O. The table is kept in the
-    # schema for future use but no longer populated on every insert.
+    parent_name = AUTO_PARENT_RULES.get(normalized)
+    if parent_name:
+        _write_entity_relation(cursor, entity_id, parent_name)
 
     return entity_id
