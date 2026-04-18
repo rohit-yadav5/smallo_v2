@@ -1,11 +1,18 @@
-def rewrite_query_for_retrieval(query: str) -> str:
+"""LLM query expansion — first step of the deep retrieval path.
+
+Rewrites the user query into key concepts before FAISS top-20 search.
+"""
+import asyncio
+
+
+async def rewrite_query_for_retrieval(query: str) -> str:
     """Expand query into key concepts for better FAISS semantic matching.
 
     Returns the original query unchanged if the LLM call fails or returns
     an empty result — so the caller always gets something usable.
     """
     try:
-        result = _call_rewriter_llm(query)
+        result = await asyncio.to_thread(_call_rewriter_llm, query)
         return result.strip() if result and len(result.strip()) > 5 else query
     except Exception:
         return query
