@@ -57,7 +57,8 @@ DECAY_HALF_LIFE: dict[str, int | None] = {
     "DecisionMemory":     90,
     "ActionMemory":       30,
     "PlannerMemory":      14,
-    "ConsolidatedMemory": None,
+    "ConsolidatedMemory":     None,
+    "MetaConsolidatedMemory": None,
 }
 DECAY_HALF_LIFE_DEFAULT = 60  # fallback for unlisted memory types
 

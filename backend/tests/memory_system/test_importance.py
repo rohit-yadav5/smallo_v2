@@ -38,3 +38,9 @@ def test_personal_memory_decays_slowly():
     result = calculate_effective_importance(8.0, "PersonalMemory", _iso(90))
     expected = 8.0 * math.pow(0.5, 90 / 180)
     assert abs(result - expected) < 0.01
+
+
+def test_malformed_date_returns_stored_importance():
+    from memory_system.core.importance import calculate_effective_importance
+    result = calculate_effective_importance(5.0, "ActionMemory", "not-a-date")
+    assert result == 5.0

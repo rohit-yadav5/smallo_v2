@@ -1,3 +1,9 @@
+import math
+from datetime import datetime
+
+from config.llm import DECAY_HALF_LIFE, DECAY_HALF_LIFE_DEFAULT
+
+
 def calculate_importance(memory_type: str, text: str) -> float:
     score = 5.0
 
@@ -19,10 +25,6 @@ def calculate_importance(memory_type: str, text: str) -> float:
     return min(score, 10)
 
 
-import math
-from datetime import datetime
-
-
 def calculate_effective_importance(
     stored_importance: float,
     memory_type: str,
@@ -33,14 +35,12 @@ def calculate_effective_importance(
     Stored value in SQLite is never modified — only the returned value is used
     for ranking so decay is always reversible.
     """
-    from config.llm import DECAY_HALF_LIFE, DECAY_HALF_LIFE_DEFAULT
-
     half_life = DECAY_HALF_LIFE.get(memory_type, DECAY_HALF_LIFE_DEFAULT)
     if half_life is None:
         return stored_importance
 
     try:
-        age_days = max(0, (datetime.utcnow() - datetime.fromisoformat(created_at_iso)).days)
+        age_days = max(0.0, (datetime.utcnow() - datetime.fromisoformat(created_at_iso)).total_seconds() / 86400)
     except Exception:
         return stored_importance
 
