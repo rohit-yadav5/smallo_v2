@@ -19,6 +19,88 @@ _CONVERSATIONAL_BYPASS = re.compile(
     re.IGNORECASE,
 )
 
+# Web/browser-related inputs that should fall through to the LLM so the
+# web agent tools (web_navigate, web_search, deep_research, …) can handle them.
+# Any match → router returns None without consulting any plugin.
+_WEB_BYPASS = re.compile(
+    r"""
+    \bin\s+browser\b                    # "open X in browser"
+    | open\s+\S+\.(?:com|org|net|io|co|app|dev|ai)\b  # "open instagram.com"
+    | (?:^|\s)go\s+to\s                 # "go to ..."
+    | (?:^|\s)navigate\s+to\s          # "navigate to ..."
+    | (?:^|\s)search\s+google          # "search google for ..."
+    | (?:^|\s)fetch\s+http             # "fetch https://..."
+    | (?:^|\s)web_                     # raw tool names like "web_navigate"
+    | \bwebsite\b                      # "open the website"
+    | \bwebpage\b                      # "load the webpage"
+    | \bbrowse\s+to\b                  # "browse to ..."
+    | \burl\b                          # "open this url"
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Supplemental patterns for named sites and domain patterns.
+# Catches "open github" (no TLD), "find the person who made Linux on github", etc.
+# Kept as a list so new entries are easy to add without modifying a complex regex.
+_WEB_BYPASS_PATTERNS: list[str] = [
+    r'https?://',                                                              # explicit URL
+    r'\b\w+\.(com|org|net|io|dev|ai|co|uk|app)\b',                           # any domain with TLD
+    r'\b(github|youtube|twitter|reddit|instagram|linkedin|google|wikipedia|'
+    r'stackoverflow|hackernews|hacker\s+news|npm|pypi|gitlab|bitbucket)\b',   # named sites
+]
+
+
+def _is_web_query(text: str) -> bool:
+    """Return True if the query references a website, URL, or well-known web service."""
+    tl = text.lower()
+    return any(re.search(p, tl) for p in _WEB_BYPASS_PATTERNS)
+
+
+# "Close heavy tabs" — recognized phrase that maps directly to the close_heavy_tabs tool.
+# Matched before any plugin so it never reaches the computer plugin.
+_CLOSE_HEAVY_TABS_RE = re.compile(
+    r'\bclose\s+(?:heavy|memory|ram|resource)\s+tabs?\b'
+    r'|\bclose\s+(?:youtube|suno|chatgpt|netflix|twitch|spotify)\s+tabs?\b'
+    r'|\bfree\s+(?:up\s+)?(?:ram|memory)\b.*\btabs?\b',
+    re.IGNORECASE,
+)
+
+# Primary file/system creation actions — query mentions the weather (or any other
+# topic) but the *intent* is file creation/writing.  Any match → skip ALL plugins
+# and let the LLM/planner handle the full multi-step task.
+# Rule: if the sentence starts with or prominently contains a file-creation verb,
+# plugins must not intercept on incidental keywords ("weather", "news", etc.).
+_PRIMARY_FILE_ACTION_PATTERNS: list[str] = [
+    r'\b(create|make|write|save|generate)\s+a?\s*(file|document|note|txt|pdf|csv|json)\b',
+    r'\b(write|put|add)\s+.{0,40}\s+(to|into|in)\s+(a\s+)?(file|document|note)\b',
+    r'\bsave\s+.{0,40}\s+to\b.{0,20}\b(file|document|desktop|folder|directory)\b',
+    r'\bcreate\s+.{0,40}\s+on\b.{0,15}\b(desktop|disk|drive|computer)\b',
+]
+
+
+def _has_primary_file_action(text: str) -> bool:
+    """Return True if the query's primary intent is a file/system creation task."""
+    tl = text.lower()
+    return any(re.search(p, tl) for p in _PRIMARY_FILE_ACTION_PATTERNS)
+
+
+# Math / calculation patterns — LLM can answer these inline, no plugin needed.
+# Any match → skip ALL plugins, route directly to LLM.
+_MATH_PATTERNS: list[str] = [
+    r'\d+\s*[\+\-\*\/\^%]\s*\d+',   # arithmetic: 2 + 2, 10 * 5, 50%
+    r'\bwhat\s+is\s+\d',             # "what is 2...", "what is 15%..."
+    r'\bcalculate\b',
+    r'\bconvert\b.*\bto\b',          # unit conversions: "convert 5 km to miles"
+    r'\bhow\s+much\s+is\b',
+    r'\bsquare\s+root\b',
+    r'\bpercent(?:age)?\s+of\b',     # "15 percent of 340"
+]
+
+
+def _is_math_query(text: str) -> bool:
+    """Return True if the query is a pure math/calculation question the LLM can answer inline."""
+    return any(re.search(p, text, re.IGNORECASE) for p in _MATH_PATTERNS)
+
 
 class PluginRouter:
     """
@@ -56,12 +138,43 @@ class PluginRouter:
         """
         Try each plugin in priority order.
         Returns a PluginResult on first match, else None.
-        Conversational/personal questions are bypassed immediately.
+
+        Bypass order (checked before any plugin):
+          1. Conversational/personal questions → LLM
+          2. Web/browser-related commands      → LLM → web agent tools
+          3. Math / calculation questions      → LLM (no plugin can answer these)
         """
-        if _CONVERSATIONAL_BYPASS.search(user_text.strip()):
+        text = user_text.strip()
+
+        if _CONVERSATIONAL_BYPASS.search(text):
+            return None
+
+        # Intent guard: file/system creation is the primary action — bypass all
+        # plugins even if the query contains a keyword like "weather" or "news".
+        if _has_primary_file_action(text):
+            print("  [plugin] file action detected — bypassing all plugins", flush=True)
+            return None
+
+        if _CLOSE_HEAVY_TABS_RE.search(text):
+            # Route directly to close_heavy_tabs tool via LLM tool call path
+            print("  [plugin] close heavy tabs — routing to LLM/tool", flush=True)
+            return None
+
+        if _WEB_BYPASS.search(text) or _is_web_query(text):
+            print("  [plugin] web bypass — routing to LLM/web-agent", flush=True)
+            return None
+
+        if _is_math_query(text):
+            print("  [plugin] math query — routing to LLM", flush=True)
             return None
 
         for plugin in self._plugins:
+            # Word-count guard: the computer plugin only handles short, specific
+            # OS-level open commands ("open Finder", "open Safari").  Queries
+            # longer than 4 words — e.g. "open github and find the person who
+            # made Linux" — must never reach computer.open_target.
+            if getattr(plugin, "NAME", "") == "computer" and len(text.split()) > 4:
+                continue
             result = plugin.match(user_text)
             if result is not None:
                 action, match_obj = result

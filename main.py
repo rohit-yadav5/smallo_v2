@@ -21,6 +21,37 @@ FRONTEND = ROOT / "frontend"
 VENV_PY  = ROOT / ".venv" / "bin" / "python3"
 PYTHON   = str(VENV_PY) if VENV_PY.exists() else sys.executable
 
+# Resolve npm — subprocess doesn't inherit the user's shell PATH on macOS
+def _find_npm() -> str:
+    """Return the absolute path to npm, searching common install locations."""
+    import shutil
+    # 1. Already on PATH (works in most CI / Linux envs)
+    npm = shutil.which("npm")
+    if npm:
+        return npm
+    # 2. Common macOS locations (Homebrew Apple Silicon / Intel, nvm, fnm, volta)
+    candidates = [
+        "/opt/homebrew/bin/npm",          # Homebrew arm64
+        "/usr/local/bin/npm",             # Homebrew x86_64
+        Path.home() / ".nvm/versions/node" ,  # nvm (glob below)
+        "/usr/bin/npm",
+    ]
+    for c in candidates:
+        p = Path(str(c))
+        if p.is_file():
+            return str(p)
+    # 3. nvm: pick the highest-versioned node in ~/.nvm
+    nvm_dir = Path.home() / ".nvm" / "versions" / "node"
+    if nvm_dir.is_dir():
+        versions = sorted(nvm_dir.iterdir(), reverse=True)
+        for v in versions:
+            npm_bin = v / "bin" / "npm"
+            if npm_bin.is_file():
+                return str(npm_bin)
+    return "npm"   # last resort — let the OS raise the error
+
+NPM = _find_npm()
+
 
 def _kill_tree(proc: subprocess.Popen, label: str) -> None:
     """Terminate a process and all its children (handles npm → vite → esbuild chains)."""
@@ -70,7 +101,7 @@ def main():
         procs.append(backend_proc)
 
         frontend_proc = subprocess.Popen(
-            ["npm", "run", "dev"],
+            [NPM, "run", "dev"],
             cwd=FRONTEND, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )

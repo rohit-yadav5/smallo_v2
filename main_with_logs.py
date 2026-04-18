@@ -32,6 +32,24 @@ FRONTEND = ROOT / "frontend"
 VENV_PY  = ROOT / ".venv" / "bin" / "python3"
 PYTHON   = str(VENV_PY) if VENV_PY.exists() else sys.executable
 
+def _find_npm() -> str:
+    import shutil
+    npm = shutil.which("npm")
+    if npm:
+        return npm
+    for c in ["/opt/homebrew/bin/npm", "/usr/local/bin/npm", "/usr/bin/npm"]:
+        if Path(c).is_file():
+            return c
+    nvm_dir = Path.home() / ".nvm" / "versions" / "node"
+    if nvm_dir.is_dir():
+        for v in sorted(nvm_dir.iterdir(), reverse=True):
+            npm_bin = v / "bin" / "npm"
+            if npm_bin.is_file():
+                return str(npm_bin)
+    return "npm"
+
+NPM = _find_npm()
+
 # ── ANSI codes ────────────────────────────────────────────────────────
 R    = "\033[0m"
 B    = "\033[1m"
@@ -649,7 +667,7 @@ def main():
         # ── Frontend ──────────────────────────────────────────────────
         _section("FRONTEND", BLU)
         frontend_proc = subprocess.Popen(
-            ["npm", "run", "dev"],
+            [NPM, "run", "dev"],
             cwd=FRONTEND,
             env=env,
             stdout=subprocess.PIPE,

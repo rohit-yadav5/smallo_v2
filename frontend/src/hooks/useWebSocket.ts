@@ -3,6 +3,28 @@ import { useAppStore } from '../store/appStore'
 import { wsRef } from '../lib/wsRef'
 import type { WSEvent } from '../types/events'
 
+// ── _triggerDownload ──────────────────────────────────────────────────────────
+// Triggers a browser Save As dialog for a file received over WebSocket.
+// Uses the Blob API — no server-side file serving needed.
+function _triggerDownload(content: string, filename: string, extension: string) {
+  const mimeTypes: Record<string, string> = {
+    '.txt':  'text/plain',
+    '.md':   'text/markdown',
+    '.py':   'text/x-python',
+    '.json': 'application/json',
+    '.html': 'text/html',
+    '.csv':  'text/csv',
+  }
+  const mime = mimeTypes[extension] ?? 'text/plain'
+  const blob = new Blob([content], { type: mime })
+  const url  = URL.createObjectURL(blob)
+  const a    = document.createElement('a')
+  a.href     = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 // ── TTSAudioReceiver ──────────────────────────────────────────────────────────
 // Receives chunked PCM16 or Opus audio frames from the server and plays them
 // via Web Audio API in arrival order using a sequential drain queue.
@@ -113,6 +135,28 @@ export function useWebSocket() {
   const llmTimeRef       = useRef<number>(0)
   const audioReceiverRef = useRef<TTSAudioReceiver>(new TTSAudioReceiver())
 
+  // Keep a stable ref of ttsEnabled so ws.onopen can read the current value
+  // without stale-closure issues (the main useEffect runs once with [] deps).
+  const ttsEnabled    = useAppStore((s) => s.ttsEnabled)
+  const ttsEnabledRef = useRef(ttsEnabled)
+  useEffect(() => { ttsEnabledRef.current = ttsEnabled }, [ttsEnabled])
+
+  // Sync ttsEnabled changes to backend while connected
+  useEffect(() => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'SET_TTS_ENABLED', enabled: ttsEnabled }))
+      console.log(`[ws] SET_TTS_ENABLED → ${ttsEnabled}`)
+    }
+  }, [ttsEnabled])
+
+  /** Send a typed message over WebSocket — bypasses STT entirely. */
+  function sendTextInput(text: string) {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({ event: 'TEXT_INPUT', data: { text } }))
+  }
+
   useEffect(() => {
     let retryDelay    = 1_000
     let reconnectTimer: ReturnType<typeof setTimeout>
@@ -166,6 +210,12 @@ export function useWebSocket() {
         retryDelay = 1_000          // reset backoff on success
         store.setWsConnected(true)
         startHeartbeat(ws)
+        // Sync TTS state to backend immediately on connect / reconnect.
+        // Uses the ref so we always read the live store value, not the
+        // stale closure captured at effect creation time.
+        ws.send(JSON.stringify({ event: 'SET_TTS_ENABLED', enabled: ttsEnabledRef.current }))
+        // Request any files already saved this session (handles page refresh)
+        ws.send(JSON.stringify({ event: 'GET_SESSION_FILES' }))
       }
 
       ws.onerror = (e) => {
@@ -199,6 +249,29 @@ export function useWebSocket() {
         } catch (err) {
           console.warn('[ws] could not parse message:', err)
         }
+      }
+    }
+
+    // ── Notification sound ─────────────────────────────────────────────────
+    // Two-tone descending ping via Web Audio API.  No external library, no file.
+    // Called for every PROACTIVE_EVENT (reminder or web_monitor alert).
+    function playNotificationSound() {
+      try {
+        const ctx  = new AudioContext()
+        const osc  = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.connect(gain)
+        gain.connect(ctx.destination)
+        osc.frequency.setValueAtTime(880, ctx.currentTime)
+        osc.frequency.setValueAtTime(660, ctx.currentTime + 0.1)
+        gain.gain.setValueAtTime(0.3, ctx.currentTime)
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4)
+        osc.start(ctx.currentTime)
+        osc.stop(ctx.currentTime + 0.4)
+        // Allow GC after the tone finishes
+        osc.onended = () => ctx.close().catch(() => {})
+      } catch {
+        // AudioContext not available (e.g. in tests) — silently skip
       }
     }
 
@@ -285,6 +358,56 @@ export function useWebSocket() {
           audioReceiverRef.current.stop()
           break
 
+        case 'PROACTIVE_EVENT': {
+          const pev = msg.data
+          // Play a sound for every proactive event regardless of type
+          playNotificationSound()
+          if (pev.event === 'web_monitor') {
+            // Webpage change alert — show with URL context
+            store.addPluginNotification({
+              plugin: 'monitor',
+              action: `Page changed: ${pev.description ?? pev.url ?? 'unknown'}`,
+              result: pev.summary
+                ? `${pev.summary.slice(0, 200)}${pev.summary.length > 200 ? '…' : ''}`
+                : `${pev.url ?? ''}`,
+            })
+            console.info('[web_monitor] change detected', pev)
+          } else {
+            // Reminder / other proactive notification
+            store.addPluginNotification({
+              plugin: 'reminder',
+              action: pev.event,
+              result: pev.message ?? '',
+            })
+            console.info('[proactive]', pev.event, pev.message)
+          }
+          break
+        }
+
+        case 'PLAN_EVENT':
+          store.handlePlanEvent(msg.data)
+          break
+
+        case 'WEB_SCREENSHOT':
+          store.setScreenshot(msg.data)
+          break
+
+        case 'SYSTEM_EVENT':
+          store.handleSystemEvent(msg.data)
+          break
+
+        case 'FILE_CREATED':
+          store.addSessionFile(msg.data)
+          break
+
+        case 'FILE_LIST':
+          store.setSessionFiles(msg.data.files)
+          break
+
+        case 'FILE_CONTENT':
+          _triggerDownload(msg.data.content, msg.data.filename, msg.data.extension)
+          break
+
         case 'pong':
           clearTimeout(pongTimeout)   // received pong — cancel the close-on-timeout
           break
@@ -299,4 +422,6 @@ export function useWebSocket() {
       wsRef.current = null
     }
   }, [])
+
+  return { sendTextInput }
 }

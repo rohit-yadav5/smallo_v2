@@ -1,8 +1,11 @@
-import { useState } from 'react'
+import { useState, useRef, useCallback } from 'react'
 import { StatusBar } from './components/StatusBar'
 import { ConversationStream } from './components/ConversationStream'
 import { InfoDrawer } from './components/InfoDrawer'
 import { PluginNotifications } from './components/PluginNotifications'
+import { PlanProgress } from './components/PlanProgress'
+import { WebViewer } from './components/WebViewer'
+import { DocPanel } from './components/DocPanel'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useMicrophone } from './hooks/useMicrophone'
@@ -107,12 +110,31 @@ const STATE_FOOTER: Record<string, { emoji: string; label: string }> = {
 }
 
 export default function App() {
-  useWebSocket()
-  const { startMic } = useMicrophone()
-  const voiceState = useAppStore((s) => s.voiceState)
-  const [drawerOpen, setDrawerOpen] = useState(false)
+  const { sendTextInput }  = useWebSocket()
+  const { startMic }       = useMicrophone()
+  const voiceState         = useAppStore((s) => s.voiceState)
+  const wsConnected        = useAppStore((s) => s.wsConnected)
+  const browserViewerOpen  = useAppStore((s) => s.browserViewerOpen)
+  const [drawerOpen, setDrawerOpen]   = useState(false)
+  const [inputText,  setInputText]    = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
 
   const footer = STATE_FOOTER[voiceState]
+
+  const handleSend = useCallback(() => {
+    const text = inputText.trim()
+    if (!text || !wsConnected) return
+    sendTextInput(text)
+    setInputText('')
+    inputRef.current?.focus()
+  }, [inputText, wsConnected, sendTextInput])
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
+    }
+  }, [handleSend])
 
   return (
     <ErrorBoundary>
@@ -125,6 +147,50 @@ export default function App() {
         <div className="w-full max-w-2xl flex flex-col px-4 py-4 gap-3" style={{ height: '100dvh' }}>
           <StatusBar />
           <ConversationStream onStartMic={startMic} />
+          <PlanProgress />
+          {browserViewerOpen && <WebViewer />}
+          <DocPanel />
+
+          {/* ── Text input bar — always visible ─────────────────────── */}
+          <div
+            className="flex items-center gap-2 px-3 py-2 rounded-xl shrink-0"
+            style={{
+              background:  '#F8F0FF',
+              border:      '3px solid #000',
+              boxShadow:   '5px 5px 0px #000',
+            }}
+          >
+            <input
+              ref={inputRef}
+              type="text"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="Type a message…"
+              disabled={!wsConnected}
+              className="flex-1 bg-transparent outline-none text-sm font-medium placeholder:text-gray-400"
+              style={{
+                fontFamily: 'Inter, sans-serif',
+                color: '#000',
+              }}
+            />
+            <button
+              onClick={handleSend}
+              disabled={!inputText.trim() || !wsConnected}
+              className="shrink-0 px-3 py-1 rounded-lg text-sm font-black transition-all active:translate-y-0.5 disabled:opacity-40 disabled:cursor-not-allowed"
+              style={{
+                background:  '#7B2FBE',
+                border:      '2px solid #000',
+                boxShadow:   '3px 3px 0px #000',
+                color:       '#FFD60A',
+                cursor:      'pointer',
+              }}
+            >
+              Send ↵
+            </button>
+          </div>
+
+          {/* ── Footer status + drawer toggle ────────────────────────── */}
           <div
             className="flex items-center justify-between px-4 py-2.5 rounded-xl shrink-0"
             style={{

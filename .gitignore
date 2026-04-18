@@ -1,59 +1,105 @@
-# ── Python ────────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
-*.egg-info/
-dist/
-build/
-
-# ── Virtual environment ───────────────────────────────────────────────────────
 .venv/
 venv/
 env/
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# ── Environment variables ─────────────────────────────────────────────────────
-.env
-.env.*
+# Node
+node_modules/
+dist/
+.next/
+.nuxt/
+*.local
 
-# ── Database & vector index (runtime-generated, not source) ──────────────────
-**/*.db
-**/*.sqlite
-**/*.sqlite3
-backend/memory_system/embeddings/faiss.index
-
-# ── Scratch / experimental folders ───────────────────────────────────────────
-backend/xextra/
-backend/xstorage/
-
-# ── TTS / STT model weights (downloaded at runtime, can be large) ────────────
-*.onnx
-*.onnx.json
-*.pt
-*.bin
-*.ckpt
-*.safetensors
-models/
-
-# ── Frontend build artifacts ──────────────────────────────────────────────────
-frontend/node_modules/
+# Vite
 frontend/dist/
 frontend/.vite/
 
-# ── Logs ─────────────────────────────────────────────────────────────────────
-*.log
-logs/
+# Playwright browser binaries
+backend/data/browser_profile/
+playwright-browsers/
+ms-playwright/
 
-# ── macOS ─────────────────────────────────────────────────────────────────────
+# Models and large binary files
+*.onnx
+*.onnx.json
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.gguf
+*.ggml
+models/
+
+# Logs
+backend/logs/
+logs/
+*.log
+
+# Runtime data (persisted state — not source code)
+backend/data/user_context.json
+backend/data/monitor_targets.json
+backend/data/text_input.txt
+
+# FAISS index and embeddings (large, regenerated at runtime)
+*.faiss
+*.index
+backend/memory_system/embeddings/faiss.index
+
+# SQLite and WAL files
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+
+# macOS
 .DS_Store
 **/.DS_Store
+.AppleDouble
+.LSOverride
 
-# ── IDE ───────────────────────────────────────────────────────────────────────
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# ── Claude Code ───────────────────────────────────────────────────────────────
+.cursor/
 .claude/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Coverage / test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Scratch / experimental
+backend/xextra/
+backend/xstorage/
+
+# Misc
+*.tmp
+*.bak
+*.orig
+
+#extra
+docs/smallo_arhitecture.md
+claude.md
+bot-docs/
+docs/

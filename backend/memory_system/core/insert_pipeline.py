@@ -56,6 +56,15 @@ def insert_memory(input_data: dict):
             if row:
                 existing_memory_id = row["memory_id"]
                 print(f"[Dedup] Skipping insert. Similar memory exists: {existing_memory_id}")
+                # FIX2A: re-claim this memory for the current session so it scores
+                # full weight in retrieval (avoids cross-session penalty on reconfirmed
+                # facts like "my name is Rohit" that dedup against a legacy entry).
+                if _session_id and _session_id not in ("unknown", "legacy"):
+                    cursor.execute(
+                        "UPDATE memories SET session_id = ? WHERE id = ?",
+                        (_session_id, existing_memory_id),
+                    )
+                    conn.commit()
                 conn.close()
                 return existing_memory_id
 
@@ -67,6 +76,13 @@ def insert_memory(input_data: dict):
     # Step 4: importance score
     importance = calculate_importance(memory_type, raw_text)
 
+    # Resolve current session_id from shared ref (avoids circular import back to main).
+    try:
+        import backend_loop_ref as _loop_ref  # noqa: PLC0415
+        _session_id = _loop_ref.session_id or "unknown"
+    except Exception:
+        _session_id = "unknown"
+
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -74,8 +90,8 @@ def insert_memory(input_data: dict):
         # Insert memory
         cursor.execute("""
             INSERT INTO memories
-            (id, memory_type, raw_text, summary, importance_score, source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (id, memory_type, raw_text, summary, importance_score, source, session_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             memory_id,
             memory_type,
@@ -83,6 +99,7 @@ def insert_memory(input_data: dict):
             summary,
             importance,
             source,
+            _session_id,
             created_at
         ))
 
@@ -130,5 +147,23 @@ def insert_memory(input_data: dict):
 
     conn.commit()
     conn.close()
+
+    # ── Memory cap check ────────────────────────────────────────────────────
+    # After every insert, check if we've exceeded MAX_MEMORIES.
+    # If so, evict lowest-importance memories and rebuild FAISS.
+    # This keeps retrieval latency bounded and RAM usage predictable.
+    try:
+        from memory_system.embeddings.eviction import (  # noqa: PLC0415
+            MAX_MEMORIES, get_memory_count, evict_and_rebuild,
+        )
+        current_count = get_memory_count()
+        if current_count > MAX_MEMORIES:
+            print(
+                f"  [memory] cap exceeded ({current_count}/{MAX_MEMORIES}) — evicting",
+                flush=True,
+            )
+            evict_and_rebuild()
+    except Exception as _evict_exc:
+        print(f"  [memory] eviction check failed (non-fatal): {_evict_exc}", flush=True)
 
     return memory_id

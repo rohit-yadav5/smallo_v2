@@ -107,11 +107,15 @@ class TTSConfig:
 
     # ── Sentence splitting ────────────────────────────────────────────────────
     # Applied to accumulated LLM tokens to find sentence boundaries.
-    # Splits after .!? and also after ,;:— so comma-heavy sentences don't
-    # hold the buffer until the final period (2-3s of silence avoided).
+    # Only splits on terminal punctuation (.!?) followed by whitespace.
+    # Commas, semicolons, colons, and em-dashes are intentionally excluded:
+    # splitting at commas creates many short fragments that synthesize quickly
+    # but produce audible gaps between them.  Longer sentence chunks benefit
+    # fully from the pre-synthesis lookahead thread — sentence N+1 is already
+    # synthesized before sentence N finishes playing.
     sentence_split_pattern: str = field(default_factory=lambda: _env_str(
         "TTS_SENTENCE_SPLIT",
-        r'(?<=[.!?,;:\u2014])\s+',
+        r'(?<=[.!?])\s+',
     ))
 
     # Flush the buffer immediately as a chunk when it exceeds this many
@@ -123,10 +127,12 @@ class TTSConfig:
 
     # Minimum number of words a chunk must have before it is synthesized
     # alone.  Chunks shorter than this are held and merged with the next.
-    # 6 words ≈ ~35 chars — keeps comma fragments ("Yes, I think,") from
-    # becoming solo Kokoro calls that cost 260ms each.
+    # 8 words ≈ ~50 chars — prevents very short clause fragments from
+    # being synthesized as isolated calls.  Longer chunks mean fewer
+    # synthesis calls total, and the pre-synthesis thread has more time
+    # to complete lookahead synthesis before the current sentence ends.
     min_chunk_words: int = field(default_factory=lambda: _env_int(
-        "TTS_MIN_CHUNK_WORDS", 6,
+        "TTS_MIN_CHUNK_WORDS", 8,
     ))
 
     # Minimum character length a non-sentence-final chunk must reach before

@@ -769,6 +769,19 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         # No pre-roll stitching needed — the buffer is the single source of truth.
         log.debug("reading audio window from buffer  start=%.3fs  end=%.3fs", speech_start_s, speech_end_s)
         audio_data = _audio_buffer.read_window(speech_start_s, speech_end_s)
+
+        # Guard: VAD can fire on a window that maps to no buffered frames yet.
+        if audio_data is None or len(audio_data) == 0:
+            log.warning("skipping transcription — empty audio window [%.3fs → %.3fs]",
+                        speech_start_s, speech_end_s)
+            print(
+                f"  [stt] skipping transcription — empty audio window "
+                f"[{speech_start_s:.3f}s → {speech_end_s:.3f}s]",
+                flush=True,
+            )
+            _emit("VOICE_STATE", {"state": "idle"})
+            return False
+
         dur      = len(audio_data) / 16_000
         rec_secs = time.perf_counter() - rec_start
         log.info("audio extracted  samples=%d  dur=%.2fs  waited=%.3fs  buffer_time=%.1fs",
@@ -947,7 +960,7 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
             f"first token in {first_token:.3f}s  ({n_tok} tokens total)"
         ])
         tracker.record("TTS", tts_synth_s, [
-            f"Piper synth first sentence: {tts_synth_s:.3f}s  ({n_sent} sentences)"
+            f"Kokoro synth first sentence: {tts_synth_s:.3f}s  ({n_sent} sentences)"
         ])
         tracker.record("Speaking", speaking_s, [
             f"audio playback: {speaking_s:.3f}s"

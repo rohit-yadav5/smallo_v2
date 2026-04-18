@@ -56,49 +56,9 @@ def get_or_create_entity(cursor, name: str, domain: str, category: str, entity_t
         datetime.utcnow().isoformat()
     ))
 
-    # -----------------------------
-    # 🔗 Auto Parent Relation
-    # -----------------------------
-    parent_name = AUTO_PARENT_RULES.get(normalized)
-
-    if parent_name:
-
-        # Ensure parent entity exists
-        cursor.execute("""
-            SELECT id FROM entities WHERE name = ?
-        """, (parent_name,))
-        parent_row = cursor.fetchone()
-
-        if parent_row:
-            parent_id = parent_row["id"]
-        else:
-            # Create parent entity if it doesn't exist
-            parent_id = str(uuid.uuid4())
-            cursor.execute("""
-                INSERT INTO entities
-                (id, name, domain, category, entity_type, usage_count, importance_score, last_used_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                parent_id,
-                parent_name,
-                "Engineering",
-                "Concept",
-                "Parent",
-                1,
-                1.0,
-                datetime.utcnow().isoformat()
-            ))
-
-        # Create relation (ignore if already exists)
-        cursor.execute("""
-            INSERT OR IGNORE INTO entity_relations
-            (id, source_entity_id, target_entity_id, relation_type, created_at)
-            VALUES (?, ?, ?, 'is_a', ?)
-        """, (
-            f"rel-{entity_id}-{parent_id}",
-            entity_id,
-            parent_id,
-            datetime.utcnow().isoformat()
-        ))
+    # NOTE: entity_relations (parent links) are intentionally NOT written here.
+    # The audit (memory_audit.md §10) found that entity_relations is never read
+    # during retrieval — writing to it was wasted I/O. The table is kept in the
+    # schema for future use but no longer populated on every insert.
 
     return entity_id

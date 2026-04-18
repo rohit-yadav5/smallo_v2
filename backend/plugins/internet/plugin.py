@@ -9,6 +9,15 @@ from plugins.base import BasePlugin, PluginResult
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SmallO/2.0)"}
 
+# Strip non-ASCII characters that TTS can't speak (emoji, ideographs, etc.).
+# Keeps standard Latin, extended Latin, and common punctuation/dashes.
+_NON_SPEAKABLE_RE = re.compile(r'[^\x00-\x7F\u00C0-\u024F\u2010-\u2027]')
+
+
+def _clean_for_tts(text: str) -> str:
+    """Remove emoji and other non-speakable Unicode before text goes to TTS."""
+    return _NON_SPEAKABLE_RE.sub('', text).strip()
+
 
 class InternetPlugin(BasePlugin):
     NAME = "internet"
@@ -40,6 +49,27 @@ class InternetPlugin(BasePlugin):
         (r"\bwho\s+is\s+(?P<topic>(?!(?:you|he|she|they|it)\b).+)", "wikipedia"),
         (r"\bwhat\s+is\s+(?P<topic>(?!(?:your|my|his|her|our|their|its|it\b|this|that|a\b|an\b|the\b)\b).+)", "wikipedia"),
     ]
+
+    # Arithmetic operator pattern — used to guard the wikipedia intent.
+    _OPERATOR_RE = re.compile(r'[\+\*\/=]|\b\d+\s*-\s*\d+\b', re.IGNORECASE)
+
+    def match(self, user_text: str) -> tuple[str, re.Match] | None:
+        """
+        Extend BasePlugin.match with guards for the wikipedia action:
+          • Query must be ≥ 4 words (avoids swallowing "what is 2 + 2")
+          • Query must not contain arithmetic operators (+, *, /, =, N-N)
+        If the wikipedia pattern would match but the guards fail, skip it and
+        let the LLM answer directly.
+        """
+        for pattern, action in self._compiled:
+            m = pattern.search(user_text)
+            if m:
+                if action == "wikipedia":
+                    word_count = len(user_text.split())
+                    if word_count < 4 or self._OPERATOR_RE.search(user_text):
+                        continue   # guards failed — skip this match
+                return action, m
+        return None
 
     def execute(self, user_text: str, action: str, match: re.Match) -> PluginResult:
         handler = getattr(self, f"_{action}", None)
@@ -80,17 +110,75 @@ class InternetPlugin(BasePlugin):
         target = quote(city) if city else ""
         url = f"https://wttr.in/{target}?format=3"
         resp = requests.get(url, headers=_HEADERS, timeout=10)
-        text = resp.text.strip()
+        # Force UTF-8 decode — requests sometimes misdetects encoding on wttr.in
+        # responses, producing mangled characters like "ð«" instead of weather emoji.
+        text = resp.content.decode("utf-8", errors="replace").strip()
+        # Strip emoji and non-speakable characters so TTS doesn't attempt to
+        # read "thunderstorm emoji" aloud, which sounds terrible.
+        text = _clean_for_tts(text)
         if not text or "Unknown location" in text:
             text = "Could not get weather. Try saying 'weather in London'."
             return {"text": text, "direct": True, "plugin": self.NAME, "action": "weather"}
         return {"text": text, "direct": False, "plugin": self.NAME, "action": "weather"}
 
+    @staticmethod
+    def _extract_wiki_topic(raw_query: str) -> str:
+        """Convert a free-form question into the best Wikipedia article title.
+
+        Strategy:
+        1. Strip leading question words and filler so we get a clean noun phrase.
+        2. Call the Wikipedia opensearch API to find the closest article title.
+        3. Fall back to the stripped noun phrase if the API call fails.
+        """
+        # Strip trailing punctuation
+        cleaned = raw_query.strip().rstrip("?.!").strip()
+
+        # Strip leading question/filler prefixes iteratively until stable
+        prefixes = [
+            r"^tell\s+me\s+(?:about|of)\s+",
+            r"^who\s+(?:is|was|are|were)\s+",
+            r"^what\s+(?:is|was|are|were)\s+",
+            r"^where\s+(?:is|was|are|were)\s+",
+            r"^when\s+(?:is|was|are|were)\s+",
+            r"^which\s+(?:is|was|are|were)\s+",
+            r"^how\s+(?:is|was|are|were)\s+",
+            r"^(?:the|a|an)\s+",  # strip leading articles last
+        ]
+        prev = None
+        while prev != cleaned:
+            prev = cleaned
+            for pat in prefixes:
+                cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE).strip()
+
+        cleaned = cleaned.strip()
+
+        # Use Wikipedia opensearch to resolve the best article title
+        try:
+            search_url = (
+                "https://en.wikipedia.org/w/api.php"
+                "?action=opensearch&namespace=0&limit=1&format=json"
+                f"&search={quote(cleaned)}"
+            )
+            resp = requests.get(search_url, headers=_HEADERS, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                # data[1] is a list of matching titles
+                if data and len(data) > 1 and data[1]:
+                    return data[1][0]  # first (best) matching article title
+        except Exception:
+            pass
+
+        return cleaned  # fallback: use cleaned noun phrase directly
+
     def _wikipedia(self, user_text: str, match: re.Match) -> PluginResult:
         try:
-            topic = match.group("topic").strip()
+            raw_topic = match.group("topic").strip()
         except IndexError:
-            topic = user_text
+            raw_topic = user_text
+
+        # Resolve the raw regex capture to a proper Wikipedia article title
+        topic = self._extract_wiki_topic(raw_topic)
+
         url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(topic)}"
         resp = requests.get(url, headers=_HEADERS, timeout=10)
         if resp.status_code != 200:
