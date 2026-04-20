@@ -10,6 +10,8 @@ Falls back gracefully if LLM returns invalid JSON.
 """
 
 import json
+import llm as llm_module
+from config.llm import LLM_CONFIG
 from utils.ram_monitor import can_load_7b
 
 
@@ -80,6 +82,7 @@ def _fine_rank(query: str, candidates: list[dict]) -> list[dict]:
         List of up to 5 candidate dicts, ordered by LLM ranking.
         Falls back to first 5 if LLM response is invalid.
     """
+    candidates = candidates[:10]
     if not candidates:
         return []
 
@@ -115,7 +118,5 @@ def _call_llm_for_ranking(prompt: str) -> str:
     Returns:
         The LLM's response (expected to be JSON, but may be invalid).
     """
-    import llm as llm_module
-    from config.llm import LLM_CONFIG
     model = LLM_CONFIG.planner_model if can_load_7b() else LLM_CONFIG.model
     return llm_module.ask_llm(prompt, model=model)
