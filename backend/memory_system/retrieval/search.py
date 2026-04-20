@@ -102,29 +102,30 @@ def classify_retrieval_path(query: str) -> str:
 
 
 def _fetch_multihop_memories(
-    cursor, top_memory_ids: list[str], already_seen: set, top_n: int = 3
+    conn, top_memory_ids: list[str], already_seen: set, top_n: int = 3
 ) -> list[dict]:
     """Return up to top_n memories sharing entities with top results, not already in results."""
+    cur = conn.cursor()
     entity_ids: set[str] = set()
     for mid in top_memory_ids:
-        cursor.execute("SELECT entity_id FROM memory_entities WHERE memory_id = ?", (mid,))
-        entity_ids.update(r["entity_id"] for r in cursor.fetchall())
+        cur.execute("SELECT entity_id FROM memory_entities WHERE memory_id = ?", (mid,))
+        entity_ids.update(r["entity_id"] for r in cur.fetchall())
 
     candidate_ids: set[str] = set()
     for eid in entity_ids:
-        cursor.execute("SELECT memory_id FROM memory_entities WHERE entity_id = ?", (eid,))
-        candidate_ids.update(r["memory_id"] for r in cursor.fetchall())
+        cur.execute("SELECT memory_id FROM memory_entities WHERE entity_id = ?", (eid,))
+        candidate_ids.update(r["memory_id"] for r in cur.fetchall())
     candidate_ids -= already_seen
 
     results = []
-    for mid in list(candidate_ids)[: top_n * 3]:
-        cursor.execute("""
+    for mid in sorted(candidate_ids)[: top_n * 3]:
+        cur.execute("""
             SELECT id, summary, memory_type
             FROM memories
             WHERE id = ? AND (confidence_score IS NULL OR confidence_score >= 0.4)
               AND status != 'archived'
         """, (mid,))
-        row = cursor.fetchone()
+        row = cur.fetchone()
         if row:
             results.append({
                 "memory_id":   row["id"],
@@ -342,21 +343,17 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False, path: str
             "final_score": round(final_score, 4)
         }
 
+        base_result = {
+            "memory_id":   memory["id"],
+            "summary":     memory["summary"],
+            "raw_text":    memory["raw_text"],
+            "memory_type": memory["memory_type"],
+            "score":       final_score,
+        }
         if debug:
-            results.append({
-                "memory_id": memory["id"],
-                "summary": memory["summary"],
-                "memory_type": memory["memory_type"],
-                "score": final_score,
-                "explanation": explanation
-            })
+            results.append({**base_result, "explanation": explanation})
         else:
-            results.append({
-                "memory_id": memory["id"],
-                "summary": memory["summary"],
-                "memory_type": memory["memory_type"],
-                "score": final_score
-            })
+            results.append(base_result)
 
     # Sort by final score
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -365,44 +362,30 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False, path: str
 
     # ── Deep path: re-rank + multi-hop ───────────────────────────────────────
     if is_deep and top_results:
-        # Fetch raw_text for re-ranker (already in SELECT, but ensure it's there)
-        conn2   = get_connection()
-        c2      = conn2.cursor()
-        enriched = []
-        for r in top_results:
-            c2.execute("SELECT raw_text FROM memories WHERE id = ?", (r["memory_id"],))
-            row = c2.fetchone()
-            enriched.append({**r, "raw_text": row["raw_text"] if row else r.get("summary", "")})
-        conn2.close()
-
-        top_results = rerank_memories(query, enriched)
+        top_results = rerank_memories(query, top_results)
 
         # Multi-hop: memories sharing entities with top results
         seen_ids = {r["memory_id"] for r in top_results}
         multihop = _fetch_multihop_memories(
-            cursor, [r["memory_id"] for r in top_results], seen_ids
+            conn, [r["memory_id"] for r in top_results], seen_ids
         )
         top_results = top_results + multihop
 
     # -----------------------------
     # 🧠 Recall Reinforcement (Top-K Only)
     # -----------------------------
-    conn = get_connection()
-    cursor = conn.cursor()
-
+    rr_cursor = conn.cursor()
     for r in top_results:
-        cursor.execute("""
-            SELECT importance_score FROM memories WHERE id = ?
-        """, (r["memory_id"],))
-        row = cursor.fetchone()
+        rr_cursor.execute(
+            "SELECT importance_score FROM memories WHERE id = ?", (r["memory_id"],)
+        )
+        row = rr_cursor.fetchone()
         if row:
-            current_importance = row["importance_score"]
-            new_importance = min(current_importance + 0.1, 10)
-            cursor.execute("""
-                UPDATE memories SET importance_score = ? WHERE id = ?
-            """, (new_importance, r["memory_id"]))
-
+            new_importance = min(row["importance_score"] + 0.1, 10)
+            rr_cursor.execute(
+                "UPDATE memories SET importance_score = ? WHERE id = ?",
+                (new_importance, r["memory_id"]),
+            )
     conn.commit()
     conn.close()
-
     return top_results
