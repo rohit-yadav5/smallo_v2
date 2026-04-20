@@ -5,6 +5,8 @@ from memory_system.entities.extractor import extract_entities
 from memory_system.embeddings.embedder import generate_embedding_vector
 from memory_system.embeddings.vector_store import search_vector
 from memory_system.core.importance import calculate_effective_importance
+from memory_system.retrieval.query_rewriter import _call_rewriter_llm
+from memory_system.retrieval.reranker import rerank_memories
 from config.llm import DECAY_HALF_LIFE
 from collections import deque
 
@@ -99,9 +101,50 @@ def classify_retrieval_path(query: str) -> str:
     return "fast"
 
 
-def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
+def _fetch_multihop_memories(
+    cursor, top_memory_ids: list[str], already_seen: set, top_n: int = 3
+) -> list[dict]:
+    """Return up to top_n memories sharing entities with top results, not already in results."""
+    entity_ids: set[str] = set()
+    for mid in top_memory_ids:
+        cursor.execute("SELECT entity_id FROM memory_entities WHERE memory_id = ?", (mid,))
+        entity_ids.update(r["entity_id"] for r in cursor.fetchall())
+
+    candidate_ids: set[str] = set()
+    for eid in entity_ids:
+        cursor.execute("SELECT memory_id FROM memory_entities WHERE entity_id = ?", (eid,))
+        candidate_ids.update(r["memory_id"] for r in cursor.fetchall())
+    candidate_ids -= already_seen
+
+    results = []
+    for mid in list(candidate_ids)[: top_n * 3]:
+        cursor.execute("""
+            SELECT id, summary, memory_type
+            FROM memories
+            WHERE id = ? AND (confidence_score IS NULL OR confidence_score >= 0.4)
+              AND status != 'archived'
+        """, (mid,))
+        row = cursor.fetchone()
+        if row:
+            results.append({
+                "memory_id":   row["id"],
+                "summary":     row["summary"],
+                "memory_type": row["memory_type"],
+                "score":       0.3,
+            })
+    return results[:top_n]
+
+
+def retrieve_memories(query: str, top_k: int = 5, debug: bool = False, path: str = None):
     # Resolve current session once per retrieval call (FIX2A — BUG-005).
     current_session_id = _get_current_session_id()
+
+    # ── Two-tier routing ─────────────────────────────────────────────────────
+    effective_path = path or classify_retrieval_path(query)
+    is_deep = (effective_path == "deep")
+    faiss_top_k = top_k * 4 if is_deep else top_k * 2
+    search_query = _call_rewriter_llm(query) if is_deep else query
+    search_query = search_query.strip() if search_query and len(search_query.strip()) > 5 else query
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -185,8 +228,8 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
     # ---------------------------
     # 2️⃣ Semantic Search
     # ---------------------------
-    query_vector = generate_embedding_vector(query)
-    distances, indices = search_vector(query_vector, top_k=top_k * 2)
+    query_vector = generate_embedding_vector(search_query)
+    distances, indices = search_vector(query_vector, top_k=faiss_top_k)
 
     results = []
 
@@ -319,6 +362,27 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
     results.sort(key=lambda x: x["score"], reverse=True)
 
     top_results = results[:top_k]
+
+    # ── Deep path: re-rank + multi-hop ───────────────────────────────────────
+    if is_deep and top_results:
+        # Fetch raw_text for re-ranker (already in SELECT, but ensure it's there)
+        conn2   = get_connection()
+        c2      = conn2.cursor()
+        enriched = []
+        for r in top_results:
+            c2.execute("SELECT raw_text FROM memories WHERE id = ?", (r["memory_id"],))
+            row = c2.fetchone()
+            enriched.append({**r, "raw_text": row["raw_text"] if row else r.get("summary", "")})
+        conn2.close()
+
+        top_results = rerank_memories(query, enriched)
+
+        # Multi-hop: memories sharing entities with top results
+        seen_ids = {r["memory_id"] for r in top_results}
+        multihop = _fetch_multihop_memories(
+            cursor, [r["memory_id"] for r in top_results], seen_ids
+        )
+        top_results = top_results + multihop
 
     # -----------------------------
     # 🧠 Recall Reinforcement (Top-K Only)
