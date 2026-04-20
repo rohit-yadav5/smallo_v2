@@ -91,7 +91,7 @@ _DEEP_PATH_TRIGGERS = {
 def classify_retrieval_path(query: str) -> str:
     """Return 'fast' or 'deep' based on query complexity heuristics."""
     q_lower = query.lower()
-    if len(query.split()) > 8:
+    if len(query.split()) > 10:
         return "deep"
     for trigger in _DEEP_PATH_TRIGGERS:
         if trigger in q_lower:

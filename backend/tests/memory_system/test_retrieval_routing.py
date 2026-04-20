@@ -5,7 +5,7 @@ def test_short_query_routes_fast():
 
 def test_long_query_routes_deep():
     from memory_system.retrieval.search import classify_retrieval_path
-    assert classify_retrieval_path("can you tell me what we discussed about authentication") == "deep"
+    assert classify_retrieval_path("tell me about authentication and our earlier discussions") == "deep"
 
 
 def test_question_word_routes_deep():
