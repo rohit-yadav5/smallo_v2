@@ -167,28 +167,26 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False, path: str
     # ---------------------------
     # Expand entity graph (graph mode)
     # ---------------------------
-    def expand_entity_graph(start_entity_ids):
+    def expand_entity_graph(start_entity_ids, max_depth: int = 2):
         visited = set()
-        queue = deque(start_entity_ids)
+        queue = deque((eid, 0) for eid in start_entity_ids)
 
         while queue:
-            current_id = queue.popleft()
-            if current_id in visited:
+            current_id, depth = queue.popleft()
+            if current_id in visited or depth > max_depth:
                 continue
 
             visited.add(current_id)
 
-            # Find children (is_a, part_of, depends_on, etc.)
-            cursor.execute("""
-                SELECT target_entity_id FROM entity_relations
-                WHERE source_entity_id = ?
-            """, (current_id,))
-            children = cursor.fetchall()
-
-            for child in children:
-                child_id = child["target_entity_id"]
-                if child_id not in visited:
-                    queue.append(child_id)
+            if depth < max_depth:
+                cursor.execute("""
+                    SELECT target_entity_id FROM entity_relations
+                    WHERE source_entity_id = ?
+                """, (current_id,))
+                for child in cursor.fetchall():
+                    child_id = child["target_entity_id"]
+                    if child_id not in visited:
+                        queue.append((child_id, depth + 1))
 
         return visited
 
@@ -258,7 +256,9 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False, path: str
             SELECT id, summary, raw_text, importance_score, confidence_score,
                    created_at, memory_type, session_id, affect
             FROM memories
-            WHERE id = ? AND (confidence_score IS NULL OR confidence_score >= 0.4)
+            WHERE id = ?
+              AND (confidence_score IS NULL OR confidence_score >= 0.4)
+              AND (status IS NULL OR status != 'archived')
         """, (memory_id,))
 
         memory = cursor.fetchone()

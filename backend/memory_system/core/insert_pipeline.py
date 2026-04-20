@@ -116,11 +116,16 @@ def insert_memory(input_data: dict) -> str:
         for existing_id, existing_affect in near_duplicates:
             chain_type = detect_chain_type(affect, existing_affect)
             create_chain(cursor, memory_id, existing_id, chain_type)
-            # Update confidence of older memory if contradicted
             if chain_type == "contradicts":
                 cursor.execute("""
                     UPDATE memories
                     SET confidence_score = MAX(COALESCE(confidence_score, 1.0) - 0.2, 0.0)
+                    WHERE id = ?
+                """, (existing_id,))
+            elif chain_type == "confirms":
+                cursor.execute("""
+                    UPDATE memories
+                    SET confidence_score = MIN(COALESCE(confidence_score, 1.0) + 0.1, 1.0)
                     WHERE id = ?
                 """, (existing_id,))
 
