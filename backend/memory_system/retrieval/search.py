@@ -4,6 +4,8 @@ from memory_system.db.connection import get_connection
 from memory_system.entities.extractor import extract_entities
 from memory_system.embeddings.embedder import generate_embedding_vector
 from memory_system.embeddings.vector_store import search_vector
+from memory_system.core.importance import calculate_effective_importance
+from config.llm import DECAY_HALF_LIFE
 from collections import deque
 
 
@@ -78,6 +80,23 @@ def detect_intent(query: str) -> str:
         return "knowledge_query"
 
     return "general"
+
+
+_DEEP_PATH_TRIGGERS = {
+    "why", "how", "what did", "when did", "remember", "recall",
+    "tell me about", "explain", "what have i", "what was",
+}
+
+
+def classify_retrieval_path(query: str) -> str:
+    """Return 'fast' or 'deep' based on query complexity heuristics."""
+    q_lower = query.lower()
+    if len(query.split()) > 8:
+        return "deep"
+    for trigger in _DEEP_PATH_TRIGGERS:
+        if trigger in q_lower:
+            return "deep"
+    return "fast"
 
 
 def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
@@ -192,9 +211,10 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
             continue
 
         cursor.execute("""
-            SELECT id, summary, importance_score, created_at, memory_type, session_id
+            SELECT id, summary, raw_text, importance_score, confidence_score,
+                   created_at, memory_type, session_id, affect
             FROM memories
-            WHERE id = ?
+            WHERE id = ? AND (confidence_score IS NULL OR confidence_score >= 0.4)
         """, (memory_id,))
 
         memory = cursor.fetchone()
@@ -202,18 +222,39 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
             continue
 
         similarity_score = 1 / (1 + float(distance))
-        importance_score = memory["importance_score"] / 10
+
+        # Use time-decayed effective importance instead of raw stored value
+        eff_importance   = calculate_effective_importance(
+            memory["importance_score"], memory["memory_type"], memory["created_at"]
+        )
+        importance_score = eff_importance / 10
+
         recency_score = calculate_recency_boost(memory["created_at"])
 
         # Strategic boost for consolidated memories
         consolidation_boost = 0.15 if memory["memory_type"] == "ConsolidatedMemory" else 0
 
+        # Affect boost
+        affect       = memory["affect"] if memory["affect"] else "neutral"
+        affect_boost = 0.0
+        if intent == "personal_query" and affect in ("frustrated", "excited"):
+            affect_boost = 0.15
+        if affect in ("frustrated", "negative"):
+            try:
+                age_days  = (datetime.utcnow() - datetime.fromisoformat(memory["created_at"])).days
+                half_life = DECAY_HALF_LIFE.get(memory["memory_type"], 60) or 60
+                if age_days > half_life:
+                    affect_boost -= 0.1
+            except Exception:
+                pass
+
         # Base score
         final_score = (
             similarity_score * 0.55 +
             importance_score * 0.2 +
-            recency_score * 0.1 +
-            consolidation_boost
+            recency_score    * 0.1 +
+            consolidation_boost +
+            affect_boost
         )
 
         # ── Session isolation penalty (FIX2A — BUG-005) ──────────────────────
@@ -254,6 +295,7 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
             "importance_score": round(importance_score, 4),
             "recency_score": round(recency_score, 4),
             "consolidation_boost": consolidation_boost,
+            "affect_boost": affect_boost,
             "final_score": round(final_score, 4)
         }
 
