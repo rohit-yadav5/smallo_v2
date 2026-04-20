@@ -1,4 +1,5 @@
 import uuid
+import numpy as np
 from datetime import datetime
 from collections import defaultdict
 
@@ -60,7 +61,6 @@ KEY THEMES:
 
 def validate_consolidation(summary: str, source_summaries: list[str]) -> bool:
     """Return True if the LLM summary is semantically close to the cluster centroid."""
-    import numpy as np
     summary_vec = generate_embedding_vector(summary)
     source_vecs = np.array([generate_embedding_vector(s) for s in source_summaries])
     centroid    = source_vecs.mean(axis=0)
@@ -170,7 +170,7 @@ def run_weekly_consolidation():
                             print(f"[Consolidation] Skipping cluster in '{project}' — validation failed twice.")
                             continue
 
-                    new_id = f"consolidated-{datetime.utcnow().timestamp()}"
+                    new_id = f"consolidated-{uuid.uuid4()}"
 
                     cursor.execute("""
                         INSERT INTO memories
@@ -241,7 +241,6 @@ def run_weekly_consolidation():
 
 def run_meta_consolidation():
     """Merge pairs of ConsolidatedMemory records that are very similar (depth-2 only)."""
-    import numpy as np
     conn   = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
@@ -271,7 +270,7 @@ def run_meta_consolidation():
             if sim >= META_CONSOLIDATION_SIMILARITY_THRESHOLD:
                 summaries = [mem_a["summary"], mem_b["summary"]]
                 meta_text = generate_llm_consolidation(mem_a["project_reference"] or "global", summaries)
-                new_id = f"meta-{datetime.utcnow().timestamp()}"
+                new_id = f"meta-{uuid.uuid4()}"
                 conn = get_connection()
                 try:
                     c2 = conn.cursor()
@@ -294,12 +293,12 @@ def run_meta_consolidation():
 
 
 def expire_old_consolidated_memories():
-    """Archive old ConsolidatedMemory records below the importance threshold."""
+    """Archive old ConsolidatedMemory and MetaConsolidatedMemory records below the importance threshold."""
     conn   = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT id, importance_score, created_at FROM memories
-        WHERE memory_type = 'ConsolidatedMemory' AND status = 'active'
+        WHERE memory_type IN ('ConsolidatedMemory', 'MetaConsolidatedMemory') AND status = 'active'
     """)
     rows = cursor.fetchall()
     conn.close()
@@ -317,8 +316,10 @@ def expire_old_consolidated_memories():
     if expired_ids:
         conn   = get_connection()
         cursor = conn.cursor()
-        for mid in expired_ids:
-            cursor.execute("UPDATE memories SET status = 'archived' WHERE id = ?", (mid,))
-        conn.commit()
-        conn.close()
-        print(f"[Consolidation] Archived {len(expired_ids)} expired ConsolidatedMemory records.")
+        try:
+            for mid in expired_ids:
+                cursor.execute("UPDATE memories SET status = 'archived' WHERE id = ?", (mid,))
+            conn.commit()
+        finally:
+            conn.close()
+        print(f"[Consolidation] Archived {len(expired_ids)} expired consolidated memory records.")
