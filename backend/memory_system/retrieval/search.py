@@ -4,6 +4,10 @@ from memory_system.db.connection import get_connection
 from memory_system.entities.extractor import extract_entities
 from memory_system.embeddings.embedder import generate_embedding_vector
 from memory_system.embeddings.vector_store import search_vector
+from memory_system.core.importance import calculate_effective_importance
+from memory_system.retrieval.query_rewriter import _call_rewriter_llm
+from memory_system.retrieval.reranker import rerank_memories
+from config.llm import DECAY_HALF_LIFE
 from collections import deque
 
 
@@ -80,9 +84,68 @@ def detect_intent(query: str) -> str:
     return "general"
 
 
-def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
+_DEEP_PATH_TRIGGERS = {
+    "why", "how", "what did", "when did", "remember", "recall",
+    "tell me about", "explain", "what have i", "what was",
+}
+
+
+def classify_retrieval_path(query: str) -> str:
+    """Return 'fast' or 'deep' based on query complexity heuristics."""
+    q_lower = query.lower()
+    if len(query.split()) > 10:
+        return "deep"
+    for trigger in _DEEP_PATH_TRIGGERS:
+        if trigger in q_lower:
+            return "deep"
+    return "fast"
+
+
+def _fetch_multihop_memories(
+    conn, top_memory_ids: list[str], already_seen: set, top_n: int = 3
+) -> list[dict]:
+    """Return up to top_n memories sharing entities with top results, not already in results."""
+    cur = conn.cursor()
+    entity_ids: set[str] = set()
+    for mid in top_memory_ids:
+        cur.execute("SELECT entity_id FROM memory_entities WHERE memory_id = ?", (mid,))
+        entity_ids.update(r["entity_id"] for r in cur.fetchall())
+
+    candidate_ids: set[str] = set()
+    for eid in entity_ids:
+        cur.execute("SELECT memory_id FROM memory_entities WHERE entity_id = ?", (eid,))
+        candidate_ids.update(r["memory_id"] for r in cur.fetchall())
+    candidate_ids -= already_seen
+
+    results = []
+    for mid in sorted(candidate_ids)[: top_n * 3]:
+        cur.execute("""
+            SELECT id, summary, memory_type
+            FROM memories
+            WHERE id = ? AND (confidence_score IS NULL OR confidence_score >= 0.4)
+              AND status != 'archived'
+        """, (mid,))
+        row = cur.fetchone()
+        if row:
+            results.append({
+                "memory_id":   row["id"],
+                "summary":     row["summary"],
+                "memory_type": row["memory_type"],
+                "score":       0.3,
+            })
+    return results[:top_n]
+
+
+def retrieve_memories(query: str, top_k: int = 5, debug: bool = False, path: str = None):
     # Resolve current session once per retrieval call (FIX2A — BUG-005).
     current_session_id = _get_current_session_id()
+
+    # ── Two-tier routing ─────────────────────────────────────────────────────
+    effective_path = path or classify_retrieval_path(query)
+    is_deep = (effective_path == "deep")
+    faiss_top_k = top_k * 4 if is_deep else top_k * 2
+    search_query = _call_rewriter_llm(query) if is_deep else query
+    search_query = search_query.strip() if search_query and len(search_query.strip()) > 5 else query
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -104,28 +167,26 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
     # ---------------------------
     # Expand entity graph (graph mode)
     # ---------------------------
-    def expand_entity_graph(start_entity_ids):
+    def expand_entity_graph(start_entity_ids, max_depth: int = 2):
         visited = set()
-        queue = deque(start_entity_ids)
+        queue = deque((eid, 0) for eid in start_entity_ids)
 
         while queue:
-            current_id = queue.popleft()
-            if current_id in visited:
+            current_id, depth = queue.popleft()
+            if current_id in visited or depth > max_depth:
                 continue
 
             visited.add(current_id)
 
-            # Find children (is_a, part_of, depends_on, etc.)
-            cursor.execute("""
-                SELECT target_entity_id FROM entity_relations
-                WHERE source_entity_id = ?
-            """, (current_id,))
-            children = cursor.fetchall()
-
-            for child in children:
-                child_id = child["target_entity_id"]
-                if child_id not in visited:
-                    queue.append(child_id)
+            if depth < max_depth:
+                cursor.execute("""
+                    SELECT target_entity_id FROM entity_relations
+                    WHERE source_entity_id = ?
+                """, (current_id,))
+                for child in cursor.fetchall():
+                    child_id = child["target_entity_id"]
+                    if child_id not in visited:
+                        queue.append((child_id, depth + 1))
 
         return visited
 
@@ -166,8 +227,8 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
     # ---------------------------
     # 2️⃣ Semantic Search
     # ---------------------------
-    query_vector = generate_embedding_vector(query)
-    distances, indices = search_vector(query_vector, top_k=top_k * 2)
+    query_vector = generate_embedding_vector(search_query)
+    distances, indices = search_vector(query_vector, top_k=faiss_top_k)
 
     results = []
 
@@ -192,9 +253,12 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
             continue
 
         cursor.execute("""
-            SELECT id, summary, importance_score, created_at, memory_type, session_id
+            SELECT id, summary, raw_text, importance_score, confidence_score,
+                   created_at, memory_type, session_id, affect
             FROM memories
             WHERE id = ?
+              AND (confidence_score IS NULL OR confidence_score >= 0.4)
+              AND (status IS NULL OR status != 'archived')
         """, (memory_id,))
 
         memory = cursor.fetchone()
@@ -202,18 +266,39 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
             continue
 
         similarity_score = 1 / (1 + float(distance))
-        importance_score = memory["importance_score"] / 10
+
+        # Use time-decayed effective importance instead of raw stored value
+        eff_importance   = calculate_effective_importance(
+            memory["importance_score"], memory["memory_type"], memory["created_at"]
+        )
+        importance_score = eff_importance / 10
+
         recency_score = calculate_recency_boost(memory["created_at"])
 
         # Strategic boost for consolidated memories
         consolidation_boost = 0.15 if memory["memory_type"] == "ConsolidatedMemory" else 0
 
+        # Affect boost
+        affect       = memory["affect"] if memory["affect"] else "neutral"
+        affect_boost = 0.0
+        if intent == "personal_query" and affect in ("frustrated", "excited"):
+            affect_boost = 0.15
+        if affect in ("frustrated", "negative"):
+            try:
+                age_days  = (datetime.utcnow() - datetime.fromisoformat(memory["created_at"])).days
+                half_life = DECAY_HALF_LIFE.get(memory["memory_type"], 60) or 60
+                if age_days > half_life:
+                    affect_boost -= 0.1
+            except Exception:
+                pass
+
         # Base score
         final_score = (
             similarity_score * 0.55 +
             importance_score * 0.2 +
-            recency_score * 0.1 +
-            consolidation_boost
+            recency_score    * 0.1 +
+            consolidation_boost +
+            affect_boost
         )
 
         # ── Session isolation penalty (FIX2A — BUG-005) ──────────────────────
@@ -254,49 +339,53 @@ def retrieve_memories(query: str, top_k: int = 5, debug: bool = False):
             "importance_score": round(importance_score, 4),
             "recency_score": round(recency_score, 4),
             "consolidation_boost": consolidation_boost,
+            "affect_boost": affect_boost,
             "final_score": round(final_score, 4)
         }
 
+        base_result = {
+            "memory_id":   memory["id"],
+            "summary":     memory["summary"],
+            "raw_text":    memory["raw_text"],
+            "memory_type": memory["memory_type"],
+            "score":       final_score,
+        }
         if debug:
-            results.append({
-                "memory_id": memory["id"],
-                "summary": memory["summary"],
-                "memory_type": memory["memory_type"],
-                "score": final_score,
-                "explanation": explanation
-            })
+            results.append({**base_result, "explanation": explanation})
         else:
-            results.append({
-                "memory_id": memory["id"],
-                "summary": memory["summary"],
-                "memory_type": memory["memory_type"],
-                "score": final_score
-            })
+            results.append(base_result)
 
     # Sort by final score
     results.sort(key=lambda x: x["score"], reverse=True)
 
     top_results = results[:top_k]
 
+    # ── Deep path: re-rank + multi-hop ───────────────────────────────────────
+    if is_deep and top_results:
+        top_results = rerank_memories(query, top_results)
+
+        # Multi-hop: memories sharing entities with top results
+        seen_ids = {r["memory_id"] for r in top_results}
+        multihop = _fetch_multihop_memories(
+            conn, [r["memory_id"] for r in top_results], seen_ids
+        )
+        top_results = top_results + multihop
+
     # -----------------------------
     # 🧠 Recall Reinforcement (Top-K Only)
     # -----------------------------
-    conn = get_connection()
-    cursor = conn.cursor()
-
+    rr_cursor = conn.cursor()
     for r in top_results:
-        cursor.execute("""
-            SELECT importance_score FROM memories WHERE id = ?
-        """, (r["memory_id"],))
-        row = cursor.fetchone()
+        rr_cursor.execute(
+            "SELECT importance_score FROM memories WHERE id = ?", (r["memory_id"],)
+        )
+        row = rr_cursor.fetchone()
         if row:
-            current_importance = row["importance_score"]
-            new_importance = min(current_importance + 0.1, 10)
-            cursor.execute("""
-                UPDATE memories SET importance_score = ? WHERE id = ?
-            """, (new_importance, r["memory_id"]))
-
+            new_importance = min(row["importance_score"] + 0.1, 10)
+            rr_cursor.execute(
+                "UPDATE memories SET importance_score = ? WHERE id = ?",
+                (new_importance, r["memory_id"]),
+            )
     conn.commit()
     conn.close()
-
     return top_results

@@ -152,13 +152,13 @@ async def _deep_research(args: dict) -> str:
 
     await _emit("done", "Research complete. Report saved to DocPanel.", topic=topic)
 
-    # Return an excerpt so the second-pass LLM has real content to summarise.
-    # The full report is always in DocPanel; here we give the first 800 words
-    # so the spoken + text response has actual findings, not just a file pointer.
+    # Pass the full report (up to 2000 words) to the second-pass LLM so it has
+    # enough material to write a comprehensive 2-3 page response. The full
+    # report is also saved to DocPanel for download.
     word_count = len(report.split())
     sources = report.count("http")
     words = report.split()
-    excerpt = " ".join(words[:800]) + ("…" if len(words) > 800 else "")
+    excerpt = " ".join(words[:2000]) + ("…" if len(words) > 2000 else "")
 
     return (
         f"[Research complete — full {word_count}-word report saved to DocPanel ({sources} sources cited)]\n\n"

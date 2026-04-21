@@ -99,6 +99,7 @@ from tts import speak, speak_stream, warmup as tts_warmup, abort_speaking
 from tts.main_tts import register_ws_audio_sender
 from memory_system.retrieval.search import retrieve_memories
 from memory_system.core.insert_pipeline import insert_memory
+from memory_system.db.init_db import migrate_database
 from plugins.router import PluginRouter
 from utils.latency import LatencyTracker
 
@@ -1421,6 +1422,14 @@ async def _main():
 
     # ── Share the event loop with tool dispatch (reminder asyncio tasks) ──────
     backend_loop_ref.loop = _loop
+
+    # ── Database initialization and migrations ────────────────────────────────
+    # Ensure all schema tables and columns exist, including the affect column
+    # added in memory v2. Must run before any memory insert or retrieval.
+    try:
+        migrate_database()
+    except Exception as _init_exc:
+        print(f"  [memory] database migration failed (non-fatal): {_init_exc}", flush=True)
 
     # ── Session-ID memory migration (FIX2A — BUG-005) ────────────────────────
     # Adds session_id column to memories if absent and marks pre-existing rows

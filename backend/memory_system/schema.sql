@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS memories (
     project_reference TEXT,
     status TEXT DEFAULT 'active',
     session_id TEXT DEFAULT 'legacy',
+    affect TEXT DEFAULT 'neutral',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -36,7 +37,8 @@ CREATE TABLE IF NOT EXISTS entity_relations (
     relation_type TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (source_entity_id) REFERENCES entities(id),
-    FOREIGN KEY (target_entity_id) REFERENCES entities(id)
+    FOREIGN KEY (target_entity_id) REFERENCES entities(id),
+    UNIQUE(source_entity_id, target_entity_id, relation_type)
 );
 
 CREATE TABLE IF NOT EXISTS memory_entities (

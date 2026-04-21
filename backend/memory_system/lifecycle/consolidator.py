@@ -1,3 +1,5 @@
+import uuid
+import numpy as np
 from datetime import datetime
 from collections import defaultdict
 
@@ -7,8 +9,14 @@ from memory_system.embeddings.vector_store import search_vector
 
 from llm import ask_llm
 
-
-SIMILARITY_THRESHOLD = 0.75
+from config.llm import (
+    CONSOLIDATION_SIMILARITY_THRESHOLD,
+    META_CONSOLIDATION_SIMILARITY_THRESHOLD,
+    CONSOLIDATION_VALIDATION_THRESHOLD,
+    CONSOLIDATED_MEMORY_EXPIRY_DAYS,
+    CONSOLIDATED_MEMORY_EXPIRY_MIN_IMPORTANCE,
+)
+SIMILARITY_THRESHOLD = CONSOLIDATION_SIMILARITY_THRESHOLD
 MIN_CLUSTER_SIZE = 3
 
 
@@ -49,6 +57,19 @@ KEY THEMES:
 
     response = ask_llm(prompt)
     return response.strip()
+
+
+def validate_consolidation(summary: str, source_summaries: list[str]) -> bool:
+    """Return True if the LLM summary is semantically close to the cluster centroid."""
+    summary_vec = generate_embedding_vector(summary)
+    source_vecs = np.array([generate_embedding_vector(s) for s in source_summaries])
+    centroid    = source_vecs.mean(axis=0)
+    norm_s = np.linalg.norm(summary_vec)
+    norm_c = np.linalg.norm(centroid)
+    if norm_s < 1e-8 or norm_c < 1e-8:
+        return False
+    similarity = float(np.dot(summary_vec, centroid) / (norm_s * norm_c))
+    return similarity >= CONSOLIDATION_VALIDATION_THRESHOLD
 
 
 def run_weekly_consolidation():
@@ -143,8 +164,13 @@ def run_weekly_consolidation():
 
                     # 🔥 LLM consolidation here
                     consolidated_text = generate_llm_consolidation(project, summaries)
+                    if not validate_consolidation(consolidated_text, summaries):
+                        consolidated_text = generate_llm_consolidation(project, summaries)
+                        if not validate_consolidation(consolidated_text, summaries):
+                            print(f"[Consolidation] Skipping cluster in '{project}' — validation failed twice.")
+                            continue
 
-                    new_id = f"consolidated-{datetime.utcnow().timestamp()}"
+                    new_id = f"consolidated-{uuid.uuid4()}"
 
                     cursor.execute("""
                         INSERT INTO memories
@@ -211,3 +237,89 @@ def run_weekly_consolidation():
         conn.close()
 
     print(f"[Consolidation] Created {consolidated_count} intelligent consolidated memories.")
+
+
+def run_meta_consolidation():
+    """Merge pairs of ConsolidatedMemory records that are very similar (depth-2 only)."""
+    conn   = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, summary, project_reference FROM memories
+        WHERE memory_type = 'ConsolidatedMemory' AND status != 'archived'
+        LIMIT 200
+    """)
+    consolidated = cursor.fetchall()
+    conn.close()
+
+    used: set[str] = set()
+    for i, mem_a in enumerate(consolidated):
+        if mem_a["id"] in used:
+            continue
+        vec_a = np.array(generate_embedding_vector(mem_a["summary"]), dtype="float32")
+        for mem_b in consolidated[i + 1:]:
+            if mem_b["id"] in used:
+                continue
+            if (mem_a["project_reference"] or "global") != (mem_b["project_reference"] or "global"):
+                continue
+            vec_b = np.array(generate_embedding_vector(mem_b["summary"]), dtype="float32")
+            norm_a = np.linalg.norm(vec_a)
+            norm_b = np.linalg.norm(vec_b)
+            if norm_a < 1e-8 or norm_b < 1e-8:
+                continue
+            sim = float(np.dot(vec_a, vec_b) / (norm_a * norm_b))
+            if sim >= META_CONSOLIDATION_SIMILARITY_THRESHOLD:
+                summaries = [mem_a["summary"], mem_b["summary"]]
+                meta_text = generate_llm_consolidation(mem_a["project_reference"] or "global", summaries)
+                new_id = f"meta-{uuid.uuid4()}"
+                conn = get_connection()
+                try:
+                    c2 = conn.cursor()
+                    c2.execute("""
+                        INSERT INTO memories (id, memory_type, raw_text, summary, importance_score,
+                                             source, created_at, project_reference)
+                        VALUES (?, 'MetaConsolidatedMemory', ?, ?, 9, 'system', ?, ?)
+                    """, (new_id, meta_text, meta_text, datetime.utcnow().isoformat(), mem_a["project_reference"]))
+                    for src_id in (mem_a["id"], mem_b["id"]):
+                        c2.execute("""
+                            INSERT INTO memory_relations (id, source_memory_id, target_memory_id,
+                                                          relation_type, created_at)
+                            VALUES (?, ?, ?, 'summarized_by', ?)
+                        """, (str(uuid.uuid4()), src_id, new_id, datetime.utcnow().isoformat()))
+                    conn.commit()
+                finally:
+                    conn.close()
+                used.update([mem_a["id"], mem_b["id"]])
+                break
+
+
+def expire_old_consolidated_memories():
+    """Archive old ConsolidatedMemory and MetaConsolidatedMemory records below the importance threshold."""
+    conn   = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, importance_score, created_at FROM memories
+        WHERE memory_type IN ('ConsolidatedMemory', 'MetaConsolidatedMemory') AND status = 'active'
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    expired_ids = []
+    for row in rows:
+        try:
+            age_days = (datetime.utcnow() - datetime.fromisoformat(row["created_at"])).days
+        except Exception:
+            age_days = 0
+        if (age_days > CONSOLIDATED_MEMORY_EXPIRY_DAYS and
+                row["importance_score"] < CONSOLIDATED_MEMORY_EXPIRY_MIN_IMPORTANCE):
+            expired_ids.append(row["id"])
+
+    if expired_ids:
+        conn   = get_connection()
+        cursor = conn.cursor()
+        try:
+            for mid in expired_ids:
+                cursor.execute("UPDATE memories SET status = 'archived' WHERE id = ?", (mid,))
+            conn.commit()
+        finally:
+            conn.close()
+        print(f"[Consolidation] Archived {len(expired_ids)} expired consolidated memory records.")
