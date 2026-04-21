@@ -192,17 +192,23 @@ def _build_messages(
 
 # ── Raw streaming call ────────────────────────────────────────────────────────
 
-def _stream_ollama(messages: list[dict], model: str | None = None) -> Iterator[str]:
+def _stream_ollama(
+    messages: list[dict],
+    model: str | None = None,
+    num_predict: int | None = None,
+) -> Iterator[str]:
     """Yield response tokens one by one from Ollama (blocking generator).
 
     Parameters
     ----------
-    messages: The message list to send to Ollama.
-    model:    Optional model override. Defaults to LLM_CONFIG.model when None.
+    messages:    The message list to send to Ollama.
+    model:       Optional model override. Defaults to LLM_CONFIG.model when None.
+    num_predict: Optional token budget override. Defaults to LLM_CONFIG.num_predict.
     """
     effective_model = model if model is not None else LLM_CONFIG.model
+    effective_predict = num_predict if num_predict is not None else LLM_CONFIG.num_predict
     total_chars = sum(len(m["content"]) for m in messages)
-    print(f"  [llm] ▶ {total_chars:,} char prompt → {effective_model}", flush=True)
+    print(f"  [llm] ▶ {total_chars:,} char prompt → {effective_model} (num_predict={effective_predict})", flush=True)
 
     # Use ACTIVE keep_alive during a conversation so entity extraction and the
     # main LLM call share a warm model; idle turns still evict immediately.
@@ -215,7 +221,7 @@ def _stream_ollama(messages: list[dict], model: str | None = None) -> Iterator[s
             "stream":     True,
             "keep_alive": _keep_alive,
             "options": {
-                "num_predict": LLM_CONFIG.num_predict,
+                "num_predict": effective_predict,
                 "stop":        ["User:", "Human:"],
             },
         },
@@ -594,26 +600,38 @@ def ask_llm_stream(user_text: str, system_suffix: str = "") -> Iterator[str]:
     tool_result = _run_tool_sync(tool_name, tool_args or {})
     print(f"  [llm] 🔧 tool result ({len(tool_result)} chars): {tool_result[:120]}", flush=True)
 
-    # ── Pass 2: stream brief final answer with tool result in history ─────
-    # The user can see the browser / file / terminal output directly, so the
-    # verbal response should be at most one sentence of confirmation.
+    # ── Pass 2: stream final answer with tool result in history ──────────
     history = [
         {"role": "assistant", "content": full_text},
         {"role": "tool",      "content": f"Tool '{tool_name}' result:\n{tool_result}"},
     ]
     messages2 = _build_messages(safe_text, system_suffix=system_suffix, extra_history=history)
-    messages2[-1] = {
-        "role":    "user",
-        "content": (
-            "The tool just executed and the user can see the result directly "
-            "(browser is visible, file was written, etc.). "
-            "Respond in ONE sentence only — briefly confirm what happened or "
-            "add one useful observation.  Do NOT repeat the user's request.  "
-            "Do NOT describe what you did step by step."
-        ),
-    }
+    if tool_name == "deep_research":
+        messages2[-1] = {
+            "role":    "user",
+            "content": (
+                "The deep research is complete. Present the findings as a comprehensive "
+                "written report using markdown: include a title, section headers, key "
+                "findings, details, and a conclusion. Write at least 500 words. "
+                "Do NOT summarize into one sentence — the user asked for deep research "
+                "and expects a full detailed response."
+            ),
+        }
+        pass2_predict = 3000
+    else:
+        messages2[-1] = {
+            "role":    "user",
+            "content": (
+                "The tool just executed and the user can see the result directly "
+                "(browser is visible, file was written, etc.). "
+                "Respond in ONE sentence only — briefly confirm what happened or "
+                "add one useful observation.  Do NOT repeat the user's request.  "
+                "Do NOT describe what you did step by step."
+            ),
+        }
+        pass2_predict = None
     print(f"  [llm] ▶ pass-2 stream after tool '{tool_name}'", flush=True)
-    yield from _stream_ollama(messages2)
+    yield from _stream_ollama(messages2, num_predict=pass2_predict)
 
 
 # ── Internal helper: tool or plain token stream ───────────────────────────────
@@ -666,18 +684,35 @@ def _handle_tool_or_plain(
         {"role": "tool",      "content": f"Tool '{tool_name}' result:\n{tool_result}"},
     ]
     messages2 = _build_messages(safe_text, system_suffix=system_suffix, extra_history=history)
-    messages2[-1] = {
-        "role":    "user",
-        "content": (
-            "The tool just executed and the user can see the result directly "
-            "(browser is visible, file was written, etc.). "
-            "Respond in ONE sentence only — briefly confirm what happened or "
-            "add one useful observation.  Do NOT repeat the user's request.  "
-            "Do NOT describe what you did step by step."
-        ),
-    }
+
+    is_research = (tool_name == "deep_research")
+    if is_research:
+        messages2[-1] = {
+            "role":    "user",
+            "content": (
+                "The deep research is complete. Present the findings as a comprehensive "
+                "written report using markdown: include a title, section headers, key "
+                "findings, details, and a conclusion. Write at least 500 words. "
+                "Do NOT summarize into one sentence — the user asked for deep research "
+                "and expects a full detailed response."
+            ),
+        }
+        pass2_predict = 3000
+    else:
+        messages2[-1] = {
+            "role":    "user",
+            "content": (
+                "The tool just executed and the user can see the result directly "
+                "(browser is visible, file was written, etc.). "
+                "Respond in ONE sentence only — briefly confirm what happened or "
+                "add one useful observation.  Do NOT repeat the user's request.  "
+                "Do NOT describe what you did step by step."
+            ),
+        }
+        pass2_predict = None  # use default
+
     print(f"  [llm] ▶ pass-2 stream after tool '{tool_name}'", flush=True)
-    yield from _stream_ollama(messages2)
+    yield from _stream_ollama(messages2, num_predict=pass2_predict)
 
 
 def ask_llm_turn(
