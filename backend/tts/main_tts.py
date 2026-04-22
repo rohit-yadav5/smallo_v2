@@ -12,6 +12,7 @@ from tts.audio_utils import encode_pcm16, encode_opus, chunk_audio, resample_aud
 # ── Kokoro singleton ──────────────────────────────────────────────────────────
 # None until warmup() is called.
 _kokoro = None   # kokoro_onnx.Kokoro instance
+_kokoro_ready: bool = False
 
 _SENTENCE_SPLIT = re.compile(TTS_CONFIG.sentence_split_pattern)
 
@@ -160,6 +161,8 @@ def warmup() -> None:
     voices_path = os.path.normpath(TTS_CONFIG.kokoro_voices_path)
     _kokoro = Kokoro(model_path, voices_path)
     _synthesize_to_buffer("Hi.")
+    global _kokoro_ready
+    _kokoro_ready = True
     print(
         f"  [tts] Kokoro ready  voice={TTS_CONFIG.kokoro_voice}  "
         f"speed={TTS_CONFIG.kokoro_speed}  sr={TTS_CONFIG.sample_rate}",
@@ -182,6 +185,8 @@ def warmup() -> None:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def speak(text: str, interrupt_event=None):
+    if not _kokoro_ready:
+        raise RuntimeError("TTS not ready — call warmup() first")
     # speak() is used only by warmup() — production uses speak_stream()
     if not text.strip():
         return
@@ -237,6 +242,8 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
     text_spoken     — full response text up to the interrupt (may be "")
     timing_dict     — first_word_secs, total_secs, token_count, sentence_count
     """
+    if not _kokoro_ready:
+        raise RuntimeError("TTS not ready — call warmup() first")
     _abort_flag.clear()
 
     _start        = time.perf_counter()

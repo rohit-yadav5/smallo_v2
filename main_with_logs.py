@@ -32,23 +32,9 @@ FRONTEND = ROOT / "frontend"
 VENV_PY  = ROOT / ".venv" / "bin" / "python3"
 PYTHON   = str(VENV_PY) if VENV_PY.exists() else sys.executable
 
-def _find_npm() -> str:
-    import shutil
-    npm = shutil.which("npm")
-    if npm:
-        return npm
-    for c in ["/opt/homebrew/bin/npm", "/usr/local/bin/npm", "/usr/bin/npm"]:
-        if Path(c).is_file():
-            return c
-    nvm_dir = Path.home() / ".nvm" / "versions" / "node"
-    if nvm_dir.is_dir():
-        for v in sorted(nvm_dir.iterdir(), reverse=True):
-            npm_bin = v / "bin" / "npm"
-            if npm_bin.is_file():
-                return str(npm_bin)
-    return "npm"
+from launcher_utils import find_npm as _find_npm_fn, kill_tree as _kill_tree_fn, kill_port, check_port_free
 
-NPM = _find_npm()
+NPM = _find_npm_fn()
 
 # ── ANSI codes ────────────────────────────────────────────────────────
 R    = "\033[0m"
@@ -526,12 +512,6 @@ def _stream_reader(pipe, label: str, col: str, stop_event: threading.Event,
 
 
 # ── Health checks ──────────────────────────────────────────────────────
-def _check_port_free(port: int) -> bool:
-    import socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(("localhost", port)) != 0
-
-
 def _preflight():
     ok = True
     print(f"  {B}Pre-flight checks{R}")
@@ -582,41 +562,17 @@ def _preflight():
 
     # Ports free
     for port, name in [(8765, "WebSocket :8765"), (5173, "Vite      :5173")]:
-        free = _check_port_free(port)
-        sym  = f"{GRN}✓{R}" if free else f"{YLW}!{R}"
-        note = "" if free else f"  {YLW}← busy, may conflict{R}"
-        print(f"    {sym}  {name}{note}")
+        free = check_port_free(port)
+        if free:
+            print(f"    {GRN}✓{R}  {name}")
+        else:
+            print(f"    {YLW}!{R}  {name}  {YLW}← busy — killing stale process...{R}")
+            kill_port(port)
+            import time as _t; _t.sleep(0.5)
+            print(f"    {GRN}✓{R}  {name}  {DIM}(cleared){R}")
 
     print()
     return ok
-
-
-# ── Kill helpers ────────────────────────────────────────────────────────
-def _kill_tree(proc: subprocess.Popen, label: str) -> None:
-    try:
-        import psutil
-        parent   = psutil.Process(proc.pid)
-        children = parent.children(recursive=True)
-        for child in children:
-            try:   child.terminate()
-            except psutil.NoSuchProcess: pass
-        try:   parent.terminate()
-        except psutil.NoSuchProcess: pass
-        _, alive = psutil.wait_procs([parent] + children, timeout=3)
-        for p in alive:
-            try:   p.kill()
-            except psutil.NoSuchProcess: pass
-        print(f"  {GRN}✓{R}  {label} stopped")
-    except Exception:
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-            print(f"  {GRN}✓{R}  {label} stopped")
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            print(f"  {YLW}!{R}  {label} killed (didn't stop in time)")
-        except Exception:
-            pass
 
 
 # ── Main ────────────────────────────────────────────────────────────────
@@ -713,7 +669,7 @@ def main():
         _section("SHUTDOWN", YLW)
         for p in procs:
             label = "BACKEND" if p is backend_proc else "FRONTEND"
-            _kill_tree(p, label)
+            _kill_tree_fn(p, label)
         elapsed = time.perf_counter() - _SESSION_START
         m, s = divmod(int(elapsed), 60)
         print(f"\n  {DIM}Session duration: {m:02d}:{s:02d}{R}")

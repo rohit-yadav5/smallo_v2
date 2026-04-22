@@ -118,18 +118,31 @@ class _ToolRegistry:
     async def dispatch(self, name: str, args: dict) -> str:
         """Call a registered tool by name.
 
-        Never raises — all errors are returned as a string so the LLM can
-        incorporate them into its next response naturally.
+        Never raises — all errors are returned as a JSON string so the LLM can
+        distinguish tool_not_found from execution_error in its next response.
         """
         tool = self._tools.get(name)
         if tool is None:
             known = ", ".join(self._tools.keys()) or "none"
-            return f"Error: unknown tool '{name}'. Known tools: {known}"
+            return json.dumps({
+                "status":  "error",
+                "code":    "tool_not_found",
+                "message": f"Unknown tool '{name}'. Known tools: {known}",
+            })
         try:
             result = await tool.handler(args)
             return str(result)
         except Exception as exc:
-            return f"Error running tool '{name}': {exc}"
+            import traceback as _tb
+            print(
+                f"  [tools] tool '{name}' raised exception:\n{_tb.format_exc()}",
+                flush=True,
+            )
+            return json.dumps({
+                "status":  "error",
+                "code":    "execution_error",
+                "message": f"Tool '{name}' raised: {exc}",
+            })
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<ToolRegistry tools={list(self._tools.keys())}>"

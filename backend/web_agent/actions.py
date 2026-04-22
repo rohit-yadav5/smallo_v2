@@ -22,6 +22,7 @@ search_google() adds a third phase:
 import asyncio
 
 from playwright.async_api import Page
+from config.limits import TOOL_OUTPUT_BROWSER
 
 
 async def navigate(page: Page, url: str) -> str:
@@ -71,7 +72,7 @@ async def type_text(page: Page, selector: str, text: str) -> str:
         return f"Type failed for {selector!r}: {exc}"
 
 
-async def get_page_text(page: Page, max_chars: int = 8_000) -> str:
+async def get_page_text(page: Page, max_chars: int = TOOL_OUTPUT_BROWSER) -> str:
     """
     Extract visible text with noise reduction and lazy-load triggering.
 

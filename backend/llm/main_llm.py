@@ -21,7 +21,7 @@ emission noise.
 
 Phase 2 note: the ``messages`` list is the natural handoff point for a future
 task-planner.  It can pre-populate the history with sub-agent results before
-calling ask_llm_stream(), making multi-agent orchestration a simple extension.
+calling ask_llm_plugin_summary(), making multi-agent orchestration a simple extension.
 """
 
 import asyncio
@@ -276,22 +276,16 @@ _TOOL_NARRATION_RE = re.compile(
 )
 
 
-def _has_tool_leak(text: str) -> bool:
-    """Return True if text contains leaked tool-call syntax that should be stripped."""
-    return any(p.search(text) for p in _TOOL_LEAK_RES) or bool(
-        _TOOL_NARRATION_RE.search(text)
-    )
-
-
 def _strip_tool_leaks(text: str) -> str:
     """
-    Strip leaked tool-call syntax from plain text before it reaches TTS.
+    Strip leaked tool-call syntax and narration phrases from plain text.
 
     Only removes syntax artifacts — never strips valid user-facing content.
     Returns the cleaned string; caller logs if anything changed.
     """
     for p in _TOOL_LEAK_RES:
         text = p.sub("", text)
+    text = _TOOL_NARRATION_RE.sub("", text)
     return text.strip()
 
 _PLAN_TRIGGER_RE = re.compile(
@@ -431,15 +425,16 @@ def _run_tool_sync(name: str, args: dict) -> str:
     except (ImportError, AttributeError):
         main_loop = None
 
-    if main_loop is not None and main_loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(reg.dispatch(name, args), main_loop)
-        try:
-            return future.result(timeout=60)
-        except Exception as exc:
-            return f"Error running tool '{name}': {exc}"
-    else:
-        # Fallback: own event loop (works for all tools except reminder asyncio tasks)
-        return asyncio.run(reg.dispatch(name, args))
+    import traceback as _tb
+    if main_loop is None or not main_loop.is_running():
+        return f"Error running tool '{name}': main event loop not available (backend not fully started)"
+
+    future = asyncio.run_coroutine_threadsafe(reg.dispatch(name, args), main_loop)
+    try:
+        return future.result(timeout=60)
+    except Exception as exc:
+        print(f"  [llm] tool '{name}' raised exception:\n{_tb.format_exc()}", flush=True)
+        return f"Error running tool '{name}': {exc}"
 
 
 # ── Forced tool-call fallback ─────────────────────────────────────────────────
@@ -563,9 +558,9 @@ def ask_llm(user_text: str, system_suffix: str = "", model: str | None = None) -
     return full.strip()
 
 
-def ask_llm_stream(user_text: str, system_suffix: str = "") -> Iterator[str]:
+def ask_llm_plugin_summary(user_text: str, system_suffix: str = "") -> Iterator[str]:
     """
-    Streaming LLM call with transparent tool-call detection.
+    Streaming LLM call used exclusively for plugin summarization.
 
     Yields response tokens for TTS/frontend consumption.  Internally:
       Pass 1 — collect full response, scan for <tool_call>.
@@ -727,7 +722,7 @@ def ask_llm_turn(
       • Iterator[str] of tokens                 — normal response (with tool
                                                   handling transparent)
 
-    Unlike ask_llm_stream (which is for backward compat / plugin summariser),
+    Unlike ask_llm_plugin_summary (which is for plugin summarisation only),
     this function additionally detects the <start_plan> planner trigger and
     returns a sentinel dict so _run_turn can start the autonomous planner
     without modifying the token stream.

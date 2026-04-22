@@ -1,11 +1,12 @@
 # ── Audio & Speech ───────────────────────────────────────────────────────────
 faster-whisper==1.2.1
 kokoro-onnx==0.5.0
-misaki[en]==0.9.4
-huggingface-hub>=0.23.0
+misaki[en]==0.9.4          # kokoro-onnx text normaliser (English)
+huggingface-hub>=0.23.0    # model downloads for faster-whisper + sentence-transformers
 sounddevice==0.5.5
 soundfile==0.13.1
 silero-vad==6.2.1
+scipy==1.15.3              # audio resampling (tts/audio_utils.py)
 
 # ── LLM & Transformers ───────────────────────────────────────────────────────
 torch==2.10.0
@@ -21,25 +22,21 @@ spacy>=3.8.0
 # ── System & Automation ──────────────────────────────────────────────────────
 psutil==7.2.2
 PyAutoGUI==0.9.54
-pyperclip==1.11.0
 
 # ── macOS / ObjC Bindings ────────────────────────────────────────────────────
+# Required by PyAutoGUI on macOS for screenshot + screen-size detection
 pyobjc-framework-Quartz==12.1
-rubicon-objc==0.5.3
 
-# ── Web & Networking ─────────────────────────────────────────────────────────
+# ── Web & Browser ────────────────────────────────────────────────────────────
 websockets==14.2
 requests==2.32.5
 httpx==0.28.1
 beautifulsoup4==4.14.3
+playwright>=1.40.0         # web_agent/browser.py — persistent Chromium singleton
+
+# ── Deep-research & Browser-use Adapters ─────────────────────────────────────
+# These two pull in the bulk of the dependency tree (LangChain, OpenAI SDK,
+# litellm, etc.).  Remove both lines if you drop the deep_research /
+# web_task tools and delete backend/adapters/.
 gpt-researcher>=0.9.0
 browser-use>=0.1.0
-langchain-openai>=0.1.0
-ddgs>=9.0.0
-
-# ── Utilities ────────────────────────────────────────────────────────────────
-click==8.3.1
-coloredlogs==15.0.1
-PyYAML==6.0.3
-typer-slim==0.21.1
-cffi==2.0.0

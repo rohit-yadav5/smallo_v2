@@ -42,7 +42,7 @@ class LLMConfig:
 
 LLM_CONFIG = LLMConfig(
     ollama_url               = os.getenv("OLLAMA_URL",          "http://localhost:11434/api/chat"),
-    model                    = os.getenv("LLM_MODEL",           "qwen2.5:7b"),
+    model                    = os.getenv("LLM_MODEL",           "qwen2.5:3b"),
     planner_model            = os.getenv("PLANNER_MODEL",       "qwen2.5:7b"),
     num_predict              = int(os.getenv("LLM_NUM_PREDICT",         "512")),
     planner_num_predict      = int(os.getenv("PLANNER_NUM_PREDICT",    "1024")),

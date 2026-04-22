@@ -119,17 +119,28 @@ async def _store_plan_memory(
 # When True, Ollama calls use keep_alive="300s" to keep the model warm
 # across all steps of the plan.  Resets to False when the plan finishes or
 # is cancelled.  This avoids a 2-3s cold-load stall between every plan step.
-_plan_active: bool = False
+_planner_active: bool = False
+
+# Cancel signal: set by request_cancel() when user says "stop"/"cancel".
+# Checked at every step iteration so a mid-step sync call can be interrupted.
+_cancel_requested: threading.Event = threading.Event()
+
+
+def request_cancel() -> None:
+    """Signal the running plan to stop after the current step completes."""
+    _cancel_requested.set()
+
 
 # ── Active plan model (set at run_plan() start based on RAM) ─────────────────
 # LLM_CONFIG.planner_model (7b) for all cases; LLM_CONFIG.model is also 7b.
 # All per-plan LLM helpers read this variable.
-_active_plan_model: str = ""
+_planner_model: str = ""
 
 # ── Last plan result (B1 — injected into next conversational turn) ─────────
 # Holds the outcome of the most recently completed plan so _run_turn() can
 # inject it as context before calling the LLM.  Cleared after one injection.
-_last_plan_result: Optional[dict] = None
+_planner_last_result: Optional[dict] = None
+_planner_last_result_lock: threading.Lock = threading.Lock()
 
 # Accumulates tool calls made during the current plan execution.
 # Reset at plan start; appended to inside _execute_step_planner().
@@ -138,13 +149,15 @@ _current_plan_tool_calls: list[dict] = []
 
 def get_last_plan_result() -> Optional[dict]:
     """Return the last completed plan result dict, or None if none/already consumed."""
-    return _last_plan_result
+    with _planner_last_result_lock:
+        return _planner_last_result
 
 
 def clear_last_plan_result() -> None:
     """Clear the last plan result after it has been injected into one LLM turn."""
-    global _last_plan_result
-    _last_plan_result = None
+    global _planner_last_result
+    with _planner_last_result_lock:
+        _planner_last_result = None
 
 
 # ── Regex helpers ─────────────────────────────────────────────────────────────
@@ -242,17 +255,17 @@ def _call_planner_llm_sync(
     caller-supplied max_tokens for short yes/no checks (e.g. 5 tokens).
 
     keep_alive strategy:
-      KEEP_ALIVE_PLAN while _plan_active=True  → model stays warm across all plan steps
+      KEEP_ALIVE_PLAN while _planner_active=True  → model stays warm across all plan steps
       KEEP_ALIVE_IDLE when plan is done/cancelled → RAM freed within seconds
     """
     num_predict = max_tokens if max_tokens is not None else LLM_CONFIG.planner_num_predict
-    keep_alive  = KEEP_ALIVE_PLAN if _plan_active else KEEP_ALIVE_IDLE
+    keep_alive  = KEEP_ALIVE_PLAN if _planner_active else KEEP_ALIVE_IDLE
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user})
 
-    model = _active_plan_model or LLM_CONFIG.planner_model
+    model = _planner_model or LLM_CONFIG.planner_model
     resp = requests.post(
         LLM_CONFIG.ollama_url,
         json={
@@ -277,8 +290,8 @@ async def _planner_llm(system: str, user: str, max_tokens: int | None = None) ->
 
 def _stream_planner_ollama(messages: list[dict]):
     """Streaming Ollama call using the active plan model — yields token strings."""
-    keep_alive = KEEP_ALIVE_PLAN if _plan_active else KEEP_ALIVE_IDLE
-    model = _active_plan_model or LLM_CONFIG.planner_model
+    keep_alive = KEEP_ALIVE_PLAN if _planner_active else KEEP_ALIVE_IDLE
+    model = _planner_model or LLM_CONFIG.planner_model
     resp = requests.post(
         LLM_CONFIG.ollama_url,
         json={
@@ -484,7 +497,9 @@ async def _execute_step_planner(
         full = "".join(tokens)
         return full, tokens
 
-    full_text, _tokens = await asyncio.to_thread(_pass1)
+    full_text, _tokens = await asyncio.wait_for(
+        asyncio.to_thread(_pass1), timeout=45
+    )
     print(
         f"  [executor/7b] response ({len(full_text)} chars): {full_text[:100]!r}",
         flush=True,
@@ -549,7 +564,9 @@ async def _execute_step_planner(
             tokens2.append(tok)
         return "".join(tokens2).strip()
 
-    return await asyncio.to_thread(_pass2)
+    return await asyncio.wait_for(
+        asyncio.to_thread(_pass2), timeout=45
+    )
 
 
 # ── Main planner coroutine ────────────────────────────────────────────────────
@@ -575,25 +592,26 @@ async def run_plan(
     action_callback: Callable for add_recent_action — same reason as result_queue.
     max_steps:       Hard cap on execution steps to prevent infinite loops.
     """
-    global _plan_active, _active_plan_model, _last_plan_result, _current_plan_tool_calls
+    global _planner_active, _planner_model, _planner_last_result, _current_plan_tool_calls
 
     # Reset tool-call log for this plan
     _current_plan_tool_calls = []
+    _cancel_requested.clear()
 
     # ── RAM-aware model selection ─────────────────────────────────────────────
     available_gb = get_available_ram_gb()
     if can_load_7b():
-        _active_plan_model = LLM_CONFIG.planner_model
+        _planner_model = LLM_CONFIG.planner_model
         print(
-            f"\n  [planner] 🗺 starting plan  model={_active_plan_model}"
+            f"\n  [planner] 🗺 starting plan  model={_planner_model}"
             f"  RAM={available_gb:.1f}GB free: '{goal}'",
             flush=True,
         )
     else:
-        _active_plan_model = LLM_CONFIG.model   # fall back to 3b
+        _planner_model = LLM_CONFIG.model   # fall back to 3b
         print(
             f"\n  [planner] ⚠ low RAM ({available_gb:.1f}GB) — falling back to "
-            f"{_active_plan_model}: '{goal}'",
+            f"{_planner_model}: '{goal}'",
             flush=True,
         )
         broadcast("SYSTEM_EVENT", {
@@ -602,7 +620,7 @@ async def run_plan(
             "available_gb": round(available_gb, 2),
         })
 
-    _plan_active = True   # keep model warm across all plan steps (keep_alive=300s)
+    _planner_active = True   # keep model warm across all plan steps (keep_alive=300s)
 
     # Initialize results before the try block so CancelledError handler can
     # reference it even if cancellation fires during the pre-plan check phase.
@@ -685,6 +703,9 @@ async def run_plan(
         consecutive_drifts = 0           # track back-to-back drift signals
 
         for i, step in enumerate(steps):
+            if _cancel_requested.is_set():
+                print("  [planner] cancel requested — stopping at step boundary", flush=True)
+                break
             print(f"  [planner] step {i+1}/{len(steps)}: {step[:80]}", flush=True)
             broadcast("PLAN_EVENT", {
                 "phase":      "step_start",
@@ -772,14 +793,15 @@ async def run_plan(
         print(f"  [planner] ✅ complete. Summary: {summary[:100]}", flush=True)
 
         # ── Persist plan result for next conversational turn (B1) ─────────
-        global _last_plan_result
-        _last_plan_result = {
-            "goal": goal,
-            "steps_taken": len(results),
-            "summary": summary,
-            "tool_calls": list(_current_plan_tool_calls),
-            "completed_at": time.time(),
-        }
+        global _planner_last_result
+        with _planner_last_result_lock:
+            _planner_last_result = {
+                "goal": goal,
+                "steps_taken": len(results),
+                "summary": summary,
+                "tool_calls": list(_current_plan_tool_calls),
+                "completed_at": time.time(),
+            }
 
         broadcast("PLAN_EVENT", {
             "phase":   "complete",
@@ -821,7 +843,7 @@ async def run_plan(
         broadcast("VOICE_STATE", {"state": "idle"})
 
     except asyncio.CancelledError:
-        _plan_active = False   # evict 7b model immediately
+        _planner_active = False   # evict 7b model immediately
         print("  [planner] ⛔ cancelled", flush=True)
         broadcast("PLAN_EVENT", {"phase": "cancelled", "goal": goal})
         broadcast("VOICE_STATE", {"state": "idle"})
@@ -839,7 +861,7 @@ async def run_plan(
         raise
 
     except Exception as exc:
-        _plan_active = False   # evict 7b model immediately
+        _planner_active = False   # evict 7b model immediately
         import traceback
         reason = str(exc)
         print(f"  [planner] ✗ failed: {reason}", flush=True)
@@ -856,4 +878,4 @@ async def run_plan(
         broadcast("VOICE_STATE", {"state": "idle"})
 
     finally:
-        _plan_active = False   # always reset — even if plan completes normally
+        _planner_active = False   # always reset — even if plan completes normally

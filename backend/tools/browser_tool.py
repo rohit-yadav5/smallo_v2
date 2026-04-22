@@ -31,7 +31,7 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
-_MAX_CHARS = 8_000
+from config.limits import TOOL_OUTPUT_BROWSER as _MAX_CHARS
 
 
 async def _fetch_url(args: dict) -> str:

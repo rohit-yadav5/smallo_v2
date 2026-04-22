@@ -29,6 +29,7 @@ outstanding work.
 """
 
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,13 +93,16 @@ def save_user_context(ctx: dict) -> None:
     ctx["last_updated"] = datetime.now(timezone.utc).isoformat()
     with _lock:
         _cache.update(ctx)
+    _tmp = _CTX_FILE.with_suffix(".json.tmp")
     try:
-        _CTX_FILE.write_text(
+        _tmp.write_text(
             json.dumps(ctx, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        os.replace(_tmp, _CTX_FILE)
     except Exception as exc:
         print(f"  [user_ctx] ⚠ failed to save: {exc}", flush=True)
+        _tmp.unlink(missing_ok=True)
 
 
 def update_user_context(key: str, value) -> None:

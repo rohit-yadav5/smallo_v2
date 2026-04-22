@@ -22,6 +22,8 @@ frontend.  Before that call screenshots are silently skipped (no crash).
 import time
 from typing import Callable, Optional
 
+from config.limits import TOOL_OUTPUT_BROWSER
+
 from web_agent.browser import BrowserManager
 from web_agent.actions import (
     navigate, click, type_text, get_page_text,
@@ -92,7 +94,7 @@ async def _web_type(args: dict) -> str:
 
 
 async def _web_read(args: dict) -> str:
-    max_chars = int(args.get("max_chars", 8_000))
+    max_chars = int(args.get("max_chars", TOOL_OUTPUT_BROWSER))
     manager   = await BrowserManager.get()
     page      = await manager.page()
     return await get_page_text(page, max_chars)  # no screenshot — read-only

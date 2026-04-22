@@ -93,7 +93,7 @@ if str(BACKEND_DIR) not in sys.path:
 from audio import RollingAudioBuffer
 from stt import transcribe, transcribe_partial, warmup as stt_warmup, StreamingTranscriber
 from vad import VADOracle
-from llm import ask_llm_stream, warmup as llm_warmup
+from llm import ask_llm_plugin_summary, warmup as llm_warmup
 from llm.main_llm import ask_llm_turn
 from tts import speak, speak_stream, warmup as tts_warmup, abort_speaking
 from tts.main_tts import register_ws_audio_sender
@@ -116,6 +116,7 @@ from stt.text_input import watch_text_input
 from planner.planner import run_plan
 from utils.ram_monitor import get_available_ram_gb, get_memory_pressure, can_load_7b
 from config.llm import LLM_CONFIG
+from config.limits import PARTIAL_RESPONSE_CHARS
 from llm.main_llm import set_conversation_active
 
 # ── Phase 3: web agent + deep research ───────────────────────────────────────
@@ -131,14 +132,14 @@ import tools.close_heavy_tabs                            # registers close_heavy
 import tools.memory_tool                                 # registers clear_memory tool     # noqa: F401
 
 import httpx as _httpx
-import uuid as _uuid
+from uuid import uuid4 as _uuid4
 
 
 # ──────────────────────────────────────────────────
 # Session ID — unique per server startup
 # ──────────────────────────────────────────────────
 
-SESSION_ID: str = _uuid.uuid4().hex[:12]
+SESSION_ID: str = _uuid4().hex[:12]
 
 
 # ──────────────────────────────────────────────────
@@ -725,7 +726,7 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
                 if _tts_enabled:
                     ai_text, tts_timing = speak_stream(
                         _token_broadcaster(
-                            ask_llm_stream(summary_prompt, system_suffix=_PLUGIN_SUMMARIZE_SUFFIX),
+                            ask_llm_plugin_summary(summary_prompt, system_suffix=_PLUGIN_SUMMARIZE_SUFFIX),
                             _interrupt_event,
                         ),
                         _interrupt_event,
@@ -733,7 +734,7 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
                 else:
                     print("  [tts] disabled by user — skipping synthesis", flush=True)
                     ai_text = "".join(_token_broadcaster(
-                        ask_llm_stream(summary_prompt, system_suffix=_PLUGIN_SUMMARIZE_SUFFIX),
+                        ask_llm_plugin_summary(summary_prompt, system_suffix=_PLUGIN_SUMMARIZE_SUFFIX),
                         _interrupt_event,
                     ))
                     tts_timing = {"first_word_secs": 0.0, "total_secs": 0.0}
@@ -1109,15 +1110,18 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     # If the bot was cut off mid-response, prepend what it had already said
     # so it can acknowledge the interruption and seamlessly respond to the
     # new query (or pick up where it left off if the user asks it to).
-    if _interrupted_partial:
-        snip = _interrupted_partial[:400] + ("…" if len(_interrupted_partial) > 400 else "")
+    with _barge_in_lock:
+        _partial_snapshot = _interrupted_partial
+        _interrupted_partial = ""
+
+    if _partial_snapshot:
+        snip = _partial_snapshot[:PARTIAL_RESPONSE_CHARS] + ("…" if len(_partial_snapshot) > PARTIAL_RESPONSE_CHARS else "")
         prompt = (
             f"[Context: you were mid-response saying \"{snip}\" when the user interrupted you. "
             f"You don't need to repeat it; just respond naturally to what they said next.]\n\n"
             f"{prompt}"
         )
-        print(f"  [pipeline] injecting interrupted context ({len(_interrupted_partial)} chars)")
-        _interrupted_partial = ""
+        print(f"  [pipeline] injecting interrupted context ({len(_partial_snapshot)} chars)")
 
     # ── LLM (with plan-trigger and tool detection) ───────────────────────
     # Inject user context + recent planner actions into every LLM call.
@@ -1132,9 +1136,8 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     # you save that?" without needing a memory retrieval round-trip.
     try:
         import planner.planner as _planner_mod
-        import time as _time
         plan_result = _planner_mod.get_last_plan_result()
-        if plan_result and (_time.time() - plan_result["completed_at"]) < 300:
+        if plan_result and (time.time() - plan_result["completed_at"]) < 300:
             tool_names = ", ".join(t["tool"] for t in plan_result["tool_calls"])
             snippets = "; ".join(
                 t["result_snippet"] for t in plan_result["tool_calls"][:3] if t["result_snippet"]
@@ -1213,7 +1216,7 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
                     )
                 else:
                     print("  [tts] disabled — skipping synthesis", flush=True)
-                    "".join(_token_broadcaster(llm_resp, _interrupt_event))
+                    ai_text = "".join(_token_broadcaster(llm_resp, _interrupt_event))
             except Exception as _resp_err:
                 print(f"  [pipeline] LLM response for tool result failed: {_resp_err} — speaking raw", flush=True)
                 try:
@@ -1267,7 +1270,7 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         print(f"  [llm/tts] error: {e}")
         _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
-        return
+        return False
 
     # ── Barge-in: save partial response, decide next state ───────────────
     if _interrupt_event.is_set():
@@ -1369,7 +1372,7 @@ async def _ws_handler(ws):
 
                     elif ev == "SET_TTS_ENABLED":
                         global _tts_enabled
-                        _tts_enabled = bool(ctrl.get("enabled", True))
+                        _tts_enabled = bool(ctrl.get("data", {}).get("enabled", True))
                         print(f"  [ws] SET_TTS_ENABLED → {_tts_enabled}", flush=True)
 
                     elif ev == "TEXT_INPUT":
@@ -1587,7 +1590,7 @@ async def _main():
     threading.Thread(target=_audio_ingestion_loop, daemon=True).start()
     threading.Thread(target=_pipeline_loop,        daemon=True).start()
 
-    async with websockets.serve(_ws_handler, "localhost", 8765):
+    async with websockets.serve(_ws_handler, "localhost", 8765, reuse_address=True):
         print("  [ws] server listening on ws://localhost:8765")
         try:
             await asyncio.Future()   # blocks until cancelled (Ctrl-C)

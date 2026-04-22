@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from tools.registry import ToolDefinition, registry
+from config.limits import TOOL_OUTPUT_TERMINAL
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -101,8 +102,8 @@ async def _run_terminal(args: dict) -> str:
 
     combined = stdout or stderr or "(no output)"
     # Cap output to avoid bloating the LLM context
-    if len(combined) > 6_000:
-        combined = combined[:6_000] + "\n[Output truncated]"
+    if len(combined) > TOOL_OUTPUT_TERMINAL:
+        combined = combined[:TOOL_OUTPUT_TERMINAL] + "\n[Output truncated]"
 
     return f"Exit {exit_code}:\n{combined}"
 

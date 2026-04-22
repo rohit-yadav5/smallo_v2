@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stt import listen, warmup as stt_warmup
-from llm import ask_llm_stream, warmup as llm_warmup
+from llm import ask_llm_plugin_summary, warmup as llm_warmup
 from tts import speak, speak_stream, warmup as tts_warmup
 
 from memory_system.retrieval.search import retrieve_memories
@@ -121,7 +121,7 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
             f"Data:\n{result['text']}"
         )
         with tracker.step("LLM + TTS (plugin summarize)"):
-            ai_text, tts_timing = speak_stream(ask_llm_stream(summary_prompt))
+            ai_text, tts_timing = speak_stream(ask_llm_plugin_summary(summary_prompt))
         print(f"    [tts] first word: {tts_timing['first_word_secs']:.3f}s  |  total: {tts_timing['total_secs']:.3f}s")
         print(f"\n  Plugin summary: {ai_text}\n")
         return ai_text
@@ -212,7 +212,7 @@ def run():
             prompt = build_memory_context(user_text)
 
         with tracker.step("LLM + TTS"):
-            ai_text, tts_timing = speak_stream(ask_llm_stream(prompt))
+            ai_text, tts_timing = speak_stream(ask_llm_plugin_summary(prompt))
         print(f"    [tts] first word: {tts_timing['first_word_secs']:.3f}s  |  total: {tts_timing['total_secs']:.3f}s")
 
         print(f"\n  AI: {ai_text}\n")

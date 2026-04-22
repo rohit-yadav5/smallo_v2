@@ -20,7 +20,7 @@ from typing import Callable, Optional
 from tools.registry import ToolDefinition, registry
 
 
-_MAX_CHARS = 50_000
+from config.limits import TOOL_OUTPUT_FILE as _MAX_CHARS
 
 # Compiled once at import time — matches common LLM-hallucinated placeholders.
 _PLACEHOLDER_RE = re.compile(

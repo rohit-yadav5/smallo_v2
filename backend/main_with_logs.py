@@ -116,7 +116,7 @@ log.debug("BACKEND_DIR=%s", BACKEND_DIR)
 from audio import RollingAudioBuffer
 from stt import transcribe, transcribe_partial, warmup as stt_warmup, StreamingTranscriber
 from vad import VADOracle
-from llm import ask_llm_stream, warmup as llm_warmup
+from llm import ask_llm_plugin_summary, warmup as llm_warmup
 from tts import speak, speak_stream, warmup as tts_warmup, abort_speaking
 from tts.main_tts import register_ws_audio_sender
 from memory_system.retrieval.search import retrieve_memories
@@ -589,7 +589,7 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
         with tracker.step("LLM + TTS (plugin summarize)"):
             try:
                 ai_text, tts_timing = speak_stream(
-                    _token_broadcaster(ask_llm_stream(summary_prompt), _interrupt_event),
+                    _token_broadcaster(ask_llm_plugin_summary(summary_prompt), _interrupt_event),
                     _interrupt_event,
                 )
                 log.info("plugin summarize complete  first_word=%.3fs  total=%.3fs",
@@ -938,10 +938,10 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     log.debug("_interrupt_event cleared — barge-in now armed")
 
     try:
-        log.debug("starting speak_stream(ask_llm_stream(...))")
+        log.debug("starting speak_stream(ask_llm_plugin_summary(...))")
         t_llm_start = time.perf_counter()
         ai_text, tts_timing = speak_stream(
-            _token_broadcaster(ask_llm_stream(prompt), _interrupt_event),
+            _token_broadcaster(ask_llm_plugin_summary(prompt), _interrupt_event),
             _interrupt_event,
         )
         first_token = tts_timing.get("first_token_secs", tts_timing["first_word_secs"])

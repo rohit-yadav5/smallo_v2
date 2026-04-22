@@ -42,19 +42,31 @@ _ENERGY_THRESHOLD = 0.005
 # Slightly more aggressive than Whisper's own internal 0.6 gate.
 _NO_SPEECH_THRESH = 0.55
 
-# Partial-transcription no_speech gate — more permissive than the final gate
-# because the final call will correct any errors from the fast partial path.
-_PARTIAL_NO_SPEECH_THRESH = 0.65
+from config.limits import VAD_NO_SPEECH_THRESHOLD as _PARTIAL_NO_SPEECH_THRESH
 
 # ── Model (loaded once at import time) ────────────────────────────────────────
 _model = load_model()
+if _model is None:
+    raise RuntimeError("Whisper model failed to load — cannot start STT")
+_stt_available: bool = True
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def warmup() -> None:
     """Pre-warms CTranslate2 JIT on startup.  Called once from main.py."""
-    _engine_warmup(_model)
+    global _stt_available
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
+    with ThreadPoolExecutor(max_workers=1) as _ex:
+        _fut = _ex.submit(_engine_warmup, _model)
+        try:
+            _fut.result(timeout=30)
+        except _FutureTimeout:
+            print("  [stt] warmup timed out after 30s — STT marked unavailable", flush=True)
+            _stt_available = False
+        except Exception as _exc:
+            print(f"  [stt] warmup failed: {_exc} — STT marked unavailable", flush=True)
+            _stt_available = False
 
 
 def transcribe_partial(
@@ -71,6 +83,8 @@ def transcribe_partial(
         (text, [(word_str, start_secs, probability), ...], secs)
         text and words list are both "" / [] if audio is silent or hallucination.
     """
+    if not _stt_available:
+        return "", [], 0.0
     with stt_lock:
         return _transcribe_partial(audio_data)
 
@@ -86,6 +100,8 @@ def transcribe(audio_data: np.ndarray) -> tuple[str, float]:
         all segments fail the no_speech gate, or the result is a known
         hallucination.
     """
+    if not _stt_available:
+        return "", 0.0
     with stt_lock:
         return _transcribe(audio_data)
 
