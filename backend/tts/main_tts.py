@@ -209,7 +209,7 @@ def speak(text: str, interrupt_event=None):
             time.sleep(TTS_CONFIG.poll_interval_s)
 
 
-def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
+def speak_stream(token_gen, interrupt_event=None, token_timeout_s: float | None = None) -> tuple[str, dict]:
     """
     Stream tokens from the LLM and play audio sentence-by-sentence.
 
@@ -248,6 +248,7 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
 
     _start        = time.perf_counter()
     _timing: dict = {}
+    _token_timeout = token_timeout_s if token_timeout_s is not None else TTS_CONFIG.llm_token_timeout_s
 
     full_text     = ""
     buffer        = ""
@@ -459,9 +460,9 @@ def speak_stream(token_gen, interrupt_event=None) -> tuple[str, dict]:
                     if bucket > _last_wait_log:
                         _last_wait_log = bucket
                         print(f"  [llm] ◌ waiting for first token...  {elapsed:.0f}s", flush=True)
-                    if elapsed > TTS_CONFIG.llm_token_timeout_s:
+                    if elapsed > _token_timeout:
                         print(
-                            f"  [llm] ✗ no tokens in {TTS_CONFIG.llm_token_timeout_s:.0f}s — "
+                            f"  [llm] ✗ no tokens in {_token_timeout:.0f}s — "
                             f"Ollama may be hung (run: ollama ps)",
                             flush=True,
                         )

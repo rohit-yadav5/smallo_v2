@@ -19,8 +19,14 @@ that Ollama accepts without validation.
 """
 
 import asyncio
+import logging
 import os
+import warnings
 from typing import Callable, Optional
+
+# Suppress gpt-researcher noise before import
+warnings.filterwarnings("ignore", category=FutureWarning, module="gpt_researcher")
+logging.getLogger("gpt_researcher").setLevel(logging.WARNING)
 
 # ── Env vars must be set BEFORE importing GPTResearcher ─────────────────────
 # LLM_CONFIG is a frozen dataclass — safe to import first.
@@ -59,12 +65,12 @@ def set_broadcast_fn(fn: Callable) -> None:
     _broadcast_fn = fn
 
 
-async def _emit(phase: str, message: str, topic: str = "") -> None:
+async def _emit(phase: str, message: str, topic: str = "", **extra) -> None:
     """Emit a PLAN_EVENT progress update if a broadcast function is registered."""
     if _broadcast_fn is None:
         return
     try:
-        payload = {"phase": phase, "message": message, "tool": "deep_research", "topic": topic}
+        payload = {"phase": phase, "message": message, "tool": "deep_research", "topic": topic, **extra}
         if asyncio.iscoroutinefunction(_broadcast_fn):
             await _broadcast_fn("PLAN_EVENT", payload)
         else:
@@ -82,7 +88,7 @@ async def _deep_research(args: dict) -> str:
         topic       (str, required) — the research question / topic
         query       (str)           — alias for topic (backward compat)
         max_pages   (int)           — max search results per query (default 10, cap 15)
-        report_type (str)           — "detailed_report" (default) or "research_report"
+        report_type (str)           — "deep" (default) or "research_report"
         save_to     (str)           — extra file path to also copy the report to
 
     The report is ALWAYS auto-saved to bot-docs (DocPanel) so the user can
@@ -94,15 +100,21 @@ async def _deep_research(args: dict) -> str:
         return "Error: topic (or query) is required."
 
     max_pages: int = min(int(args.get("max_pages", 10)), 15)
-    report_type: str = args.get("report_type", "detailed_report")
+    report_type: str = args.get("report_type", "deep")
     save_to: Optional[str] = args.get("save_to") or args.get("save_path")
 
     print(f"  [gpt_researcher] starting research: {topic!r}  max_pages={max_pages}  type={report_type}", flush=True)
-    await _emit("start", f"Starting research on: {topic}", topic=topic)
+    await _emit(
+        "decomposed",
+        f"Starting research on: {topic}",
+        topic=topic,
+        goal=topic,
+        steps=["Search & gather sources", "Analyse and scrape pages", "Write structured report", "Save to DocPanel"],
+    )
 
     # ── Run GPT-Researcher ────────────────────────────────────────────────────
     try:
-        await _emit("searching", "Searching and gathering sources…", topic=topic)
+        await _emit("step_start", "Searching and gathering sources…", topic=topic, step_index=0)
 
         # Forward max_pages to GPTResearcher via its env-var config knob.
         # Safe in a single asyncio event loop — no concurrent calls can race here.
@@ -118,7 +130,7 @@ async def _deep_research(args: dict) -> str:
 
         await researcher.conduct_research()
 
-        await _emit("writing", "Writing detailed report…", topic=topic)
+        await _emit("step_start", "Writing detailed report…", topic=topic, step_index=2)
         report: str = await researcher.write_report()
 
     except Exception as exc:
@@ -131,12 +143,16 @@ async def _deep_research(args: dict) -> str:
     # A detailed research report is too long for voice. Save it so the user
     # can download it from DocPanel, and return a short spoken summary.
     doc_title = f"Research: {topic[:60]}"
+    saved_filename: str = ""
+    await _emit("step_start", "Saving report to DocPanel…", topic=topic, step_index=3)
     try:
-        await registry.dispatch(
+        save_result = await registry.dispatch(
             "write_file",
             {"title": doc_title, "content": report, "extension": ".md"},
         )
-        print(f"  [gpt_researcher] auto-saved report to bot-docs", flush=True)
+        # save_result is typically the uid filename or a status string
+        saved_filename = str(save_result) if save_result else ""
+        print(f"  [gpt_researcher] auto-saved report to bot-docs: {saved_filename}", flush=True)
     except Exception as exc:
         print(f"  [gpt_researcher] auto-save failed: {exc}", flush=True)
 
@@ -150,18 +166,20 @@ async def _deep_research(args: dict) -> str:
         except Exception as exc:
             print(f"  [gpt_researcher] save_to failed: {exc}", flush=True)
 
-    await _emit("done", "Research complete. Report saved to DocPanel.", topic=topic)
+    word_count = len(report.split())
+    sources = report.count("http")
+    summary_msg = f"Research complete — {word_count}-word report saved to DocPanel ({sources} sources)."
+    await _emit("complete", summary_msg, topic=topic, summary=summary_msg)
 
     # Pass the full report (up to 2000 words) to the second-pass LLM so it has
     # enough material to write a comprehensive 2-3 page response. The full
     # report is also saved to DocPanel for download.
-    word_count = len(report.split())
-    sources = report.count("http")
     words = report.split()
     excerpt = " ".join(words[:2000]) + ("…" if len(words) > 2000 else "")
 
+    file_note = f" (saved as {saved_filename})" if saved_filename else ""
     return (
-        f"[Research complete — full {word_count}-word report saved to DocPanel ({sources} sources cited)]\n\n"
+        f"[Research complete — full {word_count}-word report saved to DocPanel{file_note} ({sources} sources cited)]\n\n"
         f"{excerpt}"
     )
 
@@ -191,8 +209,8 @@ registry.register(ToolDefinition(
             },
             "report_type": {
                 "type": "string",
-                "description": "Report depth: 'detailed_report' (default, comprehensive) or 'research_report' (shorter summary)",
-                "default": "detailed_report",
+                "description": "Report depth: 'deep' (default, comprehensive) or 'research_report' (shorter summary)",
+                "default": "deep",
             },
             "save_to": {
                 "type": "string",

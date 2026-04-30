@@ -1228,6 +1228,23 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         return False
 
     # ── Normal streaming response ────────────────────────────────────────
+    # Check whether Pass 1 detected a deep_research tool call so we can
+    # speak an acknowledgment before the tool runs (it takes 2-5 minutes).
+    _is_deep_research = getattr(llm_result, "tool_name", "") == "deep_research"
+    if _is_deep_research and _tts_enabled:
+        _dr_query = (
+            getattr(llm_result, "tool_args", {}).get("topic")
+            or getattr(llm_result, "tool_args", {}).get("query", "your query")
+        )
+        _ack = f"Starting deep research on {_dr_query}. This will take a few minutes."
+        _emit("VOICE_STATE", {"state": "speaking"})
+        _interrupt_event.clear()
+        try:
+            speak(_ack, _interrupt_event)
+        except Exception:
+            pass
+        _emit("VOICE_STATE", {"state": "thinking"})
+
     print(f"  [pipeline] VOICE_STATE → speaking", flush=True)
     _emit("VOICE_STATE", {"state": "speaking"})
     _interrupt_event.clear()   # arm: VAD can now set this on barge-in
@@ -1247,6 +1264,7 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
             ai_text, tts_timing = speak_stream(
                 _token_broadcaster(llm_result, _interrupt_event),
                 _interrupt_event,
+                token_timeout_s=300.0 if _is_deep_research else None,
             )
             first_token = tts_timing.get("first_token_secs", tts_timing["first_word_secs"])
             first_audio = tts_timing["first_word_secs"]
@@ -1585,6 +1603,18 @@ async def _main():
         name="server-ready-preload",
     )
     print("  [llm] background preload started at server ready", flush=True)
+
+    # Warm up sentence-transformers so Turn 1 memory retrieval isn't slow (~8 s cold-load).
+    def _warmup_embedder():
+        try:
+            from memory_system.embeddings.embedder import generate_embedding_vector  # noqa: PLC0415
+            generate_embedding_vector("warmup")
+            print("  [embedder] warm-up complete", flush=True)
+        except Exception as _exc:
+            print(f"  [embedder] warm-up failed (non-fatal): {_exc}", flush=True)
+
+    threading.Thread(target=_warmup_embedder, daemon=True, name="embedder-warmup").start()
+    print("  [embedder] background warm-up started", flush=True)
 
     threading.Thread(target=_stats_loop,           daemon=True).start()
     threading.Thread(target=_audio_ingestion_loop, daemon=True).start()

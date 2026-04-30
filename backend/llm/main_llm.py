@@ -33,6 +33,28 @@ from typing import Iterator
 import requests
 
 from config.llm import LLM_CONFIG, KEEP_ALIVE_IDLE, KEEP_ALIVE_ACTIVE
+
+
+# ── Tagged iterator — carries tool metadata to the speak_stream call site ─────
+# ask_llm_turn wraps its return value in this thin wrapper so _run_turn in
+# backend/main.py can read tool_name / tool_args before speak_stream is called,
+# enabling per-tool timeout and pre-speech acknowledgment without changing the
+# two-pass flow structure.
+
+class _TaggedIter:
+    """Iterator wrapper that carries tool_name and tool_args as attributes."""
+    __slots__ = ("_it", "tool_name", "tool_args")
+
+    def __init__(self, it: Iterator, tool_name: str = "", tool_args: dict | None = None):
+        self._it       = it
+        self.tool_name = tool_name
+        self.tool_args = tool_args or {}
+
+    def __iter__(self) -> "_TaggedIter":
+        return self
+
+    def __next__(self) -> str:
+        return next(self._it)
 from llm.SYSTEM_PROMPT import SYSTEM_PROMPT, get_runtime_context
 
 # ── Conversation-active flag ──────────────────────────────────────────────────
@@ -196,17 +218,22 @@ def _stream_ollama(
     messages: list[dict],
     model: str | None = None,
     num_predict: int | None = None,
+    read_timeout: float | None = None,
 ) -> Iterator[str]:
     """Yield response tokens one by one from Ollama (blocking generator).
 
     Parameters
     ----------
-    messages:    The message list to send to Ollama.
-    model:       Optional model override. Defaults to LLM_CONFIG.model when None.
-    num_predict: Optional token budget override. Defaults to LLM_CONFIG.num_predict.
+    messages:     The message list to send to Ollama.
+    model:        Optional model override. Defaults to LLM_CONFIG.model when None.
+    num_predict:  Optional token budget override. Defaults to LLM_CONFIG.num_predict.
+    read_timeout: Optional streaming read timeout in seconds. Defaults to
+                  LLM_CONFIG.stream_timeout_read_s. Pass 300 for long-running
+                  tools (e.g. deep_research) whose Pass 2 response may start late.
     """
     effective_model = model if model is not None else LLM_CONFIG.model
     effective_predict = num_predict if num_predict is not None else LLM_CONFIG.num_predict
+    effective_read_timeout = read_timeout if read_timeout is not None else LLM_CONFIG.stream_timeout_read_s
     total_chars = sum(len(m["content"]) for m in messages)
     print(f"  [llm] ▶ {total_chars:,} char prompt → {effective_model} (num_predict={effective_predict})", flush=True)
 
@@ -228,7 +255,7 @@ def _stream_ollama(
         stream=True,
         timeout=(
             LLM_CONFIG.stream_timeout_connect_s,
-            LLM_CONFIG.stream_timeout_read_s,
+            effective_read_timeout,
         ),
     )
     response.raise_for_status()
@@ -251,7 +278,7 @@ def _collect_full_response(token_iter: Iterator[str]) -> tuple[str, list[str]]:
 # ── Tool-call and plan-trigger detection ─────────────────────────────────────
 
 _TOOL_CALL_RE = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)",
     re.DOTALL,
 )
 
@@ -263,7 +290,7 @@ _TOOL_CALL_RE = re.compile(
 _TOOL_LEAK_RES = [
     re.compile(r"`<tool_call>.*?</tool_call>`", re.DOTALL),   # backtick-wrapped tags
     re.compile(r"`\{\"name\".*?\}`", re.DOTALL),              # backtick-wrapped JSON
-    re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL),     # bare tags not caught earlier
+    re.compile(r"<tool_call>.*?(?:</tool_call>|$)", re.DOTALL),  # bare tags, closed or unclosed
 ]
 
 # Narration pattern: "I will call web_navigate", "let me run run_terminal", etc.
@@ -430,8 +457,9 @@ def _run_tool_sync(name: str, args: dict) -> str:
         return f"Error running tool '{name}': main event loop not available (backend not fully started)"
 
     future = asyncio.run_coroutine_threadsafe(reg.dispatch(name, args), main_loop)
+    _timeout = 300 if name == "deep_research" else 60
     try:
-        return future.result(timeout=60)
+        return future.result(timeout=_timeout)
     except Exception as exc:
         print(f"  [llm] tool '{name}' raised exception:\n{_tb.format_exc()}", flush=True)
         return f"Error running tool '{name}': {exc}"
@@ -625,8 +653,9 @@ def ask_llm_plugin_summary(user_text: str, system_suffix: str = "") -> Iterator[
             ),
         }
         pass2_predict = None
+    _pass2_read_timeout = 300.0 if tool_name == "deep_research" else None
     print(f"  [llm] ▶ pass-2 stream after tool '{tool_name}'", flush=True)
-    yield from _stream_ollama(messages2, num_predict=pass2_predict)
+    yield from _stream_ollama(messages2, num_predict=pass2_predict, read_timeout=_pass2_read_timeout)
 
 
 # ── Internal helper: tool or plain token stream ───────────────────────────────
@@ -706,8 +735,9 @@ def _handle_tool_or_plain(
         }
         pass2_predict = None  # use default
 
+    _pass2_read_timeout = 300.0 if tool_name == "deep_research" else None
     print(f"  [llm] ▶ pass-2 stream after tool '{tool_name}'", flush=True)
-    yield from _stream_ollama(messages2, num_predict=pass2_predict)
+    yield from _stream_ollama(messages2, num_predict=pass2_predict, read_timeout=_pass2_read_timeout)
 
 
 def ask_llm_turn(
@@ -787,4 +817,11 @@ def ask_llm_turn(
             print("  [llm] ⚠ forced tool-call pass failed — using conversational response", flush=True)
 
     # ── Otherwise: delegate to tool-or-plain handler (a generator) ─────────
-    return _handle_tool_or_plain(full_text, tokens, safe_text, system_suffix)
+    # Extract tool metadata now (Pass 1 already has the full response) so the
+    # caller can read tool_name / tool_args before speak_stream consumes any token.
+    _final_name, _final_args, _ = _extract_tool_call(full_text)
+    return _TaggedIter(
+        _handle_tool_or_plain(full_text, tokens, safe_text, system_suffix),
+        _final_name or "",
+        _final_args or {},
+    )

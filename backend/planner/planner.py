@@ -174,7 +174,7 @@ _BAD_STEP_TOKENS = ("<start_plan>", "</start_plan>", "<tool_call>", "</tool_call
 #   3. x({"key":"val"})                                  ← Python call style
 #   4. x {"key":"val"}                                   ← name + JSON args
 
-_TAGGED_TOOL_RE   = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TAGGED_TOOL_RE   = re.compile(r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)", re.DOTALL)
 _BARE_JSON_RE     = re.compile(r'^\s*\{"name"\s*:\s*"([^"]+)"', re.DOTALL)
 _PY_CALL_RE       = re.compile(r'^(\w+)\s*\((\{.*\})\)\s*$', re.DOTALL)
 _NAME_JSON_RE     = re.compile(r'^(\w+)\s*(\{.*\})\s*$', re.DOTALL)

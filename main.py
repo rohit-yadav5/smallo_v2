@@ -8,6 +8,7 @@ Usage:
     python main.py
 """
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -54,13 +55,33 @@ def main():
         frontend_proc = subprocess.Popen(
             [NPM, "run", "dev"],
             cwd=FRONTEND, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1,
         )
         procs.append(frontend_proc)
 
-        time.sleep(2.0)
-        webbrowser.open("http://localhost:5173")
-        print("  Small O is running  →  http://localhost:5173")
+        # Parse the actual port Vite chose — it auto-increments when 5173 is busy.
+        _vite_url  = ["http://localhost:5173"]   # list so the thread can write to it
+        _url_ready = threading.Event()
+
+        def _watch_vite_stdout():
+            try:
+                for line in frontend_proc.stdout:
+                    m = re.search(r"Local:\s*(http://localhost:\d+)", line)
+                    if m:
+                        _vite_url[0] = m.group(1).rstrip("/")
+                        _url_ready.set()
+                        break
+            except Exception:
+                pass
+            finally:
+                _url_ready.set()   # unblock on EOF or error too
+
+        threading.Thread(target=_watch_vite_stdout, daemon=True).start()
+        _url_ready.wait(timeout=15.0)
+
+        webbrowser.open(_vite_url[0])
+        print(f"  Small O is running  →  {_vite_url[0]}")
         print("  Press Ctrl+C to stop.\n")
 
         while True:
