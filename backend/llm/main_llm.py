@@ -665,6 +665,7 @@ def _handle_tool_or_plain(
     tokens: list[str],
     safe_text: str,
     system_suffix: str,
+    prior_messages: list[dict] | None = None,
 ) -> Iterator[str]:
     """Generator: either re-yields plain tokens or does the two-pass tool flow."""
     tool_name, tool_args, visible_text = _extract_tool_call(full_text)
@@ -688,7 +689,7 @@ def _handle_tool_or_plain(
                     f'"args": {json.dumps(tool_args2 or {})}}}</tool_call>'
                 )
                 yield from _handle_tool_or_plain(
-                    synthetic, [synthetic], safe_text, system_suffix
+                    synthetic, [synthetic], safe_text, system_suffix, prior_messages
                 )
                 return
             yield cleaned
@@ -703,10 +704,11 @@ def _handle_tool_or_plain(
     tool_result = _run_tool_sync(tool_name, tool_args or {})
     print(f"  [llm] 🔧 tool result ({len(tool_result)} chars): {tool_result[:120]}", flush=True)
 
-    history = [
+    tool_history = [
         {"role": "assistant", "content": full_text},
         {"role": "tool",      "content": f"Tool '{tool_name}' result:\n{tool_result}"},
     ]
+    history = (prior_messages or []) + tool_history
     messages2 = _build_messages(safe_text, system_suffix=system_suffix, extra_history=history)
 
     is_research = (tool_name == "deep_research")
@@ -743,6 +745,7 @@ def _handle_tool_or_plain(
 def ask_llm_turn(
     user_text: str,
     system_suffix: str = "",
+    prior_messages: list[dict] | None = None,
 ) -> "dict | Iterator[str]":
     """
     Combined LLM turn function used by _run_turn in backend/main.py.
@@ -758,9 +761,13 @@ def ask_llm_turn(
     without modifying the token stream.
 
     Priority: plan_trigger > tool_call > plain text
+
+    prior_messages: optional [{role, content}, ...] spliced between the
+    system prompt and the current user turn. Used by normal-mode chat to
+    carry session continuity without writing to long-term memory.
     """
     safe_text = _sanitize_user_text(user_text)
-    messages  = _build_messages(safe_text, system_suffix=system_suffix)
+    messages  = _build_messages(safe_text, system_suffix=system_suffix, extra_history=prior_messages)
 
     # Pass 1: collect the full response before making any decisions
     full_text, tokens = _collect_full_response(_stream_ollama(messages))
@@ -821,7 +828,7 @@ def ask_llm_turn(
     # caller can read tool_name / tool_args before speak_stream consumes any token.
     _final_name, _final_args, _ = _extract_tool_call(full_text)
     return _TaggedIter(
-        _handle_tool_or_plain(full_text, tokens, safe_text, system_suffix),
+        _handle_tool_or_plain(full_text, tokens, safe_text, system_suffix, prior_messages),
         _final_name or "",
         _final_args or {},
     )

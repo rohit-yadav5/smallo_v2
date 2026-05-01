@@ -114,13 +114,9 @@ ollama pull phi3    # first time only
 ```bash
 # Standard run — opens browser automatically
 python main.py
-
-# With detailed logs — shows every pipeline step + latency
-python main_with_logs.py
 ```
 
 `main.py` starts both processes silently and opens `http://localhost:5173`.
-`main_with_logs.py` pipes all backend events to the terminal with timestamps and colour.
 
 Press **Ctrl+C** to stop — both frontend and backend (and all child processes) are shut down cleanly.
 
@@ -146,7 +142,6 @@ python main.py
 ```
 smallO_v2/
 ├── main.py                    # Root launcher — starts backend + frontend
-├── main_with_logs.py          # Same but with detailed terminal logs
 ├── requirements.txt           # Python dependencies
 │
 ├── backend/

@@ -113,6 +113,19 @@ export interface FileContentEvent {
   extension: string
 }
 
+export type Mode = 'normal' | 'super'
+
+/** Frontend → backend: request a mode change. */
+export interface SetModeEvent {
+  mode: Mode
+}
+
+/** Backend → frontend: mode change applied; session boundary crossed. */
+export interface ModeChangedEvent {
+  mode:       Mode
+  session_id: string
+}
+
 export type WSEvent =
   | { event: 'STT_RESULT';       data: STTResult }
   | { event: 'STT_PARTIAL';      data: STTPartial }
@@ -131,6 +144,7 @@ export type WSEvent =
   | { event: 'FILE_CREATED';     data: FileCreatedEvent }
   | { event: 'FILE_LIST';        data: FileListEvent }
   | { event: 'FILE_CONTENT';     data: FileContentEvent }
+  | { event: 'MODE_CHANGED';     data: ModeChangedEvent }
   | { event: 'pong';             data: Record<string, never> }
 
 export interface SystemStats {

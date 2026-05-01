@@ -1,4 +1,4 @@
-"""launcher_utils.py — Shared helpers for main.py and main_with_logs.py."""
+"""launcher_utils.py — Shared helpers for main.py."""
 import subprocess
 from pathlib import Path
 

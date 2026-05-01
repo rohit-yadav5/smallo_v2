@@ -214,6 +214,11 @@ export function useWebSocket() {
         // Uses the ref so we always read the live store value, not the
         // stale closure captured at effect creation time.
         ws.send(JSON.stringify({ event: 'SET_TTS_ENABLED', enabled: ttsEnabledRef.current }))
+        // Sync the persisted mode preference. Backend default is "normal";
+        // if the user's last session was "super" this brings them back to it.
+        // No-op on the backend if the mode already matches.
+        const persistedMode = useAppStore.getState().mode
+        ws.send(JSON.stringify({ event: 'SET_MODE', data: { mode: persistedMode } }))
         // Request any files already saved this session (handles page refresh)
         ws.send(JSON.stringify({ event: 'GET_SESSION_FILES' }))
       }
@@ -406,6 +411,10 @@ export function useWebSocket() {
 
         case 'FILE_CONTENT':
           _triggerDownload(msg.data.content, msg.data.filename, msg.data.extension)
+          break
+
+        case 'MODE_CHANGED':
+          store.handleModeChanged(msg.data.mode, msg.data.session_id)
           break
 
         case 'pong':

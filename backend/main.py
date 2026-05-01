@@ -105,6 +105,8 @@ from utils.latency import LatencyTracker
 
 # ── Jarvis upgrade: tools + user context ──────────────────────────────────────
 import backend_loop_ref                                  # loop ref for tool dispatch
+import mode
+import session_history
 import tools                                             # triggers self-registration of all four tools  # noqa: F401
 from tools.reminder_tool import set_broadcast_fn as _set_reminder_broadcast, shutdown_all_reminders
 from user_context import load_user_context, get_context_prompt, update_user_context
@@ -569,6 +571,10 @@ def _extract_identity_facts(user_text: str) -> list[dict]:
 # ──────────────────────────────────────────────────
 
 def _build_memory_context(user_text: str) -> str:
+    if not mode.is_super():
+        # Normal mode: stateless chat, no memory retrieval. Continuity comes
+        # from session_history (spliced into the LLM call as prior_messages).
+        return user_text
     try:
         memories = retrieve_memories(user_text, top_k=5)
     except Exception as e:
@@ -752,6 +758,8 @@ def _handle_plugin_result(result: dict, tracker: LatencyTracker) -> str:
 
 
 def _store_action_memory(user_text: str, spoken_text: str, result: dict):
+    if not mode.is_super():
+        return
     def _run():
         try:
             memory_id = insert_memory({
@@ -1066,37 +1074,42 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
             print(f"  [plugin] router error: {e}")
 
     if plugin_result is not None:
+        spoken = ""
         try:
             spoken = _handle_plugin_result(plugin_result, tracker)
             _store_action_memory(user_text, spoken, plugin_result)
         except Exception as e:
             print(f"  [plugin] handle result error: {e}")
+        if mode.is_normal() and spoken:
+            session_history.append("user", user_text)
+            session_history.append("assistant", spoken)
         _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
         return False
 
     # ── Identity extraction ──────────────────────────────────────────────
-    try:
-        with tracker.step("Identity Extraction"):
-            identity_facts = _extract_identity_facts(user_text)
-    except Exception as e:
-        print(f"  [identity] extraction error: {e}")
-        identity_facts = []
+    if mode.is_super():
+        try:
+            with tracker.step("Identity Extraction"):
+                identity_facts = _extract_identity_facts(user_text)
+        except Exception as e:
+            print(f"  [identity] extraction error: {e}")
+            identity_facts = []
 
-    try:
-        with tracker.step("Identity Memory Insert"):
-            for fact in identity_facts:
-                memory_id = insert_memory(fact)
-                if memory_id:
-                    _emit("MEMORY_EVENT", {
-                        "retrieved":  False,
-                        "id":         memory_id,
-                        "type":       "personal",
-                        "importance": _MEMORY_IMPORTANCE["PersonalMemory"],
-                        "summary":    fact["text"],
-                    })
-    except Exception as e:
-        print(f"  [identity] memory insert error: {e}")
+        try:
+            with tracker.step("Identity Memory Insert"):
+                for fact in identity_facts:
+                    memory_id = insert_memory(fact)
+                    if memory_id:
+                        _emit("MEMORY_EVENT", {
+                            "retrieved":  False,
+                            "id":         memory_id,
+                            "type":       "personal",
+                            "importance": _MEMORY_IMPORTANCE["PersonalMemory"],
+                            "summary":    fact["text"],
+                        })
+        except Exception as e:
+            print(f"  [identity] memory insert error: {e}")
 
     # ── Memory retrieval ─────────────────────────────────────────────────
     try:
@@ -1154,9 +1167,14 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     except Exception as _plan_ctx_exc:
         pass  # non-fatal — plan context is best-effort
 
+    # In normal mode, splice the in-session deque into the LLM call so the
+    # bot has continuity without touching long-term memory. In super mode the
+    # memory system carries continuity instead.
+    prior_msgs = session_history.get_messages() if mode.is_normal() else None
+
     print(f"  [pipeline] calling ask_llm_turn  |  prompt {len(prompt):,} chars", flush=True)
     try:
-        llm_result = ask_llm_turn(prompt, system_suffix=user_ctx_suffix)
+        llm_result = ask_llm_turn(prompt, system_suffix=user_ctx_suffix, prior_messages=prior_msgs)
     except Exception as e:
         print(f"  [llm] ask_llm_turn failed: {e}")
         _emit("VOICE_STATE", {"state": "idle"})
@@ -1190,12 +1208,14 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
                     break
         _emit("VOICE_STATE", {"state": "speaking"})
         _interrupt_event.clear()
+        plan_assistant_text = ""
         if plan_signal is None or plan_signal in ("MULTI", "TIMEOUT"):
             # Multi-step plan, 45s timeout, or watchdog reset — speak generic ack.
             # The plan is either still running (MULTI) or timed out (TIMEOUT/None).
             # In the MULTI case the planner will speak its own completion summary.
+            plan_assistant_text = "On it. I'll let you know when it's done."
             try:
-                speak("On it. I'll let you know when it's done.", _interrupt_event)
+                speak(plan_assistant_text, _interrupt_event)
             except Exception:
                 pass
         else:
@@ -1205,24 +1225,29 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
             print(f"  [pipeline] single-tool result → generating natural response", flush=True)
             tool_suffix = (user_ctx_suffix + f"\n[Tool result]: {plan_signal}").strip()
             try:
-                llm_resp = ask_llm_turn(prompt, system_suffix=tool_suffix)
+                llm_resp = ask_llm_turn(prompt, system_suffix=tool_suffix, prior_messages=prior_msgs)
                 if isinstance(llm_resp, dict):
                     # plan_trigger inside plan response — shouldn't happen, speak raw
-                    speak(str(plan_signal)[:300], _interrupt_event)
+                    plan_assistant_text = str(plan_signal)[:300]
+                    speak(plan_assistant_text, _interrupt_event)
                 elif _tts_enabled:
-                    speak_stream(
+                    plan_assistant_text, _ = speak_stream(
                         _token_broadcaster(llm_resp, _interrupt_event),
                         _interrupt_event,
                     )
                 else:
                     print("  [tts] disabled — skipping synthesis", flush=True)
-                    ai_text = "".join(_token_broadcaster(llm_resp, _interrupt_event))
+                    plan_assistant_text = "".join(_token_broadcaster(llm_resp, _interrupt_event))
             except Exception as _resp_err:
                 print(f"  [pipeline] LLM response for tool result failed: {_resp_err} — speaking raw", flush=True)
                 try:
-                    speak(str(plan_signal)[:300], _interrupt_event)
+                    plan_assistant_text = str(plan_signal)[:300]
+                    speak(plan_assistant_text, _interrupt_event)
                 except Exception:
                     pass
+        if mode.is_normal() and plan_assistant_text:
+            session_history.append("user", user_text)
+            session_history.append("assistant", plan_assistant_text)
         _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
         return False
@@ -1322,25 +1347,30 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     tracker.summary()
 
     # ── Reflection memory (background) ───────────────────────────────────
-    def _store_reflection(ut=user_text, at=ai_text):
-        try:
-            memory_id = insert_memory({
-                "text":              f"User: {ut}\nAssistant: {at}",
-                "memory_type":       "ReflectionMemory",
-                "project_reference": "VoiceInteraction",
-            })
-            if memory_id:
-                _emit("MEMORY_EVENT", {
-                    "retrieved":  False,
-                    "id":         memory_id,
-                    "type":       "reflection",
-                    "importance": _MEMORY_IMPORTANCE["ReflectionMemory"],
-                    "summary":    f"You: {ut[:50]}… / AI: {at[:50]}…",
+    if mode.is_super():
+        def _store_reflection(ut=user_text, at=ai_text):
+            try:
+                memory_id = insert_memory({
+                    "text":              f"User: {ut}\nAssistant: {at}",
+                    "memory_type":       "ReflectionMemory",
+                    "project_reference": "VoiceInteraction",
                 })
-        except Exception as e:
-            print(f"  [memory] reflection insert failed: {e}")
+                if memory_id:
+                    _emit("MEMORY_EVENT", {
+                        "retrieved":  False,
+                        "id":         memory_id,
+                        "type":       "reflection",
+                        "importance": _MEMORY_IMPORTANCE["ReflectionMemory"],
+                        "summary":    f"You: {ut[:50]}… / AI: {at[:50]}…",
+                    })
+            except Exception as e:
+                print(f"  [memory] reflection insert failed: {e}")
 
-    threading.Thread(target=_store_reflection, daemon=True).start()
+        threading.Thread(target=_store_reflection, daemon=True).start()
+
+    if mode.is_normal():
+        session_history.append("user", user_text)
+        session_history.append("assistant", ai_text)
     return False
 
 
@@ -1392,6 +1422,19 @@ async def _ws_handler(ws):
                         global _tts_enabled
                         _tts_enabled = bool(ctrl.get("data", {}).get("enabled", True))
                         print(f"  [ws] SET_TTS_ENABLED → {_tts_enabled}", flush=True)
+
+                    elif ev == "SET_MODE":
+                        new_mode = ctrl.get("data", {}).get("mode")
+                        if new_mode in ("normal", "super"):
+                            try:
+                                # set_mode is a no-op when new_mode == current.
+                                # The registered handler does session-boundary work
+                                # and emits MODE_CHANGED.
+                                mode.set_mode(new_mode)
+                            except Exception as _mode_exc:
+                                print(f"  [ws] SET_MODE failed: {_mode_exc}", flush=True)
+                        else:
+                            print(f"  [ws] SET_MODE ignored — invalid mode: {new_mode!r}", flush=True)
 
                     elif ev == "TEXT_INPUT":
                         # User typed a message — inject directly into pipeline.
@@ -1481,6 +1524,20 @@ async def _main():
     )
     _set_file_broadcast(_emit)
     _set_file_session(SESSION_ID)
+
+    # ── Mode-change session boundary ────────────────────────────────────────
+    # Switching mode ends the current session: rotate SESSION_ID, clear the
+    # in-memory chat deque, and tell the frontend to clear its conversation.
+    def _on_mode_change(old: str, new: str) -> None:
+        global SESSION_ID
+        SESSION_ID = _uuid4().hex[:12]
+        backend_loop_ref.session_id = SESSION_ID
+        _set_file_session(SESSION_ID)
+        session_history.clear()
+        print(f"  [mode] {old} → {new}  |  new session: {SESSION_ID}", flush=True)
+        _emit("MODE_CHANGED", {"mode": new, "session_id": SESSION_ID})
+
+    mode.register_mode_change_handler(_on_mode_change)
 
     # Register the WS audio sender so TTS can stream audio to browser clients.
     # Must happen after _loop is set (sender uses run_coroutine_threadsafe).

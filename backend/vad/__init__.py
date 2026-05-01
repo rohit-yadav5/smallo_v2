@@ -5,8 +5,7 @@ Architecture
 ────────────
 SileroEngine   — stateless per-frame Silero VAD inference
 RingBuffer     — thread-safe circular audio ring buffer
-StreamingVAD   — legacy gating VAD (kept for reference; no longer in main path)
-VADOracle      — NEW: timestamp-only VAD; fires start/end callbacks, never
+VADOracle      — timestamp-only VAD; fires start/end callbacks, never
                  accumulates audio.  Used with RollingAudioBuffer in the
                  continuous-recording pipeline.
 
@@ -21,9 +20,8 @@ oracle = VADOracle(
 oracle.process(chunk_16k, current_time_s)   # fires callbacks
 oracle.reset()                              # on state transitions
 """
-from vad.streaming   import StreamingVAD
 from vad.engine      import SileroEngine
 from vad.ring_buffer import RingBuffer
 from vad.oracle      import VADOracle
 
-__all__ = ["StreamingVAD", "SileroEngine", "RingBuffer", "VADOracle"]
+__all__ = ["SileroEngine", "RingBuffer", "VADOracle"]

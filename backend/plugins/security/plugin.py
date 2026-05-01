@@ -262,7 +262,7 @@ class SecurityPlugin(BasePlugin):
             # Import here to avoid circular imports at module load time
             from llm import ask_llm
             from tts import speak
-            from memory_system.core.insert_pipeline import insert_memory
+            import mode
 
             summary = ask_llm(
                 f"Summarize this {action.replace('_', ' ')} result in 2-3 sentences. "
@@ -270,11 +270,13 @@ class SecurityPlugin(BasePlugin):
             )
             speak(summary)
 
-            insert_memory({
-                "text": f"Ran {action} on {target}.\nResult:\n{raw[:600]}",
-                "memory_type": "ActionMemory",
-                "project_reference": f"Plugin:{self.NAME}",
-                "source": "plugin"
-            })
+            if mode.is_super():
+                from memory_system.core.insert_pipeline import insert_memory
+                insert_memory({
+                    "text": f"Ran {action} on {target}.\nResult:\n{raw[:600]}",
+                    "memory_type": "ActionMemory",
+                    "project_reference": f"Plugin:{self.NAME}",
+                    "source": "plugin"
+                })
 
         threading.Thread(target=_worker, daemon=True).start()

@@ -1,5 +1,20 @@
 import { create } from 'zustand'
-import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats, PlanEvent, WebScreenshot, SystemEvent, FileCreatedEvent } from '../types/events'
+import type { VoiceState, ConversationMessage, MemoryNode, PluginNotification, SystemStats, PlanEvent, WebScreenshot, SystemEvent, FileCreatedEvent, Mode } from '../types/events'
+import { wsRef } from '../lib/wsRef'
+
+const MODE_STORAGE_KEY = 'smallo.mode'
+
+function _readPersistedMode(): Mode {
+  try {
+    const v = localStorage.getItem(MODE_STORAGE_KEY)
+    if (v === 'normal' || v === 'super') return v
+  } catch { /* localStorage may be blocked */ }
+  return 'normal'
+}
+
+function _persistMode(m: Mode): void {
+  try { localStorage.setItem(MODE_STORAGE_KEY, m) } catch { /* ignore */ }
+}
 
 export interface PlanStepState {
   text:    string
@@ -53,6 +68,12 @@ interface AppState {
   addSessionFile:           (f: FileCreatedEvent) => void
   setSessionFiles:          (files: FileCreatedEvent[]) => void
 
+  /** normal = stateless chat, no memory writes; super = full memory active */
+  mode:                     Mode
+  setMode:                  (mode: Mode) => void
+  /** Backend confirmed mode flip; clears session-scoped state. */
+  handleModeChanged:        (mode: Mode, session_id: string) => void
+
   setVoiceState:            (state: VoiceState) => void
   setWsConnected:           (connected: boolean) => void
   setMicActive:             (v: boolean) => void
@@ -102,9 +123,44 @@ export const useAppStore = create<AppState>((set, get) => ({
   ttsEnabled:          true,
   browserViewerOpen:   false,
   sessionFiles:        [],
+  mode:                _readPersistedMode(),
 
   addSessionFile:  (f) => set((s) => ({ sessionFiles: [f, ...s.sessionFiles] })),
   setSessionFiles: (files) => set({ sessionFiles: files }),
+
+  setMode: (m) => {
+    const cur = get().mode
+    if (cur === m) return
+    _persistMode(m)
+    set({ mode: m })
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'SET_MODE', data: { mode: m } }))
+    }
+  },
+
+  handleModeChanged: (m, _sessionId) => {
+    _persistMode(m)
+    set({
+      mode:               m,
+      messages:           [],
+      sessionFiles:       [],
+      memoryNodes:        [],
+      activePlan:         null,
+      currentStreamId:    null,
+      partialUserText:    '',
+      partialHypothesis:  '',
+      systemToast:        {
+        message: `Switched to ${m} mode. New session started.`,
+        kind:    'info',
+      },
+    })
+    setTimeout(() => {
+      // Only clear if this toast is still the active one
+      const cur = get().systemToast
+      if (cur && cur.message.startsWith('Switched to ')) set({ systemToast: null })
+    }, 4_000)
+  },
 
   setVoiceState:        (state)     => set({ voiceState: state }),
   setWsConnected:       (connected) => set({ wsConnected: connected }),

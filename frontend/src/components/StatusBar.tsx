@@ -113,6 +113,57 @@ function TogglePill({ active, onClick, icon, label, pressed }: PillProps) {
   )
 }
 
+// ── Mode pill (NORMAL / SUPER) ────────────────────────────────────────────────
+
+interface ModePillProps {
+  mode:     'normal' | 'super'
+  onClick:  () => void
+  disabled: boolean
+}
+
+function ModePill({ mode, onClick, disabled }: ModePillProps) {
+  const isSuper = mode === 'super'
+  return (
+    <button
+      onClick={onClick}
+      title={
+        disabled
+          ? 'Wait for current turn to finish.'
+          : `Click to switch to ${isSuper ? 'normal' : 'super'} mode`
+      }
+      style={{
+        display:        'inline-flex',
+        alignItems:     'center',
+        gap:            '4px',
+        padding:        '3px 8px',
+        borderRadius:   '999px',
+        fontSize:       '11px',
+        fontWeight:     700,
+        cursor:         disabled ? 'not-allowed' : 'pointer',
+        userSelect:     'none',
+        transition:     'background 0.15s, color 0.15s',
+        fontFamily:     'JetBrains Mono, monospace',
+        opacity:        disabled ? 0.55 : 1,
+        border:         isSuper
+          ? '1px solid rgba(251,191,36,0.55)'
+          : '1px solid rgba(255,255,255,0.18)',
+        background:     isSuper
+          ? 'rgba(251,191,36,0.22)'
+          : 'rgba(255,255,255,0.06)',
+        color:          isSuper
+          ? '#fde68a'
+          : 'rgba(255,255,255,0.55)',
+        boxShadow:      isSuper
+          ? '0 0 6px rgba(251,191,36,0.45)'
+          : 'none',
+        letterSpacing:  '0.04em',
+      }}
+    >
+      <span>MODE: {isSuper ? 'SUPER' : 'NORMAL'}</span>
+    </button>
+  )
+}
+
 // ── Component ──────────────────────────────────────────────────────────────────
 
 export function StatusBar() {
@@ -120,11 +171,13 @@ export function StatusBar() {
     memoryCount, latency, availableRamGb, ramPressure, systemToast, clearSystemToast,
     sttEnabled, ttsEnabled, toggleSTT, toggleTTS,
     latestScreenshot, browserViewerOpen, setBrowserViewerOpen,
+    mode, setMode, voiceState,
   } = useAppStore()
 
   const [time, setTime] = useState(() =>
     new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   )
+  const [modeHint, setModeHint] = useState<string | null>(null)
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -132,6 +185,15 @@ export function StatusBar() {
     }, 30_000)
     return () => clearInterval(id)
   }, [])
+
+  function onModeClick() {
+    if (voiceState !== 'idle') {
+      setModeHint('Wait for current turn to finish.')
+      setTimeout(() => setModeHint(null), 2500)
+      return
+    }
+    setMode(mode === 'normal' ? 'super' : 'normal')
+  }
 
   const dotColor = ramPressure ? _PRESSURE_COLOR[ramPressure] : 'rgba(255,255,255,0.3)'
   const hasFeed  = latestScreenshot !== null
@@ -195,7 +257,7 @@ export function StatusBar() {
           className="flex items-center gap-4 text-xs font-semibold"
           style={{ fontFamily: 'JetBrains Mono, monospace', color: 'rgba(255,255,255,0.85)' }}
         >
-          <span>phi3 · Ollama</span>
+          <span>—</span>
           {memoryCount > 0 && <span>🧠 {memoryCount}</span>}
           {latency > 0 && <span>⚡ {latency.toFixed(1)}s</span>}
 
@@ -219,8 +281,9 @@ export function StatusBar() {
             </span>
           )}
 
-          {/* ── Toggle pills: BROWSER · MIC · VOICE ─────────────────────── */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          {/* ── Toggle pills: MODE · BROWSER · MIC · VOICE ──────────────── */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', position: 'relative' }}>
+            <ModePill mode={mode} onClick={onModeClick} disabled={voiceState !== 'idle'} />
             <TogglePill
               active={hasFeed}
               pressed={browserViewerOpen}
@@ -240,6 +303,26 @@ export function StatusBar() {
               label="VOICE"
               onClick={toggleTTS}
             />
+            {modeHint && (
+              <span
+                style={{
+                  position:    'absolute',
+                  top:         '100%',
+                  right:       0,
+                  marginTop:   '4px',
+                  padding:     '4px 8px',
+                  background:  'rgba(0,0,0,0.85)',
+                  color:       '#fde68a',
+                  fontSize:    '10px',
+                  borderRadius:'6px',
+                  whiteSpace:  'nowrap',
+                  pointerEvents:'none',
+                  zIndex:      10,
+                }}
+              >
+                {modeHint}
+              </span>
+            )}
           </div>
 
           {/* Clock — 12px gap via the parent gap-4 (16px) minus 6px pill gap = fine */}

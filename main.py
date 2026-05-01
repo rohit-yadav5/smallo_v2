@@ -90,8 +90,6 @@ def main():
                 if code is not None:
                     label = "BACKEND" if p is backend_proc else "FRONTEND"
                     print(f"\n  [{label}] exited with code {code}. Shutting down.")
-                    if code != 0:
-                        print(f"  Run python main_with_logs.py for detailed diagnostics.")
                     stop.set()
                     return
             time.sleep(0.5)

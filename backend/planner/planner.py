@@ -46,7 +46,6 @@ from typing import Callable, Optional
 import requests
 
 from config.llm import LLM_CONFIG, KEEP_ALIVE_IDLE, KEEP_ALIVE_PLAN
-from llm.tool_executor import execute_step_with_tools as _execute_step_with_tools
 from planner.validator import validate_steps as _validate_steps
 from tools.registry import registry as _tool_registry
 from utils.ram_monitor import can_load_7b, get_available_ram_gb
@@ -94,6 +93,7 @@ async def _store_plan_memory(
     Runs in a background thread so it never delays the plan completion flow.
     Non-fatal — any exception is logged and swallowed.
     """
+    import mode  # noqa: PLC0415
     from memory_system.core.insert_pipeline import insert_memory  # noqa: PLC0415
 
     content = (
@@ -103,6 +103,9 @@ async def _store_plan_memory(
     )
 
     def _run():
+        if not mode.is_super():
+            print("  [planner] plan memory skipped (normal mode)", flush=True)
+            return
         try:
             insert_memory({
                 "text":        content,
