@@ -186,8 +186,14 @@ export function StatusBar() {
     return () => clearInterval(id)
   }, [])
 
+  // Mid-turn states ('thinking', 'speaking') are unsafe to switch in:
+  // memory writes / LLM stream may be in flight. 'idle' is fully clear,
+  // and 'listening' is just "waiting for the next utterance" (the pipeline
+  // sits in this state between turns) — also clear to switch.
+  const modeBusy = voiceState === 'thinking' || voiceState === 'speaking'
+
   function onModeClick() {
-    if (voiceState !== 'idle') {
+    if (modeBusy) {
       setModeHint('Wait for current turn to finish.')
       setTimeout(() => setModeHint(null), 2500)
       return
@@ -283,7 +289,7 @@ export function StatusBar() {
 
           {/* ── Toggle pills: MODE · BROWSER · MIC · VOICE ──────────────── */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px', position: 'relative' }}>
-            <ModePill mode={mode} onClick={onModeClick} disabled={voiceState !== 'idle'} />
+            <ModePill mode={mode} onClick={onModeClick} disabled={modeBusy} />
             <TogglePill
               active={hasFeed}
               pressed={browserViewerOpen}

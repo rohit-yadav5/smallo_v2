@@ -46,9 +46,12 @@ from typing import Callable, Optional
 import requests
 
 from config.llm import LLM_CONFIG, KEEP_ALIVE_IDLE, KEEP_ALIVE_PLAN
+from logging_setup import get_logger
 from planner.validator import validate_steps as _validate_steps
 from tools.registry import registry as _tool_registry
 from utils.ram_monitor import can_load_7b, get_available_ram_gb
+
+log = get_logger("planner")
 
 
 # ── Direct tool goal patterns (FIX3C + FIX1B) ────────────────────────────────
@@ -647,7 +650,7 @@ async def run_plan(
         # This prevents "remind me in 30s" → 6-step Google Calendar hallucination.
         direct_tool = _get_direct_tool(goal)
         if direct_tool:
-            print(f"  [plan] direct tool match → {direct_tool} (skipping decomposition)", flush=True)
+            log.info("plan_direct_tool tool=%s goal=%r", direct_tool, goal)
             result = await _execute_step_planner(goal, "")
             _signal_queue(result)
             return
@@ -668,7 +671,7 @@ async def run_plan(
         _check_ans = await _planner_llm(_CHECKER_SYSTEM, _check_prompt, max_tokens=5)
         # Only bypass the planner if the answer is an unambiguous NO
         if _check_ans.strip().lower().startswith("no"):
-            print("  [plan] cancelled — single-tool goal, routing to normal turn", flush=True)
+            log.info("plan_single_step goal=%r", goal)
             # Execute as single step; signal pipeline thread with result.
             result = await _execute_step_planner(goal, "")
             _signal_queue(result)
@@ -693,7 +696,7 @@ async def run_plan(
 
         steps = steps[:max_steps]
 
-        print(f"  [planner] decomposed into {len(steps)} step(s)", flush=True)
+        log.info("plan_decomposed steps=%d goal=%r", len(steps), goal)
         broadcast("PLAN_EVENT", {
             "phase": "decomposed",
             "steps": steps,
@@ -707,9 +710,9 @@ async def run_plan(
 
         for i, step in enumerate(steps):
             if _cancel_requested.is_set():
-                print("  [planner] cancel requested — stopping at step boundary", flush=True)
+                log.info("plan_cancel_requested at_step=%d", i + 1)
                 break
-            print(f"  [planner] step {i+1}/{len(steps)}: {step[:80]}", flush=True)
+            log.info("plan_step_start step=%d/%d text=%r", i + 1, len(steps), step[:80])
             broadcast("PLAN_EVENT", {
                 "phase":      "step_start",
                 "step_index": i,
@@ -732,12 +735,12 @@ async def run_plan(
                 result  = await _execute_step_planner(step, context, correction=correction)
             except Exception as exc:
                 result = f"Error on step {i+1}: {exc}"
-                print(f"  [planner] ⚠ step error: {exc}", flush=True)
+                log.exception("plan_step_error step=%d", i + 1)
 
             results.append(result)
             context_window.append(f"Step {i+1} ({step[:50]}): {result[:200]}")
 
-            print(f"  [planner] step {i+1} done: {result[:80]}", flush=True)
+            log.info("plan_step_done step=%d/%d result=%r", i + 1, len(steps), result[:80])
             broadcast("PLAN_EVENT", {
                 "phase":      "step_done",
                 "step_index": i,
@@ -774,7 +777,7 @@ async def run_plan(
                 try:
                     done = await _check_goal_done(goal, results)
                     if done:
-                        print(f"  [planner] ✓ goal achieved after {i+1} step(s)", flush=True)
+                        log.info("plan_goal_done steps=%d", i + 1)
                         break
                 except Exception:
                     pass   # goal-check failure is non-fatal
@@ -793,7 +796,7 @@ async def run_plan(
         summary = re.sub(r"<start_plan>.*?</start_plan>", "", summary, flags=re.DOTALL).strip()
         summary = re.sub(r"<tool_call>.*?</tool_call>",   "", summary, flags=re.DOTALL).strip()
 
-        print(f"  [planner] ✅ complete. Summary: {summary[:100]}", flush=True)
+        log.info("plan_complete summary=%r", summary[:100])
 
         # ── Persist plan result for next conversational turn (B1) ─────────
         global _planner_last_result
@@ -840,14 +843,14 @@ async def run_plan(
         try:
             from tts import speak as _speak  # noqa: PLC0415
             await asyncio.to_thread(_speak, summary, threading.Event())
-        except Exception as exc:
-            print(f"  [planner] ⚠ TTS speak failed: {exc}", flush=True)
+        except Exception:
+            log.exception("plan_tts_failed")
 
         broadcast("VOICE_STATE", {"state": "idle"})
 
     except asyncio.CancelledError:
         _planner_active = False   # evict 7b model immediately
-        print("  [planner] ⛔ cancelled", flush=True)
+        log.info("plan_cancelled goal=%r", goal)
         broadcast("PLAN_EVENT", {"phase": "cancelled", "goal": goal})
         broadcast("VOICE_STATE", {"state": "idle"})
         # Store partial completion if any steps finished — importance=4.0 (partial)
@@ -865,10 +868,8 @@ async def run_plan(
 
     except Exception as exc:
         _planner_active = False   # evict 7b model immediately
-        import traceback
         reason = str(exc)
-        print(f"  [planner] ✗ failed: {reason}", flush=True)
-        traceback.print_exc()
+        log.exception("plan_failed goal=%r reason=%r", goal, reason)
         broadcast("PLAN_EVENT", {
             "phase":  "failed",
             "reason": reason,

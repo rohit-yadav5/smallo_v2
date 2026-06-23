@@ -235,6 +235,10 @@ def _stream_ollama(
     effective_predict = num_predict if num_predict is not None else LLM_CONFIG.num_predict
     effective_read_timeout = read_timeout if read_timeout is not None else LLM_CONFIG.stream_timeout_read_s
     total_chars = sum(len(m["content"]) for m in messages)
+    from logging_setup import get_logger as _get_logger
+    _log = _get_logger("llm")
+    _log.debug("llm_call model=%s prompt_chars=%d num_predict=%s",
+               effective_model, total_chars, effective_predict)
     print(f"  [llm] ▶ {total_chars:,} char prompt → {effective_model} (num_predict={effective_predict})", flush=True)
 
     # Use ACTIVE keep_alive during a conversation so entity extraction and the
@@ -269,9 +273,14 @@ def _stream_ollama(
 
 def _collect_full_response(token_iter: Iterator[str]) -> tuple[str, list[str]]:
     """Drain the iterator, return (full_text, list_of_tokens)."""
+    import time as _time
+    from logging_setup import get_logger as _get_logger
+    _t0 = _time.perf_counter()
     tokens: list[str] = []
     for tok in token_iter:
         tokens.append(tok)
+    _get_logger("llm").debug("llm_response duration_ms=%d tokens_out=%d",
+                             int((_time.perf_counter() - _t0) * 1000), len(tokens))
     return "".join(tokens), tokens
 
 

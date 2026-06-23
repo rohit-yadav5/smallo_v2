@@ -137,6 +137,8 @@ def _fetch_multihop_memories(
 
 
 def retrieve_memories(query: str, top_k: int = 5, debug: bool = False, path: str = None):
+    from logging_setup import get_logger as _get_logger
+    _get_logger("memory").debug("memory_retrieve top_k=%d query=%r", top_k, query[:80])
     # Resolve current session once per retrieval call (FIX2A — BUG-005).
     current_session_id = _get_current_session_id()
 

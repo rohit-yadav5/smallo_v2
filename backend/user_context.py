@@ -128,6 +128,9 @@ def get_context_prompt() -> str:
     gives full attention to mandatory-action rules.  Facts and goals are
     truncated to the most recent items before capping.
     """
+    import mode  # lazy: avoid any import-time cycle with backend wiring
+    if not mode.is_super():
+        return ""
     with _lock:
         ctx = dict(_cache)
 

@@ -121,23 +121,28 @@ class _ToolRegistry:
         Never raises — all errors are returned as a JSON string so the LLM can
         distinguish tool_not_found from execution_error in its next response.
         """
+        from logging_setup import get_logger
+        _log = get_logger("tools")
         tool = self._tools.get(name)
         if tool is None:
             known = ", ".join(self._tools.keys()) or "none"
+            _log.warning("tool_not_found name=%s", name)
             return json.dumps({
                 "status":  "error",
                 "code":    "tool_not_found",
                 "message": f"Unknown tool '{name}'. Known tools: {known}",
             })
+        import time as _time
+        _log.info("tool_dispatch name=%s args=%r", name, args)
+        _t0 = _time.perf_counter()
         try:
             result = await tool.handler(args)
+            _log.info("tool_result name=%s ok=true duration_ms=%d",
+                      name, int((_time.perf_counter() - _t0) * 1000))
             return str(result)
         except Exception as exc:
-            import traceback as _tb
-            print(
-                f"  [tools] tool '{name}' raised exception:\n{_tb.format_exc()}",
-                flush=True,
-            )
+            _log.exception("tool_result name=%s ok=false duration_ms=%d",
+                           name, int((_time.perf_counter() - _t0) * 1000))
             return json.dumps({
                 "status":  "error",
                 "code":    "execution_error",

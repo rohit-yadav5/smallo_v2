@@ -35,6 +35,8 @@ def _get_session_id() -> str:
 
 
 def insert_memory(input_data: dict) -> str:
+    from logging_setup import get_logger as _get_logger
+    _log = _get_logger("memory")
     memory_id   = str(uuid.uuid4())
     created_at  = datetime.utcnow().isoformat()
     raw_text    = input_data["text"]
@@ -42,6 +44,7 @@ def insert_memory(input_data: dict) -> str:
     memory_type = input_data.get("memory_type", "IdeaMemory")
     summary     = raw_text[:300]
     session_id  = _get_session_id()
+    _log.debug("memory_insert type=%s chars=%d source=%s", memory_type, len(raw_text), source)
 
     # ── Step 1: Affect tagging ────────────────────────────────────────────────
     affect = detect_affect(raw_text)

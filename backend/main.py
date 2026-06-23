@@ -105,8 +105,11 @@ from utils.latency import LatencyTracker
 
 # ── Jarvis upgrade: tools + user context ──────────────────────────────────────
 import backend_loop_ref                                  # loop ref for tool dispatch
+from logging_setup import setup_logging, get_logger
 import mode
 import session_history
+
+log = get_logger("main")
 import tools                                             # triggers self-registration of all four tools  # noqa: F401
 from tools.reminder_tool import set_broadcast_fn as _set_reminder_broadcast, shutdown_all_reminders
 from user_context import load_user_context, get_context_prompt, update_user_context
@@ -811,30 +814,16 @@ def _stats_loop():
 # ──────────────────────────────────────────────────
 
 def _pipeline_loop():
-    print("  Warming up models...", flush=True)
-    t0 = time.perf_counter(); stt_warmup(); print(f"    STT  ready  ({time.perf_counter()-t0:.2f}s)", flush=True)
-    t0 = time.perf_counter(); tts_warmup(); print(f"    TTS  ready  ({time.perf_counter()-t0:.2f}s)", flush=True)
-    t0 = time.perf_counter(); llm_warmup(); print(f"    LLM  ready  ({time.perf_counter()-t0:.2f}s)", flush=True)
+    log.info("warmup_start")
+    t0 = time.perf_counter(); stt_warmup(); log.info("warmup_stt_done duration_s=%.2f", time.perf_counter()-t0)
+    t0 = time.perf_counter(); tts_warmup(); log.info("warmup_tts_done duration_s=%.2f", time.perf_counter()-t0)
+    t0 = time.perf_counter(); llm_warmup(); log.info("warmup_llm_done duration_s=%.2f", time.perf_counter()-t0)
 
     # ── RAM report after models load ─────────────────────────────────────────
     _ram_available = get_available_ram_gb()
     _ram_pressure  = get_memory_pressure()
-    print(f"  [ram] {_ram_available:.1f} GB available — pressure: {_ram_pressure}", flush=True)
-    if _ram_pressure == "high":
-        print(
-            "  [ram] ⚠ WARNING: very low RAM — 7b planner disabled, close other apps",
-            flush=True,
-        )
-    elif _ram_pressure == "medium":
-        print(
-            "  [ram] ⚡ CAUTION: limited RAM — 7b will only load if > 3 GB free at plan time",
-            flush=True,
-        )
-    else:
-        print(
-            f"  [ram] ✓ OK — qwen2.5:7b planner {'enabled' if can_load_7b() else 'unavailable'}",
-            flush=True,
-        )
+    log.info("ram_report available_gb=%.1f pressure=%s planner_7b=%s",
+             _ram_available, _ram_pressure, can_load_7b())
     _emit("SYSTEM_EVENT", {
         "event":        "ram_report",
         "message":      f"{_ram_available:.1f} GB free — {_ram_pressure} pressure",
@@ -848,13 +837,12 @@ def _pipeline_loop():
             _loop,
         )
 
-    print("\n  Loading plugins...")
     try:
         router = PluginRouter()
-    except Exception as e:
-        print(f"  [pipeline] plugin router failed to load: {e} — continuing without plugins")
+        log.info("plugin_router_loaded")
+    except Exception:
+        log.exception("plugin_router_load_failed")
         router = None
-    print()
 
     turn               = 0
     came_from_barge_in = False
@@ -871,10 +859,9 @@ def _pipeline_loop():
             _turn_in_progress = True
             _turn_started_at  = time.time()
             came_from_barge_in = _run_turn(turn, tracker, router, came_from_barge_in)
-        except Exception as e:
+        except Exception:
             came_from_barge_in = False
-            print(f"\n  [pipeline] !! UNHANDLED EXCEPTION in turn {turn}: {e}")
-            import traceback; traceback.print_exc()
+            log.exception("turn_unhandled_exception turn=%d", turn)
             _emit("VOICE_STATE", {"state": "idle"})
             time.sleep(1)   # brief pause before retrying
         finally:
@@ -1033,6 +1020,9 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         "recording_time":     round(rec_secs, 3),
         "transcription_time": round(trans_secs, 3),
     })
+    _turn_t0 = time.time()
+    log.info("turn_start turn=%d source=%s rec_s=%.2f trans_s=%.2f utterance=%r",
+             turn, "text" if _text_input_branch else "voice", rec_secs, trans_secs, user_text)
 
     # ── Plan cancellation (fast path — BEFORE thinking state, no LLM call) ─
     # Handles both "stop" with an active plan and "stop" with nothing running.
@@ -1070,21 +1060,25 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
         try:
             with tracker.step("Plugin Router"):
                 plugin_result = router.route(user_text)
-        except Exception as e:
-            print(f"  [plugin] router error: {e}")
+        except Exception:
+            log.exception("plugin_router_error")
 
     if plugin_result is not None:
+        log.info("plugin_match plugin=%s action=%s direct=%s",
+                 plugin_result.get("plugin"), plugin_result.get("action"),
+                 plugin_result.get("direct", False))
         spoken = ""
         try:
             spoken = _handle_plugin_result(plugin_result, tracker)
             _store_action_memory(user_text, spoken, plugin_result)
-        except Exception as e:
-            print(f"  [plugin] handle result error: {e}")
+        except Exception:
+            log.exception("plugin_handle_error")
         if mode.is_normal() and spoken:
             session_history.append("user", user_text)
             session_history.append("assistant", spoken)
         _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
+        log.info("turn_end turn=%d path=plugin duration_s=%.2f", turn, time.time()-_turn_t0)
         return False
 
     # ── Identity extraction ──────────────────────────────────────────────
@@ -1108,15 +1102,15 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
                             "importance": _MEMORY_IMPORTANCE["PersonalMemory"],
                             "summary":    fact["text"],
                         })
-        except Exception as e:
-            print(f"  [identity] memory insert error: {e}")
+        except Exception:
+            log.exception("identity_memory_insert_failed")
 
     # ── Memory retrieval ─────────────────────────────────────────────────
     try:
         with tracker.step("Memory Retrieval"):
             prompt = _build_memory_context(user_text)
-    except Exception as e:
-        print(f"  [memory] context build error: {e}")
+    except Exception:
+        log.exception("memory_context_build_failed")
         prompt = user_text
 
     # ── Interrupted-response context ─────────────────────────────────────
@@ -1172,19 +1166,20 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
     # memory system carries continuity instead.
     prior_msgs = session_history.get_messages() if mode.is_normal() else None
 
-    print(f"  [pipeline] calling ask_llm_turn  |  prompt {len(prompt):,} chars", flush=True)
+    log.debug("llm_call prompt_chars=%d prior_msgs=%d", len(prompt), len(prior_msgs or []))
     try:
         llm_result = ask_llm_turn(prompt, system_suffix=user_ctx_suffix, prior_messages=prior_msgs)
-    except Exception as e:
-        print(f"  [llm] ask_llm_turn failed: {e}")
+    except Exception:
+        log.exception("llm_call_failed")
         _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
+        log.info("turn_end turn=%d path=error duration_s=%.2f", turn, time.time()-_turn_t0)
         return False
 
     # ── Plan trigger detected — hand off to autonomous planner ───────────
     if isinstance(llm_result, dict) and llm_result.get("type") == "plan_trigger":
         goal = llm_result["goal"]
-        print(f"  [pipeline] 🗺 plan trigger → '{goal}'", flush=True)
+        log.info("plan_trigger goal=%r", goal)
         # Drain any stale signal from a previous plan
         while not _plan_result_queue.empty():
             try:
@@ -1250,6 +1245,7 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
             session_history.append("assistant", plan_assistant_text)
         _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
+        log.info("turn_end turn=%d path=plan duration_s=%.2f", turn, time.time()-_turn_t0)
         return False
 
     # ── Normal streaming response ────────────────────────────────────────
@@ -1270,7 +1266,7 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
             pass
         _emit("VOICE_STATE", {"state": "thinking"})
 
-    print(f"  [pipeline] VOICE_STATE → speaking", flush=True)
+    log.debug("voice_state_speaking turn=%d", turn)
     _emit("VOICE_STATE", {"state": "speaking"})
     _interrupt_event.clear()   # arm: VAD can now set this on barge-in
 
@@ -1309,10 +1305,12 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
                 f"audio playback: {speaking_s:.3f}s"
             ])
         print(f"\n  AI: {ai_text}\n")
-    except Exception as e:
-        print(f"  [llm/tts] error: {e}")
+        log.debug("llm_response chars=%d", len(ai_text))
+    except Exception:
+        log.exception("llm_tts_error")
         _emit("VOICE_STATE", {"state": "idle"})
         tracker.summary()
+        log.info("turn_end turn=%d path=error duration_s=%.2f", turn, time.time()-_turn_t0)
         return False
 
     # ── Barge-in: save partial response, decide next state ───────────────
@@ -1363,14 +1361,15 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
                         "importance": _MEMORY_IMPORTANCE["ReflectionMemory"],
                         "summary":    f"You: {ut[:50]}… / AI: {at[:50]}…",
                     })
-            except Exception as e:
-                print(f"  [memory] reflection insert failed: {e}")
+            except Exception:
+                log.exception("reflection_insert_failed")
 
         threading.Thread(target=_store_reflection, daemon=True).start()
 
     if mode.is_normal():
         session_history.append("user", user_text)
         session_history.append("assistant", ai_text)
+    log.info("turn_end turn=%d path=llm duration_s=%.2f", turn, time.time()-_turn_t0)
     return False
 
 
@@ -1380,7 +1379,7 @@ def _run_turn(turn: int, tracker: LatencyTracker, router,
 
 async def _ws_handler(ws):
     _clients.add(ws)
-    print(f"  [ws] client connected  ({len(_clients)} total)  addr={ws.remote_address}")
+    log.info("ws_connect addr=%s clients=%d", ws.remote_address, len(_clients))
 
     # Send current voice state immediately so late-connecting frontends sync up
     try:
@@ -1431,10 +1430,10 @@ async def _ws_handler(ws):
                                 # The registered handler does session-boundary work
                                 # and emits MODE_CHANGED.
                                 mode.set_mode(new_mode)
-                            except Exception as _mode_exc:
-                                print(f"  [ws] SET_MODE failed: {_mode_exc}", flush=True)
+                            except Exception:
+                                log.exception("set_mode_failed mode=%r", new_mode)
                         else:
-                            print(f"  [ws] SET_MODE ignored — invalid mode: {new_mode!r}", flush=True)
+                            log.warning("set_mode_invalid mode=%r", new_mode)
 
                     elif ev == "TEXT_INPUT":
                         # User typed a message — inject directly into pipeline.
@@ -1477,10 +1476,12 @@ async def _ws_handler(ws):
         pass
     finally:
         _clients.discard(ws)
-        print(f"  [ws] client disconnected  ({len(_clients)} remaining)")
+        log.info("ws_disconnect clients=%d", len(_clients))
 
 
 async def _main():
+    setup_logging()
+    log.info("server_start session_id=%s", SESSION_ID)
     global _loop
     _loop = asyncio.get_running_loop()
 
@@ -1493,7 +1494,7 @@ async def _main():
     try:
         migrate_database()
     except Exception as _init_exc:
-        print(f"  [memory] database migration failed (non-fatal): {_init_exc}", flush=True)
+        log.warning("memory_migration_failed err=%r", _init_exc)
 
     # ── Session-ID memory migration (FIX2A — BUG-005) ────────────────────────
     # Adds session_id column to memories if absent and marks pre-existing rows
@@ -1503,12 +1504,11 @@ async def _main():
         from memory_system.db.migrate_session import migrate_add_session_id  # noqa: PLC0415
         migrate_add_session_id()
     except Exception as _mig_exc:
-        print(f"  [memory] session migration failed (non-fatal): {_mig_exc}", flush=True)
+        log.warning("session_migration_failed err=%r", _mig_exc)
 
     # Publish current session_id into the shared ref so insert_pipeline and
     # search.py can tag / penalise memories without a circular import.
     backend_loop_ref.session_id = SESSION_ID
-    print(f"  [memory] session context: {SESSION_ID}", flush=True)
 
     # ── Load persistent user context from disk ───────────────────────────────
     load_user_context()
@@ -1516,8 +1516,7 @@ async def _main():
     # ── bot-docs managed file store ───────────────────────────────────────────
     from bot_docs.store import ensure_dirs, BOT_DOCS_DIR
     ensure_dirs()
-    print(f"  [bot-docs] directory ready: {BOT_DOCS_DIR}", flush=True)
-    print(f"  [session] ID: {SESSION_ID}", flush=True)
+    log.info("bot_docs_ready dir=%s session_id=%s", BOT_DOCS_DIR, SESSION_ID)
     from tools.file_tool import (
         set_broadcast_fn as _set_file_broadcast,
         set_session_id  as _set_file_session,
@@ -1534,7 +1533,7 @@ async def _main():
         backend_loop_ref.session_id = SESSION_ID
         _set_file_session(SESSION_ID)
         session_history.clear()
-        print(f"  [mode] {old} → {new}  |  new session: {SESSION_ID}", flush=True)
+        log.info("mode_change old=%s new=%s session_id=%s", old, new, SESSION_ID)
         _emit("MODE_CHANGED", {"mode": new, "session_id": SESSION_ID})
 
     mode.register_mode_change_handler(_on_mode_change)
@@ -1551,18 +1550,18 @@ async def _main():
     web_monitor.set_broadcast_fn(_emit)
     try:
         await BrowserManager.get()           # launch Chromium early; shows window now
-        print("  [web_agent] Chromium ready", flush=True)
+        log.info("chromium_ready")
     except Exception as _exc:
-        print(f"  [web_agent] Chromium launch failed (will retry on first use): {_exc}", flush=True)
+        log.warning("chromium_launch_failed err=%r", _exc)
 
     # ── Wire adapter broadcast functions ──────────────────────────────────────
     _set_research_broadcast(_emit)
     _set_browser_use_broadcast(_emit)
-    print("  [adapters] research + browser-use broadcast wired", flush=True)
+    log.info("adapters_wired")
 
     # Start background webpage-monitor loop
     web_monitor.run_forever(_loop)
-    print("  [monitor] background loop scheduled", flush=True)
+    log.info("web_monitor_scheduled")
 
     # ── Text-input watcher (file + WS both feed _text_input_queue) ─────────────
     def _on_text_transcript(text: str) -> None:
@@ -1577,15 +1576,12 @@ async def _main():
             MAX_MEMORIES, get_memory_count, evict_and_rebuild,
         )
         _mem_count = get_memory_count()
-        print(f"  [memory] startup count: {_mem_count}  cap: {MAX_MEMORIES}", flush=True)
+        log.info("memory_startup count=%d cap=%d", _mem_count, MAX_MEMORIES)
         if _mem_count > MAX_MEMORIES:
-            print(
-                f"  [memory] startup eviction: {_mem_count} > {MAX_MEMORIES} — rebuilding...",
-                flush=True,
-            )
+            log.info("memory_eviction count=%d cap=%d action=rebuild", _mem_count, MAX_MEMORIES)
             await asyncio.get_running_loop().run_in_executor(None, evict_and_rebuild)
-    except Exception as _exc:
-        print(f"  [memory] startup eviction check failed (non-fatal): {_exc}", flush=True)
+    except Exception:
+        log.exception("memory_startup_check_failed")
 
     # ── Memory lifecycle background tasks ─────────────────────────────────────
     # run_lifecycle_maintenance: archives stale low-importance memories every 6 h.
@@ -1601,11 +1597,11 @@ async def _main():
         while True:
             try:
                 await asyncio.get_running_loop().run_in_executor(None, _run_maint)
-                print("  [memory] lifecycle maintenance complete", flush=True)
+                log.info("memory_maintenance_done")
             except asyncio.CancelledError:
                 return
-            except Exception as exc:
-                print(f"  [memory] lifecycle maintenance error (non-fatal): {exc}", flush=True)
+            except Exception:
+                log.exception("memory_maintenance_failed")
             await asyncio.sleep(6 * 3600)   # every 6 hours
 
     async def _memory_consolidation_loop():
@@ -1616,16 +1612,16 @@ async def _main():
         while True:
             try:
                 await asyncio.get_running_loop().run_in_executor(None, _run_consol)
-                print("  [memory] consolidation complete", flush=True)
+                log.info("memory_consolidation_done")
             except asyncio.CancelledError:
                 return
-            except Exception as exc:
-                print(f"  [memory] consolidation error (non-fatal): {exc}", flush=True)
+            except Exception:
+                log.exception("memory_consolidation_failed")
             await asyncio.sleep(24 * 3600)   # every 24 hours
 
     asyncio.create_task(_memory_maintenance_loop(), name="memory-maintenance")
     asyncio.create_task(_memory_consolidation_loop(), name="memory-consolidation")
-    print("  [memory] lifecycle tasks scheduled (maintenance=6h, consolidation=24h)", flush=True)
+    log.info("memory_lifecycle_scheduled maintenance_h=6 consolidation_h=24")
 
     # ── Pipeline watchdog (FIX1A / Part C) ──────────────────────────────────
     # Detects turns stuck >90 s and resets VOICE_STATE to idle.
@@ -1634,10 +1630,7 @@ async def _main():
         while True:
             await asyncio.sleep(60)
             if _turn_in_progress and time.time() - _turn_started_at > 90:
-                print(
-                    "[watchdog] turn stuck >90s — resetting pipeline state",
-                    flush=True,
-                )
+                log.warning("watchdog_stuck_turn elapsed_s=%d", int(time.time() - _turn_started_at))
                 # Can't preempt the thread, but reset voice state so the UI
                 # doesn't stay frozen in "thinking" indefinitely.
                 _emit("VOICE_STATE", {"state": "idle"})
@@ -1648,7 +1641,7 @@ async def _main():
                     pass
 
     asyncio.create_task(_pipeline_watchdog(), name="pipeline-watchdog")
-    print("  [watchdog] pipeline watchdog scheduled (60s check, 90s threshold)", flush=True)
+    log.info("watchdog_scheduled check_s=60 threshold_s=90")
 
     # ── Server-ready preload: fire immediately on the event loop ─────────────
     # This fires the LLM preload as soon as _main() completes setup, giving
@@ -1659,44 +1652,45 @@ async def _main():
         _preload_model(LLM_CONFIG.model, keep_alive_s=120),
         name="server-ready-preload",
     )
-    print("  [llm] background preload started at server ready", flush=True)
+    log.info("llm_preload_started model=%s", LLM_CONFIG.model)
 
     # Warm up sentence-transformers so Turn 1 memory retrieval isn't slow (~8 s cold-load).
     def _warmup_embedder():
         try:
             from memory_system.embeddings.embedder import generate_embedding_vector  # noqa: PLC0415
             generate_embedding_vector("warmup")
-            print("  [embedder] warm-up complete", flush=True)
-        except Exception as _exc:
-            print(f"  [embedder] warm-up failed (non-fatal): {_exc}", flush=True)
+            log.info("embedder_warmup_done")
+        except Exception:
+            log.exception("embedder_warmup_failed")
 
     threading.Thread(target=_warmup_embedder, daemon=True, name="embedder-warmup").start()
-    print("  [embedder] background warm-up started", flush=True)
 
     threading.Thread(target=_stats_loop,           daemon=True).start()
     threading.Thread(target=_audio_ingestion_loop, daemon=True).start()
     threading.Thread(target=_pipeline_loop,        daemon=True).start()
 
     async with websockets.serve(_ws_handler, "localhost", 8765, reuse_address=True):
-        print("  [ws] server listening on ws://localhost:8765")
+        log.info("ws_listening url=ws://localhost:8765")
         try:
             await asyncio.Future()   # blocks until cancelled (Ctrl-C)
         finally:
             # ── Graceful shutdown ─────────────────────────────────────────
-            print("  [shutdown] cancelling active plan...", flush=True)
+            log.info("shutdown_begin")
             await _cancel_plan()
-            print("  [shutdown] cancelling pending reminders...", flush=True)
+            log.info("shutdown_reminders_cancelled")
             await shutdown_all_reminders()
-            print("  [shutdown] closing browser...", flush=True)
+            log.info("shutdown_browser_closing")
             try:
                 if BrowserManager._instance:
                     await BrowserManager._instance.shutdown()
             except Exception:
-                pass
+                log.exception("shutdown_browser_failed")
+            log.info("shutdown_done")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(_main())
     except KeyboardInterrupt:
+        log.info("server_stopped")
         print("\nSmall O stopped.")

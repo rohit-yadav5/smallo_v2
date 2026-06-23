@@ -120,6 +120,31 @@ python main.py
 
 Press **Ctrl+C** to stop — both frontend and backend (and all child processes) are shut down cleanly.
 
+### Logs
+
+Backend logs are written to `backend/logs/smallo.log` (rotated at 5 MB, keeps last 3).
+Console output is colorized by level when attached to a TTY; the file copy is plain text.
+
+Two entry points:
+
+```bash
+python main.py        # normal run — backend log goes to file silently
+python logs_main.py   # debug run — SMALLO_LOG_LEVEL=DEBUG and the log file
+                      # is tailed live to stdout with a [log] prefix
+```
+
+Other useful flags:
+
+```bash
+tail -f backend/logs/smallo.log              # follow live (separate terminal)
+SMALLO_LOG_LEVEL=DEBUG python main.py        # verbose without the live tail
+SMALLO_LOG_FILE=0 python main.py             # console only, no file
+```
+
+Levels: `DEBUG`, `INFO` (default), `WARNING`, `ERROR`. Each line is
+`HH:MM:SS.mmm LEVEL [name] event_name k1=v1 k2=v2` — easy to grep for `turn_start`,
+`tool_dispatch`, `plan_step_done`, `mode_change`, etc.
+
 ### First-time startup sequence
 
 ```
